@@ -76,6 +76,19 @@ typedef struct {
 } tailnet_diag_t;
 void tailnet_get_diag(tailnet_diag_t* out);
 
+// Home relay (DERP) region. AUTO: the closest, measured at each start.
+// MATCH_SERVER: the home region of the BookOrbit server (the tailnet address
+// the reader last connected to, or the pinned one), learned and remembered.
+// FIXED: a region the user picked. Persisted; applying it restarts MicroLink.
+typedef enum { TAILNET_RELAY_AUTO = 0, TAILNET_RELAY_MATCH_SERVER = 1, TAILNET_RELAY_FIXED = 2 } tailnet_relay_mode_t;
+tailnet_relay_mode_t tailnet_relay_mode(void);
+uint16_t tailnet_relay_fixed_region(void);
+void tailnet_set_relay(tailnet_relay_mode_t mode, uint16_t region);
+// Regions from the last relay map (empty until first connected); codes like "sea".
+int tailnet_relay_regions(uint16_t* ids, char (*codes)[8], int max);
+// Region code for an id ("" if unknown); our current home region code.
+void tailnet_relay_code(uint16_t id, char* out, size_t len);
+
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.
 bool tailnet_log_line(int newest_index, char* buf, size_t len);

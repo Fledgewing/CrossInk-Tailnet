@@ -9,6 +9,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <nvs.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <atomic>
@@ -17,6 +18,10 @@ extern "C" {
 #include "microlink.h"
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
 void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, char* peer, size_t len);
+void tailnet_ml_set_forced_region(microlink_t* ml, uint16_t region);
+uint16_t tailnet_ml_home_region(const microlink_t* ml);
+uint16_t tailnet_ml_peer_region(const microlink_t* ml, uint32_t vpn_ip);
+int tailnet_ml_regions(const microlink_t* ml, uint16_t* ids, char (*codes)[8], int max);
 }
 
 // Arduino's esp32-hal-log.h (pulled in by WiFi.h) turns ESP_LOGx into its own
@@ -35,8 +40,12 @@ const char* NVS_NS = "tailnet";
 const char* NVS_KEY_ENABLED = "enabled";
 const char* NVS_KEY_JOINED = "joined";  // set once connected; cleared by logout
 const char* NVS_KEY_PIN = "pin_ip";     // learned priority peer (host byte order)
+const char* NVS_KEY_RELAY_MODE = "relay_mode";  // tailnet_relay_mode_t
+const char* NVS_KEY_RELAY_FIXED = "relay_rgn";  // region picked by the user
+const char* NVS_KEY_SERVER_RGN = "srv_rgn";     // learned home region of the server
+const char* NVS_KEY_SERVER_IP = "srv_ip";       // tailnet address last connected to
 
-enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, REQ_REPIN };
+enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, REQ_REPIN, REQ_RELAY };
 
 QueueHandle_t s_queue = nullptr;
 microlink_t* s_ml = nullptr;  // owned by the worker task
@@ -60,6 +69,13 @@ uint32_t s_tried[4];
 portMUX_TYPE s_url_lock = portMUX_INITIALIZER_UNLOCKED;
 char s_url[MICROLINK_AUTH_URL_MAX];
 static_assert(TAILNET_LOGIN_URL_MAX >= MICROLINK_AUTH_URL_MAX, "Tailnet.h buffer too small");
+
+// Relay settings, cached; written by the UI task (setter) and the worker.
+std::atomic<int> s_relay_mode{-1};      // -1 = not loaded
+std::atomic<int> s_relay_fixed{0};
+std::atomic<int> s_server_rgn{0};
+std::atomic<uint32_t> s_server_ip{0};
+bool s_relay_matched = false;  // worker only: one match-server restart per WiFi session
 
 uint8_t loadFlag(const char* key, std::atomic<int>& cache);
 void storeFlag(const char* key, std::atomic<int>& cache, bool value);
@@ -160,6 +176,67 @@ void stopMl() {
   setStatus(TAILNET_OFF);
 }
 
+uint32_t nvsGetU32(const char* key) {
+  uint32_t v = 0;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+    nvs_get_u32(h, key, &v);
+    nvs_close(h);
+  }
+  return v;
+}
+
+void nvsSetU32(const char* key, uint32_t v) {
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_u32(h, key, v);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+void loadRelay() {
+  if (s_relay_mode.load() >= 0) return;
+  s_relay_fixed.store((int)nvsGetU32(NVS_KEY_RELAY_FIXED));
+  s_server_rgn.store((int)nvsGetU32(NVS_KEY_SERVER_RGN));
+  s_server_ip.store(nvsGetU32(NVS_KEY_SERVER_IP));
+  uint32_t m = nvsGetU32(NVS_KEY_RELAY_MODE);
+  s_relay_mode.store(m <= TAILNET_RELAY_FIXED ? (int)m : 0);
+}
+
+// The home region to force at start (0 = let MicroLink pick the closest).
+uint16_t forcedRegion() {
+  loadRelay();
+  switch (s_relay_mode.load()) {
+    case TAILNET_RELAY_FIXED:
+      return (uint16_t)s_relay_fixed.load();
+    case TAILNET_RELAY_MATCH_SERVER:
+      return (uint16_t)s_server_rgn.load();  // 0 until learned: closest for now
+    default:
+      return 0;
+  }
+}
+
+uint32_t serverIp() {
+  loadRelay();
+  uint32_t ip = s_server_ip.load();
+  return ip ? ip : s_pin.load();
+}
+
+// Match-server mode: once the server is in the peer table, follow its home
+// region if ours differs (remembered, so later starts use it right away).
+void matchServerRegion() {
+  if (!s_ml || s_relay_matched || s_relay_mode.load() != TAILNET_RELAY_MATCH_SERVER) return;
+  const uint16_t theirs = tailnet_ml_peer_region(s_ml, serverIp());
+  const uint16_t ours = tailnet_ml_home_region(s_ml);
+  if (!theirs || !ours || theirs == ours) return;
+  s_relay_matched = true;
+  TLOGW("Relay region %u -> %u to match the server; restarting MicroLink", ours, theirs);
+  nvsSetU32(NVS_KEY_SERVER_RGN, theirs);
+  s_server_rgn.store(theirs);
+  stopMl();  // reconcile() starts it again with the new region
+}
+
 uint32_t loadPin() {
   if (!s_pin_loaded) {
     uint32_t v = 0;
@@ -202,6 +279,7 @@ void startMl() {
   // The control plane only resends a dropped peer on a fresh map, so the pin
   // is (re)applied on every start.
   tailnet_ml_set_priority_peer(s_ml, loadPin());
+  tailnet_ml_set_forced_region(s_ml, forcedRegion());
   setStatus(TAILNET_STARTING);
   const esp_err_t err = microlink_start(s_ml);
   if (err != ESP_OK) {
@@ -232,6 +310,7 @@ void workerTask(void*) {
           break;
         case REQ_WIFI_DOWN:
           s_wifi_up = false;
+          s_relay_matched = false;
           portENTER_CRITICAL(&s_tried_lock);
           memset(s_tried, 0, sizeof(s_tried));
           portEXIT_CRITICAL(&s_tried_lock);
@@ -256,12 +335,23 @@ void workerTask(void*) {
             stopMl();
           }
           break;
+        case REQ_RELAY:
+          if (s_running) {
+            TLOGW("Relay setting changed; restarting MicroLink");
+            stopMl();
+          }
+          s_relay_matched = false;
+          break;
         case REQ_RECHECK:
           break;
       }
       reconcile();
     }
     refreshFromHandle();
+    if (s_running && tailnet_status() == TAILNET_CONNECTED) {
+      matchServerRegion();
+      if (!s_running) reconcile();
+    }
   }
 }
 
@@ -381,6 +471,13 @@ bool markTried(uint32_t ip) {
 
 static std::atomic<uint32_t> s_last_target{0};
 
+// The tailnet address the reader connects to is its BookOrbit server (the only
+// tailnet host CrossInk talks to); match-server mode follows its relay region.
+static void rememberServer(uint32_t ip) {
+  loadRelay();
+  if (s_server_ip.exchange(ip) != ip) nvsSetU32(NVS_KEY_SERVER_IP, ip);
+}
+
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   s_last_target.store(ip);
   if (!tailnet_wait_connected(timeout_ms)) {
@@ -389,7 +486,10 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   }
   // A fresh map may still be filling the table just after CONNECTED.
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
-  if (peerKnown(ip)) return true;
+  if (peerKnown(ip)) {
+    rememberServer(ip);
+    return true;
+  }
   if (ip == s_pin.load() || !markTried(ip)) {
     TLOGW("connect %u.%u.%u.%u: not a peer of this reader (check ACLs)", IP_ARGS(ip));
     return false;
@@ -405,6 +505,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   const bool known = peerKnown(ip);
   if (known) {
     TLOGW("connect %u.%u.%u.%u: peer added after pinning", IP_ARGS(ip));
+    rememberServer(ip);
   } else {
     TLOGW("connect %u.%u.%u.%u: still not a peer after pinning (check ACLs)", IP_ARGS(ip));
   }
@@ -429,4 +530,47 @@ extern "C" void tailnet_get_diag(tailnet_diag_t* out) {
     }
   }
   tailnet_ml_relay_codes(s_ml, out->target_ip, out->home_relay, out->target_relay, sizeof(out->home_relay));
+}
+
+extern "C" tailnet_relay_mode_t tailnet_relay_mode(void) {
+  loadRelay();
+  return (tailnet_relay_mode_t)s_relay_mode.load();
+}
+
+extern "C" uint16_t tailnet_relay_fixed_region(void) {
+  loadRelay();
+  return (uint16_t)s_relay_fixed.load();
+}
+
+extern "C" void tailnet_set_relay(tailnet_relay_mode_t mode, uint16_t region) {
+  loadRelay();
+  if (mode == TAILNET_RELAY_FIXED) {
+    if (!region) return;
+    nvsSetU32(NVS_KEY_RELAY_FIXED, region);
+    s_relay_fixed.store(region);
+  }
+  nvsSetU32(NVS_KEY_RELAY_MODE, mode);
+  s_relay_mode.store(mode);
+  s_generation.fetch_add(1);
+  post(REQ_RELAY);
+}
+
+extern "C" int tailnet_relay_regions(uint16_t* ids, char (*codes)[8], int max) {
+  return s_ml ? tailnet_ml_regions(s_ml, ids, codes, max) : 0;
+}
+
+extern "C" void tailnet_relay_code(uint16_t id, char* out, size_t len) {
+  if (!out || !len) return;
+  out[0] = 0;
+  if (!id) return;
+  uint16_t ids[32];
+  char codes[32][8];
+  const int n = tailnet_relay_regions(ids, codes, 32);
+  for (int i = 0; i < n; i++) {
+    if (ids[i] == id) {
+      snprintf(out, len, "%s", codes[i]);
+      return;
+    }
+  }
+  snprintf(out, len, "region %u", (unsigned)id);
 }

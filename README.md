@@ -116,6 +116,14 @@ behave like a normal Tailscale client:
   second relay connection for it on demand (one at a time, ~25 KB of RAM) and closes it after a
   minute idle; if that region can't be reached it falls back to its own.
 
+**Settings > Tailscale > Relay region** overrides the choice of home region:
+
+- **Automatic (closest)**: the default, as above.
+- **Match BookOrbit server**: the reader's home follows the home region of the tailnet server it
+  connects to (learned on first use and remembered; it restarts MicroLink once if the server moves).
+  Useful when UDP is blocked, so the probe can't run and nothing needs the second connection.
+- **A fixed region** (e.g. `sea`): listed once the reader has connected at least once.
+
 **Settings > Tailscale > Diagnostics** shows both regions ("Relay: ours sea, server sea").
 
 ## Limits

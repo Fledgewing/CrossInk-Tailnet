@@ -36,3 +36,33 @@ void tailnet_ml_relay_codes(const microlink_t *ml, uint32_t vpn_ip, char *home, 
         }
     }
 }
+
+/* Home relay region forced by the user (0 = closest, MicroLink probes). Takes
+ * effect at the next microlink_start(). */
+void tailnet_ml_set_forced_region(microlink_t *ml, uint16_t region) {
+    if (ml) ml->derp_forced_region = region;
+}
+
+/* Our current home relay region (0 = not known yet). */
+uint16_t tailnet_ml_home_region(const microlink_t *ml) { return ml ? ml->derp_home_region : 0; }
+
+/* Home relay region of a tracked peer (0 = unknown). */
+uint16_t tailnet_ml_peer_region(const microlink_t *ml, uint32_t vpn_ip) {
+    for (int i = 0; ml && vpn_ip && i < ML_MAX_PEERS; i++) {
+        if (ml->peers[i].active && ml->peers[i].vpn_ip == vpn_ip) return ml->peers[i].derp_region;
+    }
+    return 0;
+}
+
+/* Relay regions from the last DERPMap (owned by MicroLink's coord task; a
+ * read racing a new map can show a stale entry, which is harmless here). */
+int tailnet_ml_regions(const microlink_t *ml, uint16_t *ids, char (*codes)[8], int max) {
+    int n = 0;
+    for (int i = 0; ml && i < ml->derp_region_count && n < max; i++) {
+        if (ml->derp_regions[i].avoid) continue;
+        ids[n] = ml->derp_regions[i].region_id;
+        snprintf(codes[n], 8, "%s", ml->derp_regions[i].code);
+        n++;
+    }
+    return n;
+}

@@ -4,6 +4,7 @@
 #include <I18n.h>
 #include <WiFi.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -92,6 +93,9 @@ void TailnetSettingsActivity::activate(const int row) {
     case ROW_HELP:
       mode = Mode::HELP;
       break;
+    case ROW_RELAY:
+      openRelayList();
+      break;
     case ROW_ACCOUNT:
       if (tailnet_joined()) {
         tailnet_logout();
@@ -110,7 +114,9 @@ void TailnetSettingsActivity::activate(const int row) {
 void TailnetSettingsActivity::loop() {
   const bool back = TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
                     mappedInput.wasReleased(MappedInputManager::Button::Back);
-  if (mode != Mode::MENU) {
+  if (mode == Mode::RELAY) {
+    loopRelayList(back);
+  } else if (mode != Mode::MENU) {
     if (back) {
       mode = Mode::MENU;
       requestUpdate();
@@ -176,11 +182,13 @@ void TailnetSettingsActivity::renderMenu(const int top) {
         if (i == ROW_ENABLED) return "Tailscale";
         if (i == ROW_DIAG) return "Diagnostics";
         if (i == ROW_HELP) return "Setup help";
+        if (i == ROW_RELAY) return "Relay region";
         return joined ? "Log out" : "Log in";
       },
       nullptr, nullptr,
-      [](int i) -> std::string {
+      [this](int i) -> std::string {
         if (i == ROW_ENABLED) return tailnet_enabled() ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
+        if (i == ROW_RELAY) return relayValue();
         return "";
       });
 
@@ -328,6 +336,119 @@ void TailnetSettingsActivity::renderHelp(const int top) {
   if (qrBottom - y > 80) QrUtils::drawQrCode(renderer, Rect(20, y + 4, pageWidth - 40, qrBottom - y - 4), HELP_URL);
 }
 
+std::string TailnetSettingsActivity::relayValue() const {
+  switch (tailnet_relay_mode()) {
+    case TAILNET_RELAY_MATCH_SERVER:
+      return "Match server";
+    case TAILNET_RELAY_FIXED: {
+      char code[16];
+      tailnet_relay_code(tailnet_relay_fixed_region(), code, sizeof(code));
+      return code;
+    }
+    default:
+      return "Automatic";
+  }
+}
+
+void TailnetSettingsActivity::openRelayList() {
+  relayRegionCount = tailnet_relay_regions(relayIds, relayCodes, MAX_REGIONS);
+  // Not connected yet: no map. Still offer the region already chosen.
+  const uint16_t fixed = tailnet_relay_fixed_region();
+  if (relayRegionCount == 0 && fixed) {
+    relayIds[0] = fixed;
+    tailnet_relay_code(fixed, relayCodes[0], sizeof(relayCodes[0]));
+    relayRegionCount = 1;
+  }
+  relaySelected = 0;
+  switch (tailnet_relay_mode()) {
+    case TAILNET_RELAY_MATCH_SERVER:
+      relaySelected = 1;
+      break;
+    case TAILNET_RELAY_FIXED:
+      for (int i = 0; i < relayRegionCount; i++) {
+        if (relayIds[i] == fixed) relaySelected = 2 + i;
+      }
+      break;
+    default:
+      break;
+  }
+  mode = Mode::RELAY;
+}
+
+void TailnetSettingsActivity::chooseRelay(const int index) {
+  if (index == 0) {
+    tailnet_set_relay(TAILNET_RELAY_AUTO, 0);
+  } else if (index == 1) {
+    tailnet_set_relay(TAILNET_RELAY_MATCH_SERVER, 0);
+  } else if (index - 2 < relayRegionCount) {
+    tailnet_set_relay(TAILNET_RELAY_FIXED, relayIds[index - 2]);
+  }
+  mode = Mode::MENU;
+  requestUpdate();
+}
+
+void TailnetSettingsActivity::loopRelayList(const bool back) {
+  const int count = 2 + relayRegionCount;
+  if (back) {
+    mode = Mode::MENU;
+    requestUpdate();
+    return;
+  }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    chooseRelay(relaySelected);
+    return;
+  }
+  int x = 0;
+  int y = 0;
+  if (mappedInput.wasScreenTapped(x, y)) {
+    const auto& metrics = UITheme::getInstance().getMetrics();
+    const int rowH = metrics.listRowHeight + metrics.listRowGap;
+    const int listH = renderer.getScreenHeight() - listTop - metrics.buttonHintsHeight;
+    const int pageItems = rowH > 0 ? std::max(1, listH / metrics.listRowHeight) : 1;
+    if (y >= listTop && rowH > 0) {
+      const int index = (relaySelected / pageItems) * pageItems + (y - listTop) / rowH;
+      if (index >= 0 && index < count) chooseRelay(index);
+    }
+    return;
+  }
+  buttonNavigator.onNextRelease([this, count] {
+    relaySelected = ButtonNavigator::nextIndex(relaySelected, count);
+    requestUpdate();
+  });
+  buttonNavigator.onPreviousRelease([this, count] {
+    relaySelected = ButtonNavigator::previousIndex(relaySelected, count);
+    requestUpdate();
+  });
+}
+
+void TailnetSettingsActivity::renderRelay(const int top) {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int pageWidth = renderer.getScreenWidth();
+  const int lineH = renderer.getLineHeight(UI_10_FONT_ID);
+
+  renderer.drawCenteredText(SMALL_FONT_ID, top, "Where relayed traffic meets the tailnet");
+  renderer.drawCenteredText(SMALL_FONT_ID, top + lineH, relayRegionCount ? "" : "Connect once to list regions");
+  listTop = top + 2 * lineH + metrics.verticalSpacing;
+  const int listH = renderer.getScreenHeight() - listTop - metrics.buttonHintsHeight;
+  const int count = 2 + relayRegionCount;
+  const tailnet_relay_mode_t current = tailnet_relay_mode();
+  const uint16_t fixed = tailnet_relay_fixed_region();
+  GUI.drawList(
+      renderer, Rect{0, listTop, pageWidth, listH}, count, relaySelected,
+      [this](int i) -> std::string {
+        if (i == 0) return "Automatic (closest)";
+        if (i == 1) return "Match BookOrbit server";
+        return relayCodes[i - 2];
+      },
+      nullptr, nullptr,
+      [this, current, fixed](int i) -> std::string {
+        const bool on = (i == 0 && current == TAILNET_RELAY_AUTO) ||
+                        (i == 1 && current == TAILNET_RELAY_MATCH_SERVER) ||
+                        (i >= 2 && current == TAILNET_RELAY_FIXED && relayIds[i - 2] == fixed);
+        return on ? "Current" : "";
+      });
+}
+
 void TailnetSettingsActivity::render(RenderLock&&) {
   renderer.clearScreen();
   const auto& metrics = UITheme::getInstance().getMetrics();
@@ -339,7 +460,12 @@ void TailnetSettingsActivity::render(RenderLock&&) {
   }
   const int top = header.y + header.height + metrics.verticalSpacing;
 
-  if (mode == Mode::HELP) {
+  if (mode == Mode::RELAY) {
+    renderRelay(top);
+    const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), tr(STR_SELECT),
+                                              tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (mode == Mode::HELP) {
     renderHelp(top);
     const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

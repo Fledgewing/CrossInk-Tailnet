@@ -1,5 +1,5 @@
 diff --git a/components/microlink/include/microlink_internal.h b/components/microlink/include/microlink_internal.h
-index 6639ef3..2c19dbc 100644
+index 6639ef3..c3bebfd 100644
 --- a/components/microlink/include/microlink_internal.h
 +++ b/components/microlink/include/microlink_internal.h
 @@ -269,6 +269,7 @@ typedef struct {
@@ -43,15 +43,16 @@ index 6639ef3..2c19dbc 100644
  
      /* Sockets for net_io select() loop */
      int disco_sock4;                    /* UDP socket for DISCO + direct WG */
-@@ -601,6 +617,7 @@ struct microlink_s {
+@@ -601,6 +617,8 @@ struct microlink_s {
      ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
      uint8_t derp_region_count;
      uint16_t derp_home_region;      /* Our PreferredDERP region */
 +    uint16_t derp_preferred_region; /* lowest-latency region measured (0 = not measured) */
++    uint16_t derp_forced_region;    /* set by the host: use this home region, skip the probe (0 = probe) */
  
      /* Key expiry (parsed from MapResponse self-node) */
      int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
-@@ -705,7 +722,11 @@ void ml_net_io_task(void *arg);
+@@ -705,7 +723,11 @@ void ml_net_io_task(void *arg);
  /* ml_derp.c */
  void ml_derp_tx_task(void *arg);
  esp_err_t ml_derp_connect(microlink_t *ml);
@@ -931,10 +932,10 @@ index 1ae0cf0..9509ca8 100644
      /* Drain TX queue */
      ml_derp_tx_item_t item;
 diff --git a/components/microlink/src/ml_stun.c b/components/microlink/src/ml_stun.c
-index e751da7..78e3430 100644
+index e751da7..319bec4 100644
 --- a/components/microlink/src/ml_stun.c
 +++ b/components/microlink/src/ml_stun.c
-@@ -595,3 +595,121 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
+@@ -595,3 +595,127 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
  
      return false;
  }
@@ -955,6 +956,12 @@ index e751da7..78e3430 100644
 +#define DERP_PROBE_TOTAL_MS   1500
 +
 +void ml_derp_pick_region(microlink_t *ml) {
++    if (ml->derp_forced_region) {
++        ml->derp_preferred_region = ml->derp_forced_region;
++        ml->derp_home_region = ml->derp_forced_region;
++        ESP_LOGI(TAG, "Home DERP region %d (set by host; not probing)", ml->derp_forced_region);
++        return;
++    }
 +    const int n = ml->derp_region_count;
 +    if (n <= 0) return;
 +
