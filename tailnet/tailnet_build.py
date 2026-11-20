@@ -65,6 +65,9 @@ def _process_project_deps_with_tailnet(env):
         CPPDEFINES=["WIREGUARD_CRYPTO_REFC"],
         CCFLAGS=["-include", config_h, "-Wno-stringop-overread"],
     )
+    # The peer table stays small (ml_config.h: 16; 8 here on the C3): the reader
+    # only needs its servers, and tailnet_ensure_peer() pins one that a large
+    # tailnet would otherwise leave out.
     if not has_psram:
         # No PSRAM: the map-response buffers come from internal RAM.
         ml_env.Append(CPPDEFINES=[("CONFIG_ML_H2_BUFFER_SIZE_KB", 48), ("CONFIG_ML_JSON_BUFFER_SIZE_KB", 48),
@@ -96,8 +99,8 @@ def _process_project_deps_with_tailnet(env):
     fw_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
     shim_env.Append(CPPPATH=[os.path.join(fw_dir, "libraries", lib, "src") for lib in ("WiFi", "Network")])
     shim_objs = [
-        shim_env.Object(os.path.join(build_dir, "shim", f.replace(".cpp", ".o")), os.path.join(shim_dir, f))
-        for f in sorted(os.listdir(shim_dir)) if f.endswith(".cpp")
+        shim_env.Object(os.path.join(build_dir, "shim", os.path.splitext(f)[0] + ".o"), os.path.join(shim_dir, f))
+        for f in sorted(os.listdir(shim_dir)) if f.endswith((".cpp", ".c"))
     ]
     env.Append(PIOBUILDFILES=shim_objs)
     env.Append(LIBS=[microlink_lib])

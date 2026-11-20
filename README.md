@@ -10,13 +10,13 @@ This is an **overlay**, not a fork. CrossInk's source is used as released; the o
 |---|---|---|
 | MicroLink | `third_party/microlink` (submodule, pinned tag) | Tailscale-compatible WireGuard client for ESP32 |
 | Shim | `tailnet/shim` | Starts MicroLink when WiFi gets an address, stops it when WiFi goes away; answers tailnet names (`bookorbit`, `bookorbit.<tailnet>.ts.net`) for every HTTP client in the firmware |
-| Login screen | `tailnet/ui` | Shows the Tailscale login as a QR code the first time it's needed |
+| Settings screen | `tailnet/ui` | **Settings > Tailscale**: on/off, status and address, log in (QR code) and log out |
 | Build hook | `tailnet/tailnet_build.py` + `overlay/platformio.local.ini` | Compiles the above into CrossInk's normal PlatformIO build and points the updater at this repo's releases |
-| UI hook | `overlay/patches/0001-tailnet-ui-hook.patch` | Two lines in `src/main.cpp`: the only edit to CrossInk's source |
+| Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row: the only edit to CrossInk's source |
 
 When CrossInk-Bookorbit releases, the daily CI run rebuilds the new tag with the overlay and
-publishes a release here. The only thing that can need hand work is the two-line patch, and CI
-says so if it stops applying.
+publishes a release here. The only thing that can need hand work is the small settings patch, and
+CI says so if it stops applying.
 
 ## Readers
 
@@ -36,22 +36,40 @@ releases over the air. To go back to stock CrossInk-Bookorbit, flash its `.bin` 
 
 ## Joining your tailnet
 
-1. Connect the reader to WiFi (any network screen does it: BookOrbit sync, catalog, file transfer).
-2. The **Tailscale** screen shows a QR code. Scan it with a phone that is signed in to Tailscale
-   and approve the device. The screen then shows the reader's `100.x.y.z` address.
+Tailscale ships **off**. Nothing tailnet-related runs until you turn it on.
+
+1. Open **Settings > Tailscale** and choose **Log in**. It turns Tailscale on and, if WiFi is
+   off, asks for a network first.
+2. Scan the QR code with a phone that is signed in to Tailscale and approve the device. The
+   screen then shows the reader's `100.x.y.z` address. From then on the reader joins the tailnet
+   whenever WiFi is on.
 3. In the [admin console](https://login.tailscale.com/admin/machines):
    - **Disable key expiry** for the reader. A device that joined by QR cannot renew its own key.
    - Optionally rename it (default `esp32-xxyyzz`) and tag it with an ACL that only lets it reach
      your BookOrbit server. The reader keeps its tailnet key unencrypted in flash.
-4. Point BookOrbit (or OPDS) at the server's tailnet name or `100.x` address, e.g.
-   `http://bookorbit:8080`.
+4. Point BookOrbit (or OPDS) at the server's tailnet name, its `100.x` address, or a public DNS
+   name that points at the `100.x` address (e.g. `https://books.example.net`).
+
+**Log out** in the same screen erases the reader's tailnet keys; remove the old device in the
+admin console too. Turning Tailscale off keeps the login for later.
+
+### Large tailnets
+
+MicroLink keeps a small peer table (16 on the X4 Pro/Classic, 8 on the X3). When the reader
+connects to a tailnet address that isn't in it, the overlay pins that address as MicroLink's
+priority peer, remembers it across reboots, and restarts MicroLink (a few seconds) so the server
+is added; the request waits for it. It tries once per address per WiFi session, and the most
+recent such address is the one pinned.
 
 ## Limits
 
 - Only tailnet hosts go through the tunnel. Internet traffic (GitHub updates, public OPDS
   catalogs) goes direct: MicroLink cannot use an exit node.
 - Tailnet names come from the reader's peer list, not MagicDNS. Short names and full
-  `*.ts.net` names of peers work; other MagicDNS records do not.
+  `*.ts.net` names of peers work; other MagicDNS records do not. Public DNS records pointing at
+  `100.x` addresses work, unless your router's DNS rebinding protection strips such answers.
+- The tailnet key is stored in the reader's internal flash, unencrypted (MicroLink's design).
+  Limit the reader with an ACL tag, and remove it in the admin console if it's lost.
 - MicroLink is an independent, beta implementation of the Tailscale protocol (see its README).
 - The DERP home region defaults to Dallas (9). Set `CONFIG_ML_DERP_REGION` in
   `tailnet/ml_config.h` if you're far from it.

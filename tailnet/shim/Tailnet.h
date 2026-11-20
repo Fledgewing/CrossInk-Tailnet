@@ -40,9 +40,13 @@ uint32_t tailnet_ip(void);
 // Bumped on every status change, so a screen can redraw only when needed.
 uint32_t tailnet_generation(void);
 
-// Persisted on/off switch (NVS). Off stops MicroLink and keeps it stopped.
+// Persisted on/off switch (NVS), off by default. Off stops MicroLink and keeps
+// it stopped; on starts it whenever WiFi is up.
 bool tailnet_enabled(void);
 void tailnet_set_enabled(bool enabled);
+
+// True once this reader has connected to a tailnet, until tailnet_logout().
+bool tailnet_joined(void);
 
 // Forget this reader's tailnet identity (keys and cached peers). The next
 // start asks for a fresh login.
@@ -51,6 +55,12 @@ void tailnet_logout(void);
 // Block until the tailnet is connected, while it is starting or reconnecting.
 // Returns false at once when it is off, failed or waiting for a login.
 bool tailnet_wait_connected(uint32_t timeout_ms);
+
+// Make sure MicroLink tracks the peer at ip (host byte order). On a tailnet
+// larger than its peer table, a peer can be left out; this pins it as the
+// priority peer (remembered in NVS) and restarts MicroLink so it is added.
+// Tried once per peer per WiFi session. Blocks up to about 2 x timeout_ms.
+bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms);
 
 // Resolve a tailnet name ("bookorbit", "bookorbit.tail1234.ts.net") to an IPv4
 // address in host byte order via MicroLink's peer list. 0 if unknown.

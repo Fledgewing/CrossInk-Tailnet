@@ -1,0 +1,58 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index b95b5d3..db6768d 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -779,6 +779,7 @@ STR_NO_SERVERS: "No OPDS servers configured"
+ STR_DELETE_SERVER: "Delete Server"
+ STR_DELETE_CONFIRM: "Delete this server?"
+ STR_OPDS_SERVERS: "OPDS Servers"
++STR_TAILSCALE: "Tailscale"
+ STR_OPDS_DOWNLOAD_FOLDER: "Download Folder"
+ STR_OPDS_SD_ROOT: "SD Root"
+ STR_MOVE_TO_READ_FAILED_TITLE: "Could not move book"
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 62db6c0..a21c3e5 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1064,6 +1064,7 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+ #endif
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_BOOKORBIT_SYNC, SettingAction::BookOrbitSync));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_TAILSCALE, SettingAction::Tailscale));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
+   addSettingByName(systemSettings, allSettings, StrId::STR_OTA_INCLUDE_PRERELEASES);
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 2a97759..c980084 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -22,6 +22,7 @@
+ #include "ClearCacheActivity.h"
+ #include "ClockOffsetActivity.h"
+ #include "ClockSyncActivity.h"
++#include "tailnet/TailnetSettingsActivity.h"
+ #include "CrossPointSettings.h"
+ #include "DeviceCapabilities.h"
+ #include "FontSelectionActivity.h"
+@@ -1268,6 +1269,9 @@ void SettingsActivity::toggleCurrentSetting() {
+       case SettingAction::ClockSync:
+         startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput), resultHandler);
+         break;
++      case SettingAction::Tailscale:
++        startActivityForResult(std::make_unique<TailnetSettingsActivity>(renderer, mappedInput), resultHandler);
++        break;
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
+         break;
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index a1842ab..8ffa3b1 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -54,6 +54,7 @@ enum class SettingAction {
+   DownloadFonts,
+   TtfRendering,
+   ClockSync,
++  Tailscale,
+ };
+ 
+ struct SettingInfo {

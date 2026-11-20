@@ -14,6 +14,10 @@
 // Timing: CrossInk starts network work (a BookOrbit sync) the moment WiFi has
 // an address, while the tailnet needs a few seconds more. Lookups, and connects
 // to tailnet addresses, wait for it while it is starting (up to WAIT_MS).
+//
+// Large tailnets: MicroLink tracks a limited number of peers. A connect to a
+// tailnet address it is not tracking pins that address as its priority peer
+// and restarts it, so the server is added (see tailnet_ensure_peer).
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
 #include <stdio.h>
@@ -66,7 +70,7 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
 extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t namelen) {
   if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in)) {
     const uint32_t ip = lwip_ntohl(reinterpret_cast<const struct sockaddr_in*>(name)->sin_addr.s_addr);
-    if (isTailnetAddr(ip)) tailnet_wait_connected(WAIT_MS);
+    if (isTailnetAddr(ip) && tailnet_enabled()) tailnet_ensure_peer(ip, WAIT_MS);
   }
   return __real_lwip_connect(s, name, namelen);
 }
