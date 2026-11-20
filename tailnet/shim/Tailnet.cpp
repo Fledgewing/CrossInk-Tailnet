@@ -472,6 +472,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
 extern "C" void tailnet_get_diag(tailnet_diag_t* out) {
   if (!out) return;
   *out = {};
+  out->peer_capacity = CONFIG_ML_MAX_PEERS;
   out->pin_ip = s_pin.load();
   out->target_ip = s_last_target.load();
   if (!out->target_ip) out->target_ip = out->pin_ip;

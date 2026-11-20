@@ -10,6 +10,7 @@
 //   Tailscale  On/Off   persisted switch (off by default)
 //   Log in / Log out    join this reader to a tailnet with a QR code, or forget
 //                       its tailnet identity
+//   Setup help          how to tag the reader in the tailnet policy (+ QR to the README)
 //   Diagnostics         peer table, the server last reached, recent log lines
 // Logging in turns WiFi on for the screen if it is off (the same way
 // ClockSyncActivity does) and off again on exit.
@@ -27,8 +28,8 @@ class TailnetSettingsActivity final : public Activity {
   bool preventAutoSleep() override { return mode == Mode::LOGIN; }
 
  private:
-  enum class Mode { MENU, LOGIN, DIAG };
-  enum Row { ROW_ENABLED = 0, ROW_ACCOUNT, ROW_DIAG, ROW_COUNT };
+  enum class Mode { MENU, LOGIN, DIAG, HELP };
+  enum Row { ROW_ENABLED = 0, ROW_ACCOUNT, ROW_HELP, ROW_DIAG, ROW_COUNT };
 
   Mode mode = Mode::MENU;
   int selected = 0;
@@ -45,4 +46,5 @@ class TailnetSettingsActivity final : public Activity {
   void renderMenu(int top);
   void renderLogin(int top);
   void renderDiag(int top);
+  void renderHelp(int top);
 };

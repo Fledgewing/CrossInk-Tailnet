@@ -18,6 +18,7 @@
 namespace {
 
 constexpr const char* TITLE = "Tailscale";
+constexpr const char* HELP_URL = "https://github.com/Fledgewing/CrossInk-Tailnet#recommended-tailnet-setup";
 
 std::string formatIp(uint32_t ip) {
   char buf[16];
@@ -88,6 +89,9 @@ void TailnetSettingsActivity::activate(const int row) {
     case ROW_DIAG:
       mode = Mode::DIAG;
       break;
+    case ROW_HELP:
+      mode = Mode::HELP;
+      break;
     case ROW_ACCOUNT:
       if (tailnet_joined()) {
         tailnet_logout();
@@ -106,7 +110,7 @@ void TailnetSettingsActivity::activate(const int row) {
 void TailnetSettingsActivity::loop() {
   const bool back = TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
                     mappedInput.wasReleased(MappedInputManager::Button::Back);
-  if (mode == Mode::LOGIN || mode == Mode::DIAG) {
+  if (mode != Mode::MENU) {
     if (back) {
       mode = Mode::MENU;
       requestUpdate();
@@ -171,6 +175,7 @@ void TailnetSettingsActivity::renderMenu(const int top) {
       [joined](int i) -> std::string {
         if (i == ROW_ENABLED) return "Tailscale";
         if (i == ROW_DIAG) return "Diagnostics";
+        if (i == ROW_HELP) return "Setup help";
         return joined ? "Log out" : "Log in";
       },
       nullptr, nullptr,
@@ -180,7 +185,16 @@ void TailnetSettingsActivity::renderMenu(const int top) {
       });
 
   const int noteY = listTop + ROW_COUNT * (metrics.listRowHeight + metrics.listRowGap) + metrics.verticalSpacing;
-  if (loggedOutNotice) {
+  tailnet_diag_t diag;
+  tailnet_get_diag(&diag);
+  const bool tableFull = diag.peer_capacity > 0 && diag.peer_count >= diag.peer_capacity;
+  if (tableFull) {
+    // The tailnet sends this reader more devices than it can track: the
+    // server may be left out. Tagging the reader fixes it (Setup help).
+    renderer.drawCenteredText(UI_10_FONT_ID, noteY, "Peer list full: tagging this reader", true,
+                              EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, noteY + lineH, "keeps it short (see Setup help)");
+  } else if (loggedOutNotice) {
     renderer.drawCenteredText(UI_10_FONT_ID, noteY, "Logged out. Remove the old device");
     renderer.drawCenteredText(UI_10_FONT_ID, noteY + lineH, "in the Tailscale admin console.");
   } else if (joined) {
@@ -273,6 +287,42 @@ void TailnetSettingsActivity::renderDiag(const int top) {
   }
 }
 
+void TailnetSettingsActivity::renderHelp(const int top) {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
+  const int lineH = renderer.getLineHeight(UI_10_FONT_ID);
+  const int x = 12;
+  int y = top;
+
+  renderer.drawText(UI_12_FONT_ID, x, y, "Recommended tailnet setup", true, EpdFontFamily::BOLD);
+  y += renderer.getLineHeight(UI_12_FONT_ID) + 4;
+  // Short lines: they must fit the narrowest reader at UI_10.
+  static const char* const kLines[] = {
+      "Let this reader reach only your",
+      "BookOrbit server: a lost reader",
+      "then can't reach your tailnet, its",
+      "key never expires, and its device",
+      "list stays short.",
+      "",
+      "1. Access controls: add tag:ereader",
+      "   and a grant from tag:ereader to",
+      "   the server's 100.x address.",
+      "2. Machines > this reader >",
+      "   Edit ACL tags > tag:ereader",
+      "3. Avoid rules with dst \"*\", and",
+      "   don't give it Mullvad access.",
+      "",
+      "Full steps and a policy example:",
+  };
+  for (const char* line : kLines) {
+    renderer.drawText(UI_10_FONT_ID, x, y, line);
+    y += lineH;
+  }
+  const int qrBottom = pageHeight - metrics.buttonHintsHeight - 8;
+  if (qrBottom - y > 80) QrUtils::drawQrCode(renderer, Rect(20, y + 4, pageWidth - 40, qrBottom - y - 4), HELP_URL);
+}
+
 void TailnetSettingsActivity::render(RenderLock&&) {
   renderer.clearScreen();
   const auto& metrics = UITheme::getInstance().getMetrics();
@@ -284,7 +334,11 @@ void TailnetSettingsActivity::render(RenderLock&&) {
   }
   const int top = header.y + header.height + metrics.verticalSpacing;
 
-  if (mode == Mode::DIAG) {
+  if (mode == Mode::HELP) {
+    renderHelp(top);
+    const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (mode == Mode::DIAG) {
     renderDiag(top);
     const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

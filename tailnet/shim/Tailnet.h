@@ -65,6 +65,7 @@ bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms);
 // Diagnostics for the Tailscale screen.
 typedef struct {
   int peer_count;      // peers MicroLink tracks now
+  int peer_capacity;   // size of its peer table (full = the reader sees too much)
   uint32_t pin_ip;     // pinned (priority) peer, 0 if none
   uint32_t target_ip;  // last tailnet address the reader connected to (else the pin)
   bool target_known;   // ...is in MicroLink's peer table

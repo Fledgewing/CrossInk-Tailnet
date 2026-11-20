@@ -43,15 +43,54 @@ Tailscale ships **off**. Nothing tailnet-related runs until you turn it on.
 2. Scan the QR code with a phone that is signed in to Tailscale and approve the device. The
    screen then shows the reader's `100.x.y.z` address. From then on the reader joins the tailnet
    whenever WiFi is on.
-3. In the [admin console](https://login.tailscale.com/admin/machines):
-   - **Disable key expiry** for the reader. A device that joined by QR cannot renew its own key.
-   - Optionally rename it (default `esp32-xxyyzz`) and tag it with an ACL that only lets it reach
-     your BookOrbit server. The reader keeps its tailnet key unencrypted in flash.
+3. In the [admin console](https://login.tailscale.com/admin/machines), tag the reader as described
+   in [Recommended tailnet setup](#recommended-tailnet-setup) (recommended; required only on
+   tailnets of several hundred devices). If you don't tag it, **disable key expiry** for it instead: a device that joined
+   by QR cannot renew its own key. Optionally rename it (default `esp32-xxyyzz`).
 4. Point BookOrbit (or OPDS) at the server's tailnet name, its `100.x` address, or a public DNS
    name that points at the `100.x` address (e.g. `https://books.example.net`).
 
 **Log out** in the same screen erases the reader's tailnet keys; remove the old device in the
 admin console too. Turning Tailscale off keeps the login for later.
+
+## Recommended tailnet setup
+
+Recommended for every tailnet: give the reader its own tag and let it reach only your BookOrbit
+server. Tailscale sends each device only the peers it may talk to (or that may talk to it), so the
+reader then receives a list of about one device instead of your whole tailnet.
+
+- **The reader stores its tailnet key unencrypted.** Tagged and restricted, a lost reader can
+  reach one service, not your tailnet.
+- **Tagged devices don't expire.** You don't need to disable key expiry by hand.
+- **MicroLink is small.** It tracks 16 peers (8 on the X3); on a larger tailnet the overlay pins
+  your server into that table (see below), at the cost of a restart. It also reads at most 512 KB of
+  the device list (roughly 350 devices); past that, only a smaller list helps.
+
+In the admin console, **Access controls**, add (adapt the address and port):
+
+```jsonc
+"tagOwners": {
+  "tag:ereader": ["autogroup:admin"],
+},
+"grants": [
+  // E-readers reach only the BookOrbit server (add "tcp:80" for plain HTTP).
+  {"src": ["tag:ereader"], "dst": ["100.69.222.123"], "ip": ["tcp:443"]},
+],
+```
+
+Then in **Machines**, open the reader (`esp32-…`) → **Edit ACL tags** → add `tag:ereader`. It keeps
+its login.
+
+**Don't give the reader Mullvad.** With Tailscale's Mullvad add-on, every device that has Mullvad
+access receives all of Mullvad's ~530 exit nodes in its device list, far more than MicroLink can
+read. A `nodeAttrs` entry granting `"mullvad"` to a user group (e.g. `autogroup:member`) does not
+apply to tagged devices, so tagging the reader takes care of it; just don't add `tag:ereader` to
+such an entry.
+
+**Check for broad rules.** A rule whose `dst` is `"*"` (or a group the reader falls into) lets its
+sources reach the reader, and those sources are then sent to the reader too. Name the destinations
+of such rules explicitly instead. On the reader, **Settings > Tailscale > Diagnostics** should show
+only one or two peers tracked once this is right.
 
 ### Large tailnets
 
@@ -59,7 +98,14 @@ MicroLink keeps a small peer table (16 on the X4 Pro/Classic, 8 on the X3). When
 connects to a tailnet address that isn't in it, the overlay pins that address as MicroLink's
 priority peer, remembers it across reboots, and restarts MicroLink (a few seconds) so the server
 is added; the request waits for it. It tries once per address per WiFi session, and the most
-recent such address is the one pinned.
+recent such address is the one pinned. Pinning cannot recover a server whose entry falls beyond
+the 512 KB that MicroLink reads: Tailscale's protocol has no way to ask for a single device.
+
+### Relay region
+
+MicroLink keeps one DERP relay connection, to its home region, and Tailscale's relay regions don't
+forward to each other. When the reader talks to a server homed in another region, it switches its
+home region to the server's (remembered across reboots) and restarts MicroLink once.
 
 ## Limits
 
