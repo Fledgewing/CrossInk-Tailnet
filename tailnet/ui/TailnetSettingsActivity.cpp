@@ -267,6 +267,11 @@ void TailnetSettingsActivity::renderDiag(const int top) {
     renderer.drawText(UI_10_FONT_ID, x, y, line);
     y += lineH;
   }
+  if (d.home_relay[0]) {
+    snprintf(line, sizeof(line), "Relay: ours %s, server %s", d.home_relay, d.target_relay[0] ? d.target_relay : "?");
+    renderer.drawText(UI_10_FONT_ID, x, y, line);
+    y += lineH;
+  }
   if (d.pin_ip) {
     snprintf(line, sizeof(line), "Pinned: %s", formatIp(d.pin_ip).c_str());
     renderer.drawText(UI_10_FONT_ID, x, y, line);

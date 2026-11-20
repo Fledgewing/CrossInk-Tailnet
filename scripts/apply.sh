@@ -5,7 +5,8 @@
 #   platformio.local.ini  (copied from overlay/)
 #   tailnet               (symlink to this repo's tailnet/, excluded via .git/info/exclude)
 #   src/tailnet           (symlink to tailnet/ui, built with CrossInk's own sources)
-# and applies overlay/patches/*.patch (today: two lines in src/main.cpp).
+# and applies overlay/patches/*.patch (the Settings row), plus
+# overlay/patches-microlink/*.patch to this repo's MicroLink submodule.
 # A patch that no longer applies stops here with an error: that is the one
 # place an upstream update can need overlay work.
 set -euo pipefail
@@ -53,6 +54,19 @@ for patch in "$overlay"/overlay/patches/*.patch; do
   fi
   if ! git -C "$target" apply --3way "$patch"; then
     echo "patch $(basename "$patch") no longer applies to this CrossInk version; refresh it" >&2
+    exit 1
+  fi
+done
+# MicroLink patches go into this repo's submodule (pinned tag, so they always
+# apply until the pin moves; .gitmodules ignores the resulting dirty tree).
+ml="$overlay/third_party/microlink"
+for patch in "$overlay"/overlay/patches-microlink/*.patch; do
+  [ -e "$patch" ] || continue
+  if git -C "$ml" apply --reverse --check "$patch" 2>/dev/null; then
+    continue  # already applied
+  fi
+  if ! git -C "$ml" apply "$patch"; then
+    echo "MicroLink patch $(basename "$patch") no longer applies to the pinned MicroLink; refresh it" >&2
     exit 1
   fi
 done

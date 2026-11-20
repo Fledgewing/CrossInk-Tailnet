@@ -13,6 +13,7 @@ This is an **overlay**, not a fork. CrossInk's source is used as released; the o
 | Settings screen | `tailnet/ui` | **Settings > Tailscale**: on/off, status and address, log in (QR code) and log out |
 | Build hook | `tailnet/tailnet_build.py` + `overlay/platformio.local.ini` | Compiles the above into CrossInk's normal PlatformIO build and points the updater at this repo's releases |
 | Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row: the only edit to CrossInk's source |
+| MicroLink patch | `overlay/patches-microlink/0001-relay-regions.patch` | Closest relay region and per-peer relays (below), applied to the pinned MicroLink |
 
 When CrossInk-Bookorbit releases, the daily CI run rebuilds the new tag with the overlay and
 publishes a release here. The only thing that can need hand work is the small settings patch, and
@@ -101,11 +102,21 @@ is added; the request waits for it. It tries once per address per WiFi session, 
 recent such address is the one pinned. Pinning cannot recover a server whose entry falls beyond
 the 512 KB that MicroLink reads: Tailscale's protocol has no way to ask for a single device.
 
-### Relay region
+### Relay regions
 
-MicroLink keeps one DERP relay connection, to its home region, and Tailscale's relay regions don't
-forward to each other. When the reader talks to a server homed in another region, it switches its
-home region to the server's (remembered across reboots) and restarts MicroLink once.
+When a direct connection isn't possible (guest WiFi, carrier NAT, Kubernetes), traffic goes through
+Tailscale's DERP relays, which are grouped into regions that don't forward to each other. Stock
+MicroLink uses one fixed region (Dallas) for everything. The overlay's MicroLink patch makes it
+behave like a normal Tailscale client:
+
+- **Closest region.** Each time it connects, the reader times a STUN probe to every relay region
+  and makes the fastest its home (kept unless another is a third faster). With UDP blocked it
+  keeps its previous home.
+- **Per-peer relays.** Packets for a peer go through that peer's home region. The reader opens a
+  second relay connection for it on demand (one at a time, ~25 KB of RAM) and closes it after a
+  minute idle; if that region can't be reached it falls back to its own.
+
+**Settings > Tailscale > Diagnostics** shows both regions ("Relay: ours sea, server sea").
 
 ## Limits
 
@@ -117,8 +128,8 @@ home region to the server's (remembered across reboots) and restarts MicroLink o
 - The tailnet key is stored in the reader's internal flash, unencrypted (MicroLink's design).
   Limit the reader with an ACL tag, and remove it in the admin console if it's lost.
 - MicroLink is an independent, beta implementation of the Tailscale protocol (see its README).
-- The DERP home region defaults to Dallas (9). Set `CONFIG_ML_DERP_REGION` in
-  `tailnet/ml_config.h` if you're far from it.
+- One relay connection besides the reader's own: servers homed in several different relay regions
+  take turns (each switch costs a TLS handshake).
 
 ## Building locally
 
@@ -129,7 +140,8 @@ CrossInk-Tailnet/scripts/apply.sh CrossInk-Bookorbit
 cd CrossInk-Bookorbit && pio run -e x4-pro    # or x4-classic, default
 ```
 
-`apply.sh` only touches git-ignored paths plus the two-line patch, and is safe to rerun.
+`apply.sh` only touches git-ignored paths plus the settings patch in CrossInk, applies the MicroLink
+patch to this repo's submodule, and is safe to rerun.
 
 ## Licence
 

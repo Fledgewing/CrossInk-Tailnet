@@ -71,6 +71,8 @@ typedef struct {
   bool target_known;   // ...is in MicroLink's peer table
   bool target_online;  // ...is online according to the control plane
   bool target_direct;  // ...is reached directly (else via a DERP relay)
+  char home_relay[8];    // our home relay region code (closest), e.g. "sea"
+  char target_relay[8];  // the server's home relay region code
 } tailnet_diag_t;
 void tailnet_get_diag(tailnet_diag_t* out);
 
