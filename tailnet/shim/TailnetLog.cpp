@@ -1,4 +1,4 @@
-// In-memory log of MicroLink and shim messages, for the Tailscale screen.
+// Log of MicroLink and shim messages for the Tailscale screen, kept across restarts.
 //
 // The prebuilt framework has CONFIG_LOG_MAXIMUM_LEVEL=ERROR, and
 // esp_log_level_set() cannot raise a tag above it: INFO and WARN lines from
@@ -6,6 +6,7 @@
 // sees them. So the link wraps esp_log (MicroLink's ESP_LOGx;
 // tailnet_build.py), and the shim logs through tailnet_log_emit: lines from our tags are
 // kept here and printed to the console directly.
+#include <esp_attr.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <stdarg.h>
@@ -16,12 +17,23 @@
 
 namespace {
 
-constexpr int LINES = 40;
-constexpr int WIDTH = 120;
-char s_lines[LINES][WIDTH];
-int s_head = 0;   // next slot to write
-int s_count = 0;  // lines held
-uint32_t s_seq = 0;  // lines ever stored
+// CrossInk restarts the chip around every network task (SilentRestart.h: sync,
+// catalog, downloads), so a log in ordinary RAM is gone before anyone opens
+// the Diagnostics page. RTC_NOINIT survives software restarts (as CrossInk's
+// silentReboot flags do); a power-on leaves garbage, caught by the magic.
+constexpr int LINES = 16;
+constexpr int WIDTH = 80;  // RTC memory is small: ~1.7 KB free on the S3
+constexpr uint32_t MAGIC = 0x544c4f47;  // "TLOG"
+
+struct Ring {
+  uint32_t magic;
+  int head;       // next slot to write
+  int count;      // lines held
+  uint32_t seq;   // lines ever stored
+  char lines[LINES][WIDTH];
+};
+RTC_NOINIT_ATTR Ring s_ring;
+bool s_checked = false;  // this boot
 portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 const char* const TAGS[] = {"tailnet",  "microlink", "ml_coord", "ml_coord_tls", "ml_derp",    "ml_filter", "ml_h2",
@@ -36,8 +48,31 @@ bool ours(const char* tag) {
   return false;
 }
 
+void push(const char* text) {
+  const size_t n = strnlen(text, WIDTH - 1);
+  memcpy(s_ring.lines[s_ring.head], text, n);
+  s_ring.lines[s_ring.head][n] = '\0';
+  s_ring.head = (s_ring.head + 1) % LINES;
+  if (s_ring.count < LINES) s_ring.count++;
+  s_ring.seq++;
+}
+
+// Under s_lock. First touch this boot: keep a valid ring and mark the restart,
+// or start over.
+void checkRing() {
+  if (s_checked) return;
+  s_checked = true;
+  if (s_ring.magic != MAGIC || s_ring.head < 0 || s_ring.head >= LINES || s_ring.count < 0 ||
+      s_ring.count > LINES) {
+    memset(&s_ring, 0, sizeof(s_ring));
+    s_ring.magic = MAGIC;
+  } else if (s_ring.count) {
+    push("--- restart ---");
+  }
+}
+
 void store(const char* fmt, va_list args) {
-  char line[WIDTH];
+  char line[WIDTH + 24];
   vsnprintf(line, sizeof(line), fmt, args);
 
   // Drop ANSI colour codes and the trailing newline; skip blank lines.
@@ -55,10 +90,8 @@ void store(const char* fmt, va_list args) {
   clean[j] = '\0';
   if (!j) return;
   portENTER_CRITICAL(&s_lock);
-  memcpy(s_lines[s_head], clean, j + 1);
-  s_head = (s_head + 1) % LINES;
-  if (s_count < LINES) s_count++;
-  s_seq++;
+  checkRing();
+  push(clean);
   portEXIT_CRITICAL(&s_lock);
 }
 
@@ -105,9 +138,10 @@ extern "C" bool tailnet_log_line(int newest_index, char* buf, size_t len) {
   if (!buf || !len) return false;
   bool ok = false;
   portENTER_CRITICAL(&s_lock);
-  if (newest_index >= 0 && newest_index < s_count) {
-    const int slot = (s_head - 1 - newest_index + LINES) % LINES;
-    strncpy(buf, s_lines[slot], len - 1);
+  checkRing();
+  if (newest_index >= 0 && newest_index < s_ring.count) {
+    const int slot = (s_ring.head - 1 - newest_index + LINES) % LINES;
+    strncpy(buf, s_ring.lines[slot], len - 1);
     buf[len - 1] = '\0';
     ok = true;
   }
@@ -117,7 +151,8 @@ extern "C" bool tailnet_log_line(int newest_index, char* buf, size_t len) {
 
 extern "C" uint32_t tailnet_log_seq(void) {
   portENTER_CRITICAL(&s_lock);
-  const uint32_t v = s_seq;
+  checkRing();
+  const uint32_t v = s_ring.seq;
   portEXIT_CRITICAL(&s_lock);
   return v;
 }
