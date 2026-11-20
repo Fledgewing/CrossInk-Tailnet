@@ -112,16 +112,18 @@ behave like a normal Tailscale client:
 - **Closest region.** Each time it connects, the reader times a STUN probe to every relay region
   and makes the fastest its home (kept unless another is a third faster). With UDP blocked it
   keeps its previous home.
-- **Per-peer relays.** Packets for a peer go through that peer's home region. The reader opens a
-  second relay connection for it on demand (one at a time, ~25 KB of RAM) and closes it after a
-  minute idle; if that region can't be reached it falls back to its own.
+- **Per-peer relays** (off by default). Packets for a peer can go through that peer's home region
+  over a second relay connection, opened on demand and closed after a minute idle. Each costs a TLS
+  session of internal RAM, which the X4 Pro can't spare next to CrossInk's own connections, so it's
+  built with `CONFIG_ML_DERP_EXTRA_CONNS 0` (`tailnet/ml_config.h`). Peers running Tailscale reach
+  the reader through its home region anyway.
 
 **Settings > Tailscale > Relay region** overrides the choice of home region:
 
-- **Automatic (closest)**: the default, as above.
-- **Match BookOrbit server**: the reader's home follows the home region of the tailnet server it
+- **Match BookOrbit server** (default): the reader's home follows the home region of the tailnet server it
   connects to (learned on first use and remembered; it restarts MicroLink once if the server moves).
-  Useful when UDP is blocked, so the probe can't run and nothing needs the second connection.
+  Until it has learned the server's region it uses the closest.
+- **Automatic (closest)**: as above.
 - **A fixed region** (e.g. `sea`): listed once the reader has connected at least once.
 
 **Settings > Tailscale > Diagnostics** shows both regions ("Relay: ours sea, server sea").
@@ -136,8 +138,6 @@ behave like a normal Tailscale client:
 - The tailnet key is stored in the reader's internal flash, unencrypted (MicroLink's design).
   Limit the reader with an ACL tag, and remove it in the admin console if it's lost.
 - MicroLink is an independent, beta implementation of the Tailscale protocol (see its README).
-- One relay connection besides the reader's own: servers homed in several different relay regions
-  take turns (each switch costs a TLS handshake).
 
 ## Building locally
 

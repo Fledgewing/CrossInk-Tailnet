@@ -21,6 +21,8 @@ extern "C" {
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
 void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, char* peer, size_t len);
 void tailnet_ml_set_forced_region(microlink_t* ml, uint16_t region);
+void tailnet_ml_request_handshake(microlink_t* ml, uint32_t vpn_ip);
+bool tailnet_ml_tunnel_up(microlink_t* ml, uint32_t vpn_ip);
 uint16_t tailnet_ml_home_region(const microlink_t* ml);
 uint16_t tailnet_ml_peer_region(const microlink_t* ml, uint32_t vpn_ip);
 int tailnet_ml_regions(const microlink_t* ml, uint16_t* ids, char (*codes)[8], int max);
@@ -30,7 +32,7 @@ int tailnet_ml_regions(const microlink_t* ml, uint16_t* ids, char (*codes)[8], i
 // log_x macros, which CORE_DEBUG_LEVEL compiles out. Write to the ESP-IDF log
 // directly so TailnetLog.cpp captures these lines.
 #define TLOG(level, letter, fmt, ...) \
-  esp_log_write(level, TAG, letter " (%lu) %s: " fmt "\n", (unsigned long)esp_log_timestamp(), TAG, ##__VA_ARGS__)
+  tailnet_log_emit(letter " (%lu) %s: " fmt "\n", (unsigned long)esp_log_timestamp(), TAG, ##__VA_ARGS__)
 #define TLOGE(fmt, ...) TLOG(ESP_LOG_ERROR, "E", fmt, ##__VA_ARGS__)
 #define TLOGW(fmt, ...) TLOG(ESP_LOG_WARN, "W", fmt, ##__VA_ARGS__)
 #define TLOGI(fmt, ...) TLOG(ESP_LOG_INFO, "I", fmt, ##__VA_ARGS__)
@@ -178,8 +180,8 @@ void stopMl() {
   setStatus(TAILNET_OFF);
 }
 
-uint32_t nvsGetU32(const char* key) {
-  uint32_t v = 0;
+uint32_t nvsGetU32(const char* key, uint32_t missing = 0) {
+  uint32_t v = missing;
   nvs_handle_t h;
   if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
     nvs_get_u32(h, key, &v);
@@ -202,8 +204,10 @@ void loadRelay() {
   s_relay_fixed.store((int)nvsGetU32(NVS_KEY_RELAY_FIXED));
   s_server_rgn.store((int)nvsGetU32(NVS_KEY_SERVER_RGN));
   s_server_ip.store(nvsGetU32(NVS_KEY_SERVER_IP));
-  uint32_t m = nvsGetU32(NVS_KEY_RELAY_MODE);
-  s_relay_mode.store(m <= TAILNET_RELAY_FIXED ? (int)m : 0);
+  // Default: match the server. Both ends then share one relay region without
+  // a second relay connection, which the readers' internal RAM can't spare.
+  uint32_t m = nvsGetU32(NVS_KEY_RELAY_MODE, TAILNET_RELAY_MATCH_SERVER);
+  s_relay_mode.store(m <= TAILNET_RELAY_FIXED ? (int)m : TAILNET_RELAY_MATCH_SERVER);
 }
 
 // The home region to force at start (0 = let MicroLink pick the closest).
@@ -484,6 +488,27 @@ static void rememberServer(uint32_t ip) {
   if (s_server_ip.exchange(ip) != ip) nvsSetU32(NVS_KEY_SERVER_IP, ip);
 }
 
+// Bring up the WireGuard session to a peer before the caller's TCP SYN goes
+// out (see tailnet_ml_request_handshake). Re-asks every 2.5 s: a request made
+// before the relay connection is up is dropped. A peer that never answers is
+// left to the caller's own timeout.
+static void bringUpTunnel(uint32_t ip, uint32_t timeout_ms) {
+  if (tailnet_ml_tunnel_up(s_ml, ip)) return;
+  const uint32_t limit = timeout_ms < 15000 ? timeout_ms : 15000;
+  uint32_t waited = 0;
+  tailnet_ml_request_handshake(s_ml, ip);
+  while (!tailnet_ml_tunnel_up(s_ml, ip) && waited < limit && s_ml) {
+    vTaskDelay(pdMS_TO_TICKS(250));
+    waited += 250;
+    if (waited % 2500 == 0) tailnet_ml_request_handshake(s_ml, ip);
+  }
+  if (tailnet_ml_tunnel_up(s_ml, ip)) {
+    TLOGW("tunnel to %u.%u.%u.%u up after %lu ms", IP_ARGS(ip), (unsigned long)waited);
+  } else {
+    TLOGW("tunnel to %u.%u.%u.%u: no WireGuard session after %lu ms", IP_ARGS(ip), (unsigned long)waited);
+  }
+}
+
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   s_last_target.store(ip);
   if (!tailnet_wait_connected(timeout_ms)) {
@@ -494,6 +519,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (peerKnown(ip)) {
     rememberServer(ip);
+    bringUpTunnel(ip, timeout_ms);
     return true;
   }
   if (ip == s_pin.load() || !markTried(ip)) {
@@ -512,6 +538,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   if (known) {
     TLOGW("connect %u.%u.%u.%u: peer added after pinning", IP_ARGS(ip));
     rememberServer(ip);
+    bringUpTunnel(ip, timeout_ms);
   } else {
     TLOGW("connect %u.%u.%u.%u: still not a peer after pinning (check ACLs)", IP_ARGS(ip));
   }

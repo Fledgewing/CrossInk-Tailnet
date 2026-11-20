@@ -66,3 +66,13 @@ int tailnet_ml_regions(const microlink_t *ml, uint16_t *ids, char (*codes)[8], i
     }
     return n;
 }
+
+/* WireGuard session to a peer. MicroLink's own microlink_tcp_connect() asks
+ * wg_mgr for a handshake and waits for it; plain sockets (CrossInk's HTTP
+ * clients) never ask, and its peers start passive, so a peer with no direct
+ * path (relay only) never gets a session. The shim does what that API does. */
+void tailnet_ml_request_handshake(microlink_t *ml, uint32_t vpn_ip) {
+    if (ml) ml_wg_mgr_post_request(ml, ML_PEER_REQ_HANDSHAKE, vpn_ip);
+}
+
+bool tailnet_ml_tunnel_up(microlink_t *ml, uint32_t vpn_ip) { return ml && ml_wg_mgr_peer_is_up(ml, vpn_ip); }

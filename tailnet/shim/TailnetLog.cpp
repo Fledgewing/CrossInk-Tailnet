@@ -3,9 +3,9 @@
 // The prebuilt framework has CONFIG_LOG_MAXIMUM_LEVEL=ERROR, and
 // esp_log_level_set() cannot raise a tag above it: INFO and WARN lines from
 // MicroLink and the shim are dropped inside esp_log before any vprintf hook
-// sees them. So the link wraps esp_log (MicroLink's ESP_LOGx) and
-// esp_log_write (the shim's TLOG) (tailnet_build.py): lines from our tags are
-// kept here first, then passed on unchanged (the console still filters them).
+// sees them. So the link wraps esp_log (MicroLink's ESP_LOGx;
+// tailnet_build.py), and the shim logs through tailnet_log_emit: lines from our tags are
+// kept here and printed to the console directly.
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <stdarg.h>
@@ -71,27 +71,32 @@ void __wrap_esp_log(esp_log_config_t config, const char* tag, const char* format
   va_list args;
   va_start(args, format);
   if (!config.opts.constrained_env && ours(tag)) {
+    // Ours: keep it, and print it ourselves (esp_log_va would drop it).
     va_list copy;
     va_copy(copy, args);
     store(format, copy);
     va_end(copy);
+    vprintf(format, args);
+  } else {
+    esp_log_va(config, tag, format, args);
   }
-  esp_log_va(config, tag, format, args);
   va_end(args);
 }
 
-void __wrap_esp_log_write(esp_log_level_t level, const char* tag, const char* format, ...) {
+}
+
+// The shim's own lines (TLOG, connect lines): kept and printed directly.
+// Not a wrap of esp_log_write: the C3 build's Arduino core already wraps it
+// (esp32-hal-log-wrapper.c).
+extern "C" void tailnet_log_emit(const char* format, ...) {
   va_list args;
   va_start(args, format);
-  if (ours(tag)) {
-    va_list copy;
-    va_copy(copy, args);
-    store(format, copy);
-    va_end(copy);
-  }
-  esp_log_writev(level, tag, format, args);
+  va_list copy;
+  va_copy(copy, args);
+  store(format, copy);
+  va_end(copy);
+  vprintf(format, args);
   va_end(args);
-}
 }
 
 extern "C" void tailnet_log_install(void) {}

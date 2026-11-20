@@ -78,7 +78,7 @@ extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t
     // Every outgoing connection is logged for Settings > Tailscale >
     // Diagnostics: it shows whether a server name resolved to its tailnet
     // address at all.
-    esp_log_write(ESP_LOG_WARN, "tailnet", "W (%lu) tailnet: connect %u.%u.%u.%u:%u%s\n",
+    tailnet_log_emit("W (%lu) tailnet: connect %u.%u.%u.%u:%u%s\n",
                   (unsigned long)esp_log_timestamp(), (unsigned)(ip >> 24) & 0xff, (unsigned)(ip >> 16) & 0xff,
                   (unsigned)(ip >> 8) & 0xff, (unsigned)ip & 0xff, port, isTailnetAddr(ip) ? " (tailnet)" : "");
     if (isTailnetAddr(ip) && !tailnet_ensure_peer(ip, WAIT_MS) && tailnet_status() == TAILNET_CONNECTED) {

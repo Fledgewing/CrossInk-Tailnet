@@ -76,7 +76,7 @@ typedef struct {
 } tailnet_diag_t;
 void tailnet_get_diag(tailnet_diag_t* out);
 
-// Home relay (DERP) region. AUTO: the closest, measured at each start.
+// Home relay (DERP) region; MATCH_SERVER by default. AUTO: the closest, measured at each start.
 // MATCH_SERVER: the home region of the BookOrbit server (the tailnet address
 // the reader last connected to, or the pinned one), learned and remembered.
 // FIXED: a region the user picked. Persisted; applying it restarts MicroLink.
@@ -92,7 +92,9 @@ void tailnet_relay_code(uint16_t id, char* out, size_t len);
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.
 bool tailnet_log_line(int newest_index, char* buf, size_t len);
-uint32_t tailnet_log_seq(void);  // changes whenever a line is added
+uint32_t tailnet_log_seq(void);
+// Log a shim line (printf format, with its own level prefix and newline).
+void tailnet_log_emit(const char* format, ...) __attribute__((format(printf, 1, 2)));  // changes whenever a line is added
 void tailnet_log_install(void);  // called once at startup by the shim
 
 // Resolve a tailnet name ("bookorbit", "bookorbit.tail1234.ts.net") to an IPv4

@@ -23,9 +23,13 @@
 /* DERP home region before the first latency probe; MicroLink then picks the
  * closest region itself (patches/microlink). */
 #define CONFIG_ML_DERP_REGION 9
-/* Relay connections to other peers' home regions, besides our own: one TLS
- * session (~25 KB internal RAM) each while open. The reader needs one server. */
-#define CONFIG_ML_DERP_EXTRA_CONNS 1
+/* Relay connections to other peers' home regions, besides our own. Off: each
+ * is a TLS session in internal RAM (the prebuilt mbedTLS can't use PSRAM), and
+ * on the X4 Pro a third session next to CrossInk's own fails to allocate
+ * (-0x7f00, seen on a device). Peers running tailscaled reach the reader
+ * through its home region anyway, and Relay region > Match server (the
+ * default) puts both ends in one region. */
+#define CONFIG_ML_DERP_EXTRA_CONNS 0
 /* The prebuilt Arduino mbedTLS has the certificate bundle; see
  * tailnet_build.py, which checks CONFIG_MBEDTLS_CERTIFICATE_BUNDLE. */
 #define CONFIG_ML_DERP_VERIFY_CERT 1
