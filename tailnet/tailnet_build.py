@@ -62,7 +62,9 @@ def _process_project_deps_with_tailnet(env):
     ml_env.Append(
         CPPPATH=[os.path.join(ml_dir, "include"), os.path.join(ml_dir, "src"), wg_dir,
                  os.path.join(wg_dir, "crypto", "refc")],
-        CPPDEFINES=["WIREGUARD_CRYPTO_REFC"],
+        # The framework compiles logs below ERROR out; MicroLink and the shim
+        # keep INFO so TailnetLog.cpp can show them on the Tailscale screen.
+        CPPDEFINES=["WIREGUARD_CRYPTO_REFC", ("LOG_LOCAL_LEVEL", 3)],
         CCFLAGS=["-include", config_h, "-Wno-stringop-overread"],
     )
     # The peer table stays small (ml_config.h: 16; 8 here on the C3): the reader

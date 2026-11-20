@@ -20,6 +20,7 @@
 // and restarts it, so the server is added (see tailnet_ensure_peer).
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -70,7 +71,13 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
 extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t namelen) {
   if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in)) {
     const uint32_t ip = lwip_ntohl(reinterpret_cast<const struct sockaddr_in*>(name)->sin_addr.s_addr);
-    if (isTailnetAddr(ip) && tailnet_enabled()) tailnet_ensure_peer(ip, WAIT_MS);
+    if (isTailnetAddr(ip) && tailnet_enabled() && !tailnet_ensure_peer(ip, WAIT_MS) &&
+        tailnet_status() == TAILNET_CONNECTED) {
+      // Connected, but this address is not a peer: MicroLink would drop the
+      // packets and the caller would wait out its whole timeout. Fail now.
+      errno = EHOSTUNREACH;
+      return -1;
+    }
   }
   return __real_lwip_connect(s, name, namelen);
 }

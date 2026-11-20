@@ -62,6 +62,23 @@ bool tailnet_wait_connected(uint32_t timeout_ms);
 // Tried once per peer per WiFi session. Blocks up to about 2 x timeout_ms.
 bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms);
 
+// Diagnostics for the Tailscale screen.
+typedef struct {
+  int peer_count;      // peers MicroLink tracks now
+  uint32_t pin_ip;     // pinned (priority) peer, 0 if none
+  uint32_t target_ip;  // last tailnet address the reader connected to (else the pin)
+  bool target_known;   // ...is in MicroLink's peer table
+  bool target_online;  // ...is online according to the control plane
+  bool target_direct;  // ...is reached directly (else via a DERP relay)
+} tailnet_diag_t;
+void tailnet_get_diag(tailnet_diag_t* out);
+
+// Recent MicroLink and shim log lines, newest first (index 0). False past the
+// end. Captured in RAM because the framework's console log is mostly off.
+bool tailnet_log_line(int newest_index, char* buf, size_t len);
+uint32_t tailnet_log_seq(void);  // changes whenever a line is added
+void tailnet_log_install(void);  // called once at startup by the shim
+
 // Resolve a tailnet name ("bookorbit", "bookorbit.tail1234.ts.net") to an IPv4
 // address in host byte order via MicroLink's peer list. 0 if unknown.
 uint32_t tailnet_resolve(const char* name);

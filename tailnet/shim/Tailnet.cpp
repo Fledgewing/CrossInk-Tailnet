@@ -18,6 +18,15 @@ extern "C" {
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);  // ml_priority.c
 }
 
+// Arduino's esp32-hal-log.h (pulled in by WiFi.h) turns ESP_LOGx into its own
+// log_x macros, which CORE_DEBUG_LEVEL compiles out. Write to the ESP-IDF log
+// directly so TailnetLog.cpp captures these lines.
+#define TLOG(level, letter, fmt, ...) \
+  esp_log_write(level, TAG, letter " (%lu) %s: " fmt "\n", (unsigned long)esp_log_timestamp(), TAG, ##__VA_ARGS__)
+#define TLOGE(fmt, ...) TLOG(ESP_LOG_ERROR, "E", fmt, ##__VA_ARGS__)
+#define TLOGW(fmt, ...) TLOG(ESP_LOG_WARN, "W", fmt, ##__VA_ARGS__)
+#define TLOGI(fmt, ...) TLOG(ESP_LOG_INFO, "I", fmt, ##__VA_ARGS__)
+
 namespace {
 
 const char* TAG = "tailnet";
@@ -94,7 +103,7 @@ void refreshFromHandle() {
       memcpy(s_url, url, sizeof(s_url));
       portEXIT_CRITICAL(&s_url_lock);
       if (changed) {
-        ESP_LOGW(TAG, "Tailscale login needed: %s", url);
+        TLOGW("Tailscale login needed: %s", url);
         s_generation.fetch_add(1);
       }
     }
@@ -140,7 +149,7 @@ void stopMl() {
   // stuck in a blocking call; a later call resumes the wait.
   for (int i = 0; i < 4; i++) {
     if (microlink_stop(s_ml) == ESP_OK) break;
-    ESP_LOGW(TAG, "microlink_stop timed out; retrying");
+    TLOGW("microlink_stop timed out; retrying");
   }
   s_running = false;
   s_ip.store(0);
@@ -183,7 +192,7 @@ void startMl() {
     cfg.device_name = nullptr;  // esp32-<mac>; rename it in the admin console
     s_ml = microlink_init(&cfg);
     if (!s_ml) {
-      ESP_LOGE(TAG, "microlink_init failed (free heap %u)", (unsigned)esp_get_free_heap_size());
+      TLOGE("microlink_init failed (free heap %u)", (unsigned)esp_get_free_heap_size());
       setStatus(TAILNET_FAILED);
       return;
     }
@@ -195,12 +204,12 @@ void startMl() {
   setStatus(TAILNET_STARTING);
   const esp_err_t err = microlink_start(s_ml);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "microlink_start: %s", esp_err_to_name(err));
+    TLOGE("microlink_start: %s", esp_err_to_name(err));
     setStatus(TAILNET_FAILED);
     return;
   }
   s_running = true;
-  ESP_LOGI(TAG, "MicroLink started");
+  TLOGI("MicroLink started");
 }
 
 void reconcile() {
@@ -234,14 +243,14 @@ void workerTask(void*) {
           }
           microlink_factory_reset();
           storeFlag(NVS_KEY_JOINED, s_joined, false);
-          ESP_LOGW(TAG, "Tailnet identity erased");
+          TLOGW("Tailnet identity erased");
           break;
         case REQ_REPIN:
           // A peer the reader needs is not in MicroLink's table (a large
           // tailnet fills it). Restart with it pinned: the fresh map lets it
           // evict the least recently used peer. Keys and login are kept.
           if (s_running) {
-            ESP_LOGW(TAG, "Pinning %u.%u.%u.%u as priority peer; restarting MicroLink",
+            TLOGW("Pinning %u.%u.%u.%u as priority peer; restarting MicroLink",
                      (unsigned)(s_pin >> 24) & 0xff, (unsigned)(s_pin >> 16) & 0xff, (unsigned)(s_pin >> 8) & 0xff,
                      (unsigned)s_pin & 0xff);
             stopMl();
@@ -279,6 +288,7 @@ void onWifiEvent(arduino_event_id_t event) {
 // neither CrossInk, the FreeInk SDK nor the S3/C3 variants define one, so this
 // strong definition is the hook. A future clash would fail the link loudly.
 extern "C" void initVariant() {
+  tailnet_log_install();
   s_queue = xQueueCreate(8, sizeof(Request));
   // MicroLink's own tasks do the network work; this one only sequences
   // start/stop, but microlink_init() and NVS writes need some stack.
@@ -366,17 +376,55 @@ bool markTried(uint32_t ip) {
 }
 }  // namespace
 
+#define IP_ARGS(ip) (unsigned)((ip) >> 24) & 0xff, (unsigned)((ip) >> 16) & 0xff, (unsigned)((ip) >> 8) & 0xff, \
+                    (unsigned)(ip) & 0xff
+
+static std::atomic<uint32_t> s_last_target{0};
+
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
-  if (!tailnet_wait_connected(timeout_ms)) return false;
+  s_last_target.store(ip);
+  if (!tailnet_wait_connected(timeout_ms)) {
+    TLOGW("connect %u.%u.%u.%u: tailnet not connected", IP_ARGS(ip));
+    return false;
+  }
   // A fresh map may still be filling the table just after CONNECTED.
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (peerKnown(ip)) return true;
-  if (ip == s_pin.load() || !markTried(ip)) return false;  // already pinned or tried
+  if (ip == s_pin.load() || !markTried(ip)) {
+    TLOGW("connect %u.%u.%u.%u: not a peer of this reader (check ACLs)", IP_ARGS(ip));
+    return false;
+  }
+  TLOGW("connect %u.%u.%u.%u: not in peer table (%d peers); pinning", IP_ARGS(ip),
+           s_ml ? microlink_get_peer_count(s_ml) : 0);
   storePin(ip);  // remembered across reboots: pinned from the next start on
   post(REQ_REPIN);
   // Wait for the restart to begin, then for it to finish.
   for (int i = 0; i < 50 && tailnet_status() == TAILNET_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (!tailnet_wait_connected(timeout_ms)) return false;
   for (int i = 0; i < 50 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
-  return peerKnown(ip);
+  const bool known = peerKnown(ip);
+  if (known) {
+    TLOGW("connect %u.%u.%u.%u: peer added after pinning", IP_ARGS(ip));
+  } else {
+    TLOGW("connect %u.%u.%u.%u: still not a peer after pinning (check ACLs)", IP_ARGS(ip));
+  }
+  return known;
+}
+
+extern "C" void tailnet_get_diag(tailnet_diag_t* out) {
+  if (!out) return;
+  *out = {};
+  out->pin_ip = s_pin.load();
+  out->target_ip = s_last_target.load();
+  if (!out->target_ip) out->target_ip = out->pin_ip;
+  if (!s_ml || tailnet_status() != TAILNET_CONNECTED) return;
+  out->peer_count = microlink_get_peer_count(s_ml);
+  microlink_peer_info_t info;
+  for (int i = 0; i < out->peer_count; i++) {
+    if (microlink_get_peer_info(s_ml, i, &info) == ESP_OK && info.vpn_ip == out->target_ip && out->target_ip) {
+      out->target_known = true;
+      out->target_online = info.online;
+      out->target_direct = info.direct_path;
+    }
+  }
 }
