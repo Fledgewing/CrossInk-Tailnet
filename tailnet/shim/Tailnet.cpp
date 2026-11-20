@@ -8,6 +8,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
 #include <nvs.h>
 #include <stdio.h>
 #include <string.h>
@@ -358,6 +360,10 @@ void workerTask(void*) {
 void onWifiEvent(arduino_event_id_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      // lwIP's DNS cache outlives a change of network: a name answered by
+      // the home network's split DNS (a LAN address) would be reused on
+      // another network until its TTL ran out. Start each network clean.
+      tcpip_callback([](void*) { dns_clear_cache(); }, nullptr);
       post(REQ_WIFI_UP);
       break;
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
