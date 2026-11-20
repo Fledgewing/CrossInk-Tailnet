@@ -11,6 +11,7 @@
 #include "MappedInputManager.h"
 #include "Tailnet.h"
 #include "activities/network/WifiSelectionActivity.h"
+#include "activities/util/ConfirmationActivity.h"
 #include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -98,8 +99,20 @@ void TailnetSettingsActivity::activate(const int row) {
       break;
     case ROW_ACCOUNT:
       if (tailnet_joined()) {
-        tailnet_logout();
-        loggedOutNotice = true;
+        // Logging out forgets this reader's Tailscale identity: getting back
+        // needs a new QR login (and re-tagging it in the admin console).
+        startActivityForResult(
+            std::make_unique<ConfirmationActivity>(
+                renderer, mappedInput, "Log out of Tailscale?",
+                "This reader leaves your tailnet. To reconnect you'll need to log in again with the QR code."),
+            [this](const ActivityResult& result) {
+              if (!result.isCancelled) {
+                tailnet_logout();
+                loggedOutNotice = true;
+              }
+              requestUpdate();
+            });
+        return;
       } else {
         startLogin();
         return;
