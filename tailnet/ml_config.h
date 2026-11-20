@@ -20,9 +20,21 @@
 #define CONFIG_ML_NVS_MAX_PEERS 16
 #define CONFIG_ML_PRIORITY_PEER_IP ""
 
-/* DERP home region. 9 = Dallas; override with -DCONFIG_ML_DERP_REGION=N. */
+/* DERP home region, chosen at run time by the shim (Tailnet.cpp): it starts at
+ * 9 (Dallas, MicroLink's default) and follows the home region of the tailnet
+ * server the reader talks to. MicroLink keeps a single DERP connection, to
+ * its home region, and Tailscale's regions do not forward to each other, so
+ * a relayed path only works when both ends share a region. Every use of
+ * ML_DERP_REGION in MicroLink is a run-time expression. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int tailnet_derp_region(void);
+#ifdef __cplusplus
+}
+#endif
 #ifndef CONFIG_ML_DERP_REGION
-#define CONFIG_ML_DERP_REGION 9
+#define CONFIG_ML_DERP_REGION (tailnet_derp_region())
 #endif
 /* The prebuilt Arduino mbedTLS has the certificate bundle; see
  * tailnet_build.py, which checks CONFIG_MBEDTLS_CERTIFICATE_BUNDLE. */

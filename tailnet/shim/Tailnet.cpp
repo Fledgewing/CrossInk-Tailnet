@@ -15,7 +15,8 @@
 
 extern "C" {
 #include "microlink.h"
-void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);  // ml_priority.c
+void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
+uint16_t tailnet_ml_peer_derp_region(const microlink_t* ml, uint32_t vpn_ip);
 }
 
 // Arduino's esp32-hal-log.h (pulled in by WiFi.h) turns ESP_LOGx into its own
@@ -34,6 +35,8 @@ const char* NVS_NS = "tailnet";
 const char* NVS_KEY_ENABLED = "enabled";
 const char* NVS_KEY_JOINED = "joined";  // set once connected; cleared by logout
 const char* NVS_KEY_PIN = "pin_ip";     // learned priority peer (host byte order)
+const char* NVS_KEY_DERP = "derp";      // learned DERP home region
+constexpr uint16_t DEFAULT_DERP_REGION = 9;  // Dallas, MicroLink's default
 
 enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, REQ_REPIN };
 
@@ -48,6 +51,8 @@ std::atomic<uint32_t> s_ip{0};
 std::atomic<int> s_enabled{-1};  // -1 = not loaded from NVS yet
 std::atomic<int> s_joined{-1};   // -1 = not loaded from NVS yet
 std::atomic<uint32_t> s_pin{0};  // priority peer; loaded once at the first start
+std::atomic<int> s_derp{-1};     // DERP home region; -1 = not loaded from NVS yet
+bool s_derp_switched = false;    // this WiFi session (written by tailnet_ensure_peer callers)
 bool s_pin_loaded = false;       // worker task only
 // Peers already re-pinned this WiFi session (no restart loops for a peer that
 // is offline or not on the tailnet). Written by callers of tailnet_ensure_peer.
@@ -233,6 +238,7 @@ void workerTask(void*) {
           s_wifi_up = false;
           portENTER_CRITICAL(&s_tried_lock);
           memset(s_tried, 0, sizeof(s_tried));
+          s_derp_switched = false;
           portEXIT_CRITICAL(&s_tried_lock);
           break;
         case REQ_LOGOUT:
@@ -250,9 +256,9 @@ void workerTask(void*) {
           // tailnet fills it). Restart with it pinned: the fresh map lets it
           // evict the least recently used peer. Keys and login are kept.
           if (s_running) {
-            TLOGW("Pinning %u.%u.%u.%u as priority peer; restarting MicroLink",
-                     (unsigned)(s_pin >> 24) & 0xff, (unsigned)(s_pin >> 16) & 0xff, (unsigned)(s_pin >> 8) & 0xff,
-                     (unsigned)s_pin & 0xff);
+            TLOGW("Restarting MicroLink (priority peer %u.%u.%u.%u, relay region %d)", (unsigned)(s_pin >> 24) & 0xff,
+                  (unsigned)(s_pin >> 16) & 0xff, (unsigned)(s_pin >> 8) & 0xff, (unsigned)s_pin & 0xff,
+                  tailnet_derp_region());
             stopMl();
           }
           break;
@@ -381,6 +387,53 @@ bool markTried(uint32_t ip) {
 
 static std::atomic<uint32_t> s_last_target{0};
 
+extern "C" int tailnet_derp_region(void) {
+  int v = s_derp.load();
+  if (v >= 0) return v;
+  uint16_t r = 0;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+    nvs_get_u16(h, NVS_KEY_DERP, &r);
+    nvs_close(h);
+  }
+  v = r ? r : DEFAULT_DERP_REGION;
+  s_derp.store(v);
+  return v;
+}
+
+namespace {
+void storeDerp(uint16_t region) {
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_u16(h, NVS_KEY_DERP, region);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+  s_derp.store(region);
+}
+
+// The server's relay region differs from ours: move ours to it and restart,
+// once per WiFi session. Returns true if a restart was made.
+bool followPeerRegion(uint32_t ip, uint32_t timeout_ms) {
+  const uint16_t region = tailnet_ml_peer_derp_region(s_ml, ip);
+  if (!region || region == tailnet_derp_region()) return false;
+  bool first;
+  portENTER_CRITICAL(&s_tried_lock);
+  first = !s_derp_switched;
+  s_derp_switched = true;
+  portEXIT_CRITICAL(&s_tried_lock);
+  if (!first) return false;
+  TLOGW("relay region %d -> %d (home of %u.%u.%u.%u); restarting MicroLink", tailnet_derp_region(), region,
+        IP_ARGS(ip));
+  storeDerp(region);
+  post(REQ_REPIN);  // same restart path: stop, then start with the new region
+  for (int i = 0; i < 50 && tailnet_status() == TAILNET_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(100));
+  tailnet_wait_connected(timeout_ms);
+  for (int i = 0; i < 50 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
+  return true;
+}
+}  // namespace
+
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   s_last_target.store(ip);
   if (!tailnet_wait_connected(timeout_ms)) {
@@ -389,7 +442,10 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   }
   // A fresh map may still be filling the table just after CONNECTED.
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
-  if (peerKnown(ip)) return true;
+  if (peerKnown(ip)) {
+    followPeerRegion(ip, timeout_ms);
+    return peerKnown(ip);
+  }
   if (ip == s_pin.load() || !markTried(ip)) {
     TLOGW("connect %u.%u.%u.%u: not a peer of this reader (check ACLs)", IP_ARGS(ip));
     return false;
@@ -402,9 +458,11 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   for (int i = 0; i < 50 && tailnet_status() == TAILNET_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (!tailnet_wait_connected(timeout_ms)) return false;
   for (int i = 0; i < 50 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
-  const bool known = peerKnown(ip);
+  bool known = peerKnown(ip);
   if (known) {
     TLOGW("connect %u.%u.%u.%u: peer added after pinning", IP_ARGS(ip));
+    followPeerRegion(ip, timeout_ms);
+    known = peerKnown(ip);
   } else {
     TLOGW("connect %u.%u.%u.%u: still not a peer after pinning (check ACLs)", IP_ARGS(ip));
   }
