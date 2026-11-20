@@ -1,0 +1,183 @@
+name: Build
+# Builds CrossInk-Bookorbit's latest release with the Tailnet overlay applied.
+#
+# - push / pull request: build every reader (no release).
+# - daily schedule and manual runs: build, then publish a release when this
+#   (upstream tag, overlay commit) pair has not been released yet. Readers see
+#   it under Settings > Check for updates, because the overlay points their
+#   updater at this repo's releases.
+#
+# Release versions keep upstream's and add a fourth number that only ever goes
+# up (the workflow run number): upstream v1.6.1+bookorbit.8 becomes
+# v1.6.1.<run>+bookorbit.8. CrossInk's updater compares four numeric parts, so
+# a new upstream release or an overlay-only rebuild both read as newer.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "CrossInk-Bookorbit tag to build (empty = latest release)"
+        required: false
+        type: string
+      force_release:
+        description: "Publish even if this upstream tag + overlay commit was already released"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: agosez/CrossInk-Bookorbit
+  PIO_CORE: "6.1.19"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      version: ${{ steps.r.outputs.version }}
+      asset_version: ${{ steps.r.outputs.asset_version }}
+      publish: ${{ steps.r.outputs.publish }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          FORCE: ${{ inputs.force_release }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_REF:-$(gh api "repos/$UPSTREAM_REPO/releases/latest" -q .tag_name)}"
+          base="${tag#v}"
+          # 1.6.1+bookorbit.8 -> 1.6.1.<run>+bookorbit.8
+          numeric="$(printf '%s' "$base" | sed -E 's/^([0-9]+(\.[0-9]+)*).*/\1/')"
+          rest="${base#"$numeric"}"
+          version="${numeric}.${GITHUB_RUN_NUMBER}${rest}"
+          asset_version="$(printf '%s' "$version" | sed 's/[^A-Za-z0-9._-]\{1,\}/-/g')"
+
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" = schedule ] || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            marker="upstream=$tag overlay=$GITHUB_SHA"
+            if [ "$FORCE" = true ] || ! gh api "repos/$GITHUB_REPOSITORY/releases?per_page=50" -q '.[].body' \
+                | grep -qF "$marker"; then
+              publish=true
+            fi
+          fi
+          {
+            echo "upstream_tag=$tag"
+            echo "version=$version"
+            echo "asset_version=$asset_version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream $tag -> $version (publish=$publish)"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: x4-pro
+            firmware: firmware-x4-pro
+          - environment: x4-classic
+            firmware: firmware-x4-classic
+          - environment: default
+            firmware: firmware-x3-x4
+    steps:
+      - name: Check out the overlay
+        uses: actions/checkout@v6
+        with:
+          path: overlay
+          submodules: recursive
+
+      - name: Check out CrossInk-Bookorbit ${{ needs.resolve.outputs.upstream_tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          path: upstream
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: ${{ runner.os }}-pio-${{ env.PIO_CORE }}-${{ hashFiles('upstream/platformio.ini') }}
+
+      # Same toolchain setup as upstream's release workflow.
+      - name: Install PlatformIO Core
+        run: uv pip install --system -U "https://github.com/pioarduino/platformio-core/archive/refs/tags/v${PIO_CORE}.zip"
+
+      - name: Pin pioarduino core inside the platform penv
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          pio pkg install -e "${{ matrix.environment }}"
+          uv pip install --python ~/.platformio/penv/bin/python "pioarduino==${PIO_CORE}"
+
+      - name: Apply the overlay
+        run: overlay/scripts/apply.sh upstream
+
+      - name: Set the release version
+        working-directory: upstream
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: sed -i "/^\[crossink\]$/,/^\[/s/^version = .*/version = $VERSION/" platformio.ini
+
+      - name: Build
+        working-directory: upstream
+        env:
+          CROSSINK_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          TAILNET_OVERLAY_REPO: ${{ github.repository }}
+        run: pio run -j1 -e "${{ matrix.environment }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.environment }}
+          path: upstream/.pio/build/${{ matrix.environment }}/${{ matrix.firmware }}-v${{ needs.resolve.outputs.asset_version }}.bin
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+          path: firmware
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.resolve.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: v${{ needs.resolve.outputs.version }}
+          # An upstream release candidate stays a pre-release here too: only
+          # readers with Include Release Candidates on are offered it.
+          prerelease: ${{ contains(needs.resolve.outputs.version, '-rc') }}
+          body: |
+            CrossInk-Bookorbit ${{ needs.resolve.outputs.upstream_tag }} with Tailscale (MicroLink).
+
+            Install over the air from the reader (Settings > Check for updates) once it runs a
+            CrossInk-Tailnet build, or flash the .bin for your reader from an SD card or USB.
+
+            upstream=${{ needs.resolve.outputs.upstream_tag }} overlay=${{ github.sha }}
+          files: firmware/*.bin
