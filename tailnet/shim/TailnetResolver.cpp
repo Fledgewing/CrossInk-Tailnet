@@ -25,6 +25,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include <esp_log.h>
+
 #include "Tailnet.h"
 
 namespace {
@@ -69,10 +71,17 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
 }
 
 extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t namelen) {
-  if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in)) {
-    const uint32_t ip = lwip_ntohl(reinterpret_cast<const struct sockaddr_in*>(name)->sin_addr.s_addr);
-    if (isTailnetAddr(ip) && tailnet_enabled() && !tailnet_ensure_peer(ip, WAIT_MS) &&
-        tailnet_status() == TAILNET_CONNECTED) {
+  if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in) && tailnet_enabled()) {
+    const auto* sin = reinterpret_cast<const struct sockaddr_in*>(name);
+    const uint32_t ip = lwip_ntohl(sin->sin_addr.s_addr);
+    const unsigned port = lwip_ntohs(sin->sin_port);
+    // Every outgoing connection is logged for Settings > Tailscale >
+    // Diagnostics: it shows whether a server name resolved to its tailnet
+    // address at all.
+    esp_log_write(ESP_LOG_WARN, "tailnet", "W (%lu) tailnet: connect %u.%u.%u.%u:%u%s\n",
+                  (unsigned long)esp_log_timestamp(), (unsigned)(ip >> 24) & 0xff, (unsigned)(ip >> 16) & 0xff,
+                  (unsigned)(ip >> 8) & 0xff, (unsigned)ip & 0xff, port, isTailnetAddr(ip) ? " (tailnet)" : "");
+    if (isTailnetAddr(ip) && !tailnet_ensure_peer(ip, WAIT_MS) && tailnet_status() == TAILNET_CONNECTED) {
       // Connected, but this address is not a peer: MicroLink would drop the
       // packets and the caller would wait out its whole timeout. Fail now.
       errno = EHOSTUNREACH;

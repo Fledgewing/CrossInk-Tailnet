@@ -106,7 +106,10 @@ def _process_project_deps_with_tailnet(env):
     ]
     env.Append(PIOBUILDFILES=shim_objs)
     env.Append(LIBS=[microlink_lib])
-    env.Append(LINKFLAGS=["-Wl,--wrap=lwip_getaddrinfo", "-Wl,--wrap=lwip_connect"])
+    env.Append(LINKFLAGS=["-Wl,--wrap=lwip_getaddrinfo", "-Wl,--wrap=lwip_connect",
+                          # TailnetLog.cpp: keep our log lines past the
+                          # prebuilt ERROR-only log level
+                          "-Wl,--wrap=esp_log", "-Wl,--wrap=esp_log_write"])
 
 
 env.AddMethod(_process_project_deps_with_tailnet, "ProcessProjectDeps")  # noqa: F821
