@@ -291,6 +291,32 @@ extern "C" void tailnet_display_tick(void) {
   }
 }
 
+extern "C" bool tailnet_download_progress_unpark(void) {
+#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
+  if (!s_parked.load() || s_net_down.load() || tailnet_status() != TAILNET_CONNECTED) return false;
+  // The framebuffer plus the download's TLS handshake and full-record buffer (~22 KB on
+  // the X3) must fit beside Tailscale: ask for the framebuffer only with that margin left.
+  const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t wanted = display.getBufferSize() + CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN;
+  bool back = false;
+  if (largest >= wanted) {
+    RenderLock lock;
+    back = unparkLocked();
+  }
+  if (!back) {
+    LOG_INF("TNET", "Download progress UI: stays parked (largest %u, wanted %u)", static_cast<unsigned>(largest),
+            static_cast<unsigned>(wanted));
+    return false;
+  }
+  LOG_INF("TNET", "Download progress UI: framebuffer back with the network (largest %u)",
+          static_cast<unsigned>(largest));
+  if (s_pending.exchange(false)) activityManager.requestUpdate(true);
+  return true;
+#else
+  return false;
+#endif
+}
+
 extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
   if (s_restarting.load()) return !s_parked.load();  // a restart's popup: never wait for it
   const uint32_t start = millis();

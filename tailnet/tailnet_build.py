@@ -166,6 +166,11 @@ SWITCHES = {
     # framebuffer back with WiFi and Tailscale kept when the heap has the block; else WiFi goes off and
     # an upload chosen restarts the sync pre-answered. The X4s never park (no-op there).
     "CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK": (1,   0,      0),
+    # Patch 0013: a parked download boot takes the framebuffer back beside Tailscale before the
+    # download when the largest block holds it plus the margin (bytes, for the download's TLS),
+    # and shows the progress bar; else the static "Downloading" screen. The X4s never park.
+    "CROSSINK_TAILNET_DOWNLOAD_PROGRESS": (1,      0,      0),
+    "CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN": (40000, 40000, 40000),
 }
 # Switches that stand for wolfSSL defines rather than a define of their own.
 WOLFSSL_SWITCH_DEFINES = {

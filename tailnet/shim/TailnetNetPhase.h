@@ -61,6 +61,12 @@ uint32_t tailnet_network_boot_target(void);
 // Tailscale): a choice that needs the network must restart instead of failing offline.
 bool tailnet_prompt_dropped_network(void);
 
+// CROSSINK_TAILNET_DOWNLOAD_PROGRESS, main task, in a parked download boot once Tailscale
+// is ready: takes the framebuffer back with WiFi and Tailscale kept when the largest free
+// block holds it plus CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN, so the download shows its
+// progress bar. False: it stays parked (the static "Downloading" screen stays on the panel).
+bool tailnet_download_progress_unpark(void);
+
 // Render task, before an activity renders. False: the framebuffer is parked,
 // skip this render (it is drawn once the framebuffer is back).
 bool tailnet_display_render_gate(void);
