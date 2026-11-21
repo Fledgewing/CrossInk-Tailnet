@@ -23,10 +23,25 @@ index ee0bb49c..30fbae06 100644
  // Logs the calling task's stack high-water mark (bytes never used), for the
  // network-boot loopTask stack cut. Defined in main.cpp.
 diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
-index d5b5b668..bdc833b0 100644
+index d5b5b668..eb6c0a8d 100644
 --- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
 +++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
-@@ -1492,6 +1492,11 @@ void BookOrbitCatalogBrowserActivity::runPendingDownload(const bool wifiConnecte
+@@ -489,7 +489,14 @@ void BookOrbitCatalogBrowserActivity::onEnter() {
+     // C3 + Tailscale: the panel keeps this screen while the framebuffer is parked.
+     showDownloadScreen(pendingDownload.title);
+     requestUpdateAndWait();
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++    // CrossInk 2.x renders nothing an activity asks for while it is still entering
++    // (ActivityManager's enteringActivity gate), so a download run from here would never
++    // draw its progress bar: start it from the first loop() instead.
++    parkedDownloadPending = true;
++#else
+     onWifiSelectionComplete(SavedWifiConnect::connect([] { return false; }));
++#endif
+     return;
+   }
+   state = BrowserState::CHECK_WIFI;
+@@ -1492,6 +1499,11 @@ void BookOrbitCatalogBrowserActivity::runPendingDownload(const bool wifiConnecte
      requestUpdate();
      return;
    }
@@ -38,7 +53,7 @@ index d5b5b668..bdc833b0 100644
    showDownloadScreen(job.title);
    transferBook(job.bookId, job.fileId, job.path);
  }
-@@ -1557,6 +1562,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+@@ -1557,6 +1569,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
    unsigned long lastProgressUpdateMs = 0;
    unsigned long now = 0;
    int percent = 0;
@@ -51,7 +66,7 @@ index d5b5b668..bdc833b0 100644
    for (int attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++) {
      // Honor a Back press between attempts too: a failing download otherwise runs
      // all its retries (TLS handshake included) with the cancel request ignored.
-@@ -1567,8 +1578,18 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+@@ -1567,8 +1585,18 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
      downloadOptions.resumePartial = attempt > 0;
      result = BookOrbitCatalogClient::downloadFile(
          fileId, finalPath,
@@ -72,7 +87,7 @@ index d5b5b668..bdc833b0 100644
            downloadProgress = downloaded;
            downloadTotal = total;
            percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
-@@ -1599,6 +1620,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+@@ -1599,6 +1627,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
    // listing again (Tailscale is gone with the network), so the download either restarts
    // into the live catalog boot at the same listing (CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG,
    // below) or ends on Home like one from there.
@@ -85,3 +100,29 @@ index d5b5b668..bdc833b0 100644
    const bool parkedNetworkEnded = tailnet_end_parked_network();
    const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
    if (downloadFailed) {
+@@ -1833,6 +1867,13 @@ void BookOrbitCatalogBrowserActivity::navigateBack() {
+ }
+ 
+ void BookOrbitCatalogBrowserActivity::loop() {
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++  if (parkedDownloadPending) {
++    parkedDownloadPending = false;
++    onWifiSelectionComplete(SavedWifiConnect::connect([] { return false; }));
++    return;
++  }
++#endif
+   if (state == BrowserState::WIFI_SELECTION || state == BrowserState::SEARCH_INPUT) {
+     return;
+   }
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.h b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+index 84944ca9..57915f50 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.h
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+@@ -187,6 +187,7 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
+   // boot; the listing it saved is reopened once Wi-Fi is up, with the download's failure
+   // (BookOrbitDownloadResume::failure) shown over it.
+   bool returnToListing = false;
++  bool parkedDownloadPending = false;  // CrossInk-Tailnet 0013: parked download boot, run from loop()
+   int returnFailure = 0;
+ 
+   // Current book-list context, used to page and to return to the same list after a download.
