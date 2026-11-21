@@ -209,7 +209,11 @@ void TailnetSettingsActivity::renderMenu(const int top) {
       },
       nullptr, nullptr,
       [this](int i) -> std::string {
+#if CROSSINK_TAILNET_CROSSINK_MAJOR >= 2
         if (i == ROW_ENABLED) return tailnet_enabled() ? tr(STR_ON) : tr(STR_OFF);
+#else
+        if (i == ROW_ENABLED) return tailnet_enabled() ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);  // 1.6 has no STR_ON
+#endif
         if (i == ROW_RELAY) return relayValue();
         return "";
       });

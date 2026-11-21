@@ -226,6 +226,7 @@ for _name, _value in SWITCH_VALUES.items():
         ML_DEFINES.append((_name, _value))
     else:
         _global_defines.append((_name, _value))
+_global_defines.append(("CROSSINK_TAILNET_CROSSINK_MAJOR", CROSSINK_MAJOR))  # string ids differ by version
 env.Append(CPPDEFINES=_global_defines)  # noqa: F821
 
 # CROSSINK_TAILNET_NO_MDNS: the Arduino ESPmDNS library is linked as objects, so its global MDNS
