@@ -32,15 +32,21 @@ extern GfxRenderer renderer;  // main.cpp
 namespace {
 
 // NetworkBootTarget values (SilentRestart.h) whose screens need no answer while
-// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_HOME_REFRESH,
+// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_DOWNLOAD (a
+// static "Downloading" screen, see tailnet_boot_parks()), BOOKORBIT_HOME_REFRESH,
 // BOOKORBIT_HOME_SHELVES (it fetches, turns WiFi off, then shows the pickers),
-// and the overlay's own login and BookOrbit authentication boots. (A sync that
-// asks which position to keep is covered by the tick's fallback.) Only these
-// boots run Tailscale on the C3.
+// KOREADER_SYNC and KOREADER_AUTH (on demand, below), and the overlay's own
+// login and BookOrbit authentication boots. (A sync that asks which position to
+// keep is covered by the tick's fallback.) Only these boots run Tailscale on
+// the C3.
 bool parksFor(uint32_t target) {
-  return target == 8 || target == 9 || target == 12 || target == 13 || target == TAILNET_LOGIN_TARGET ||
-         target == TAILNET_BOOKORBIT_AUTH_TARGET;
+  return target == 4 || target == 5 || target == 8 || target == 9 || target == 10 || target == 12 || target == 13 ||
+         target == TAILNET_LOGIN_TARGET || target == TAILNET_BOOKORBIT_AUTH_TARGET;
 }
+
+// KOReader's server is usually on the internet; Tailscale starts only when the
+// sync resolves a tailnet name or connects to a tailnet address.
+bool onDemand(uint32_t target) { return target == 4 || target == 5; }
 
 std::atomic<bool> s_armed{false};
 std::atomic<bool> s_parked{false};
@@ -69,7 +75,21 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
   // The S3 readers keep the framebuffer in PSRAM and run Tailscale anywhere.
   if (!tailnet_lite() || !parksFor(target)) return;
   s_armed = true;
-  tailnet_permit_start(target == TAILNET_LOGIN_TARGET);
+  if (onDemand(target)) {
+    tailnet_permit_on_demand();
+  } else {
+    tailnet_permit_start(target == TAILNET_LOGIN_TARGET);
+  }
+}
+
+extern "C" bool tailnet_boot_parks(void) { return s_armed.load() && tailnet_enabled() && tailnet_joined(); }
+
+extern "C" bool tailnet_end_parked_network(void) {
+  if (!tailnet_boot_parks()) return false;
+  tailnet_wait_idle(10000);  // never cut a control session off mid-exchange
+  SavedWifiConnect::disconnect();
+  if (!tailnet_display_ready(10000)) LOG_ERR("TNET", "Framebuffer still parked after the network was turned off");
+  return true;
 }
 
 extern "C" bool tailnet_display_park(void) {

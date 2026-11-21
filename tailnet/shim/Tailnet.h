@@ -98,6 +98,12 @@ void tailnet_relay_code(uint16_t id, char* out, size_t len);
 // own boot: register_only makes MicroLink only register (no map, no relay).
 bool tailnet_lite(void);
 void tailnet_permit_start(bool register_only);
+// Lite: this boot starts Tailscale only once a request needs it: a tailnet
+// name to resolve or a connection to a tailnet address (100.64.0.0/10, also
+// what a router's DNS may answer for a server name). The resolver and connect
+// hooks call tailnet_start_on_demand(); true if it started Tailscale.
+void tailnet_permit_on_demand(void);
+bool tailnet_start_on_demand(const char* why);
 // Login boot: waits until the register-only session has an answer:
 // TAILNET_NEEDS_LOGIN (tailnet_login_url() has the URL), TAILNET_CONNECTED
 // (logged in), TAILNET_FAILED (not accepted, or stopped for low memory), or

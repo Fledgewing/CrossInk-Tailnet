@@ -92,6 +92,7 @@ bool s_relay_matched = false;  // worker only: one match-server restart per WiFi
 // the framebuffer's memory (TailnetNetPhase.h): tailnet_permit_start().
 std::atomic<bool> s_permit{false};
 std::atomic<bool> s_register_only{false};  // the login boot: register, nothing more
+std::atomic<bool> s_on_demand{false};      // start at the first tailnet name or address, not at GOT_IP
 std::atomic<bool> s_low_memory{false};     // stopped for memory this WiFi session (written by the worker)
 // Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
 // stop working well before 0, and a session would only spin retries.
@@ -640,10 +641,20 @@ static void bringUpTunnelOrRefresh(uint32_t ip, uint32_t timeout_ms) {
 
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   s_last_target.store(ip);
+  char what[24];
+  snprintf(what, sizeof(what), "%u.%u.%u.%u", IP_ARGS(ip));
+  tailnet_start_on_demand(what);
   if (!tailnet_wait_connected(timeout_ms)) {
     TLOGW("connect %u.%u.%u.%u: tailnet not connected", IP_ARGS(ip));
     return false;
   }
+#if CONFIG_ML_LITE
+  // Let a running control session finish first: its memory comes back when
+  // it closes, and the caller's TLS handshake is next.
+  for (uint32_t waited = 0; s_ml && microlink_control_busy(s_ml) && waited < timeout_ms; waited += 50) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+#endif
   // A fresh map may still be filling the table just after CONNECTED.
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (peerKnown(ip)) {
@@ -746,6 +757,24 @@ extern "C" bool tailnet_lite(void) {
 #if CONFIG_ML_LITE
   return true;
 #else
+  return false;
+#endif
+}
+
+extern "C" void tailnet_permit_on_demand(void) {
+#if CONFIG_ML_LITE
+  s_on_demand = true;
+#endif
+}
+
+extern "C" bool tailnet_start_on_demand(const char* why) {
+#if CONFIG_ML_LITE
+  if (!s_on_demand.load() || s_permit.load() || !loadEnabled() || !tailnet_joined()) return false;
+  TLOGI("%s needs Tailscale: starting it for this boot", why);
+  tailnet_permit_start(false);
+  return true;
+#else
+  (void)why;
   return false;
 #endif
 }

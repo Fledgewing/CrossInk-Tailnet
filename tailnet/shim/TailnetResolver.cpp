@@ -59,7 +59,10 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
   ip4_addr_t probe;
   if (nodename && v4_ok && !numeric_only && !ip4addr_aton(nodename, &probe)) {
     uint32_t ip = tailnet_resolve(nodename);
-    if (!ip && mayBeTailnetName(nodename) && tailnet_wait_connected(WAIT_MS)) ip = tailnet_resolve(nodename);
+    if (!ip && mayBeTailnetName(nodename)) {
+      tailnet_start_on_demand(nodename);  // lite builds: a boot that starts Tailscale only when needed
+      if (tailnet_wait_connected(WAIT_MS)) ip = tailnet_resolve(nodename);
+    }
     if (ip) {
       char lit[16];
       snprintf(lit, sizeof(lit), "%u.%u.%u.%u", (unsigned)(ip >> 24) & 0xff, (unsigned)(ip >> 16) & 0xff,

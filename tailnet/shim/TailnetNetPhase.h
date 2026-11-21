@@ -42,6 +42,14 @@ bool tailnet_bookorbit_auth_boot(void);
 // first request's heap check and connect see it ready. No-op elsewhere.
 void tailnet_wifi_joined(void);
 
+// True when this boot runs Tailscale with the framebuffer parked (lite build,
+// a parking boot, Tailscale on and logged in): screens must be drawn before
+// WiFi joins or after tailnet_end_parked_network().
+bool tailnet_boot_parks(void);
+// In such a boot: waits for a running control session, turns WiFi off and
+// gets the framebuffer back. False (and nothing done) in any other boot.
+bool tailnet_end_parked_network(void);
+
 // main.cpp, once the minimal network boot is ready. Arms parking for the boots
 // listed above (target is a NetworkBootTarget value), on the C3 only.
 void tailnet_network_phase_begin(uint32_t target);

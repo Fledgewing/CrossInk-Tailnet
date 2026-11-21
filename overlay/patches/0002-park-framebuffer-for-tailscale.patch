@@ -71,6 +71,43 @@ index 933e79a..3793a7e 100644
    // Replace for the same reason as the catalog: authentication is a TLS session, and the
    // settings screens it is reached through hold 15-20KB that the handshake needs. Nothing
    // is lost by dropping them — the activity ends in a silentRestart() to the home screen
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index e703582..1654b08 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -47,6 +47,8 @@
+ #include "util/BookCacheUtils.h"
+ #include "util/BookOrbitDevicePath.h"
+ #include "util/StringUtils.h"
++#include "network/SavedWifiConnect.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace fui = freeink::ui;
+ 
+@@ -346,6 +348,13 @@ void BookOrbitCatalogBrowserActivity::onEnter() {
+     return;
+   }
+ 
++  if (pendingDownload.fileId != 0 && tailnet_boot_parks()) {
++    // C3 + Tailscale: the panel keeps this screen while the framebuffer is parked.
++    showDownloadScreen(pendingDownload.title);
++    requestUpdateAndWait();
++    onWifiSelectionComplete(SavedWifiConnect::connect([] { return false; }));
++    return;
++  }
+   state = BrowserState::CHECK_WIFI;
+   requestUpdate();
+   checkAndConnectWifi();
+@@ -1399,6 +1408,9 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+             static_cast<int>(result));
+   }
+ 
++  // C3 + Tailscale: WiFi off and the framebuffer back first; the listing cannot be
++  // fetched again without Tailscale, so the download ends on Home like one from there.
++  if (tailnet_end_parked_network()) downloadFromHome = true;
+   const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
+   if (downloadFailed) {
+     // preservePartial kept the staged file for resuming between attempts; don't
 diff --git a/src/activities/network/WifiSelectionActivity.cpp b/src/activities/network/WifiSelectionActivity.cpp
 index 44125d2..2070975 100644
 --- a/src/activities/network/WifiSelectionActivity.cpp
