@@ -1,0 +1,1284 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+new file mode 100644
+index 00000000..e9743f4a
+--- /dev/null
++++ b/include/CrossInkTailnetCuts.h
+@@ -0,0 +1,85 @@
++#pragma once
++// CrossInk-Tailnet memory cuts (overlay patch 0004). Each cut has its own switch.
++// The overlay's build script (tailnet/tailnet_build.py) sets every one per device
++// from its switch table; the defaults here keep upstream behaviour for a build
++// without the overlay.
++
++// BookOrbit sync: free heap a new TLS session needs, and its largest free block
++// (wolfSSL gate). FLOOR 0 keeps upstream's 55000 floor and no block check.
++#ifndef CROSSINK_TAILNET_SYNC_TLS_FLOOR
++#define CROSSINK_TAILNET_SYNC_TLS_FLOOR 0
++#endif
++#ifndef CROSSINK_TAILNET_SYNC_TLS_BLOCK
++#define CROSSINK_TAILNET_SYNC_TLS_BLOCK 24576
++#endif
++
++// BookOrbit catalog: requests made while a BookOrbitCatalogClient::Session is
++// open share one keep-alive wolfSSL connection instead of a handshake each.
++#ifndef CROSSINK_TAILNET_CATALOG_KEEPALIVE
++#define CROSSINK_TAILNET_CATALOG_KEEPALIVE 0
++#endif
++
++// BookOrbit catalog: build each response's JSON filter after the download,
++// once the TLS session is freed, instead of holding it through the request.
++#ifndef CROSSINK_TAILNET_FILTER_AFTER_TLS
++#define CROSSINK_TAILNET_FILTER_AFTER_TLS 0
++#endif
++
++// Dictionary lookup worker: task stack and TCB from the heap on first lookup
++// instead of 4.4 KB of .bss in every boot.
++#ifndef CROSSINK_TAILNET_DICT_STACK_ON_DEMAND
++#define CROSSINK_TAILNET_DICT_STACK_ON_DEMAND 0
++#endif
++
++// MiniBidi: the two 1.5 KB reorder buffers allocated per call, under the bidi
++// mutex, instead of 3 KB of .bss.
++#ifndef CROSSINK_TAILNET_BIDI_ON_DEMAND
++#define CROSSINK_TAILNET_BIDI_ON_DEMAND 0
++#endif
++
++// FontCacheManager: the 2 KB scan codepoint array allocated for each prewarm
++// scope (reader page renders) instead of living in the renderer for good.
++#ifndef CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++#define CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND 0
++#endif
++
++// Arduino loopTask stack, in bytes, in a network boot (silent-reboot target >=
++// NetworkBootTarget::OTA). Other boots keep FreeInkUI's 16 KB. 0 = off.
++#ifndef CROSSINK_TAILNET_NET_LOOP_STACK
++#define CROSSINK_TAILNET_NET_LOOP_STACK 0
++#endif
++
++// BookOrbit catalog root: skip the decorative entry counts (dashboard plus two
++// book totals) when none are cached. The Want to read row is shown without a count.
++#ifndef CROSSINK_TAILNET_SKIP_ROOT_COUNTS
++#define CROSSINK_TAILNET_SKIP_ROOT_COUNTS 0
++#endif
++
++#if CROSSINK_TAILNET_NET_LOOP_STACK
++// Logs the calling task's stack high-water mark (bytes never used), for the
++// network-boot loopTask stack cut. Defined in main.cpp.
++void crossinkTailnetLogStackHighWater(const char* where);
++#define CROSSINK_TAILNET_LOG_STACK(where) crossinkTailnetLogStackHighWater(where)
++#else
++#define CROSSINK_TAILNET_LOG_STACK(where) ((void)0)
++#endif
++
++// wolfSSL arena for the BookOrbit/catalog requests, in bytes (0 = off). Reserved in one
++// block once WiFi joins in a BookOrbit network boot, before Tailscale starts, while the
++// heap still has a large block; wolfSSL allocations made on the loop task go there
++// (first fit, coalescing; heap when full), so a fragmented heap cannot fail a handshake.
++#ifndef CROSSINK_TAILNET_TLS_ARENA
++#define CROSSINK_TAILNET_TLS_ARENA 0
++#endif
++
++#if CROSSINK_TAILNET_TLS_ARENA
++#include <stdint.h>
++// src/network/TlsArena.cpp. All safe to call when the arena is not in use.
++void tlsArenaArmForBoot(uint32_t networkBootTarget);  // main.cpp, loop task, network boot
++void tlsArenaReserve();                               // WiFi joined, before Tailscale starts
++void tlsArenaRelease();                               // network ends (freed once empty)
++void tlsArenaLogRequestPeak(const char* what);        // after each request; restarts the peak
++#define CROSSINK_TAILNET_TLS_ARENA_LOG(what) tlsArenaLogRequestPeak(what)
++#else
++#define CROSSINK_TAILNET_TLS_ARENA_LOG(what) ((void)0)
++#endif
+diff --git a/lib/BookOrbitSync/BookOrbitSyncClient.cpp b/lib/BookOrbitSync/BookOrbitSyncClient.cpp
+index 8bf40912..af7484bf 100644
+--- a/lib/BookOrbitSync/BookOrbitSyncClient.cpp
++++ b/lib/BookOrbitSync/BookOrbitSyncClient.cpp
+@@ -1,6 +1,7 @@
+ #include "BookOrbitSyncClient.h"
+ 
+ #include <AppVersion.h>
++#include <CrossInkTailnetCuts.h>
+ #include <ArduinoJson.h>
+ #ifdef SIMULATOR
+ #include <ArduinoJsonStringCompat.h>
+@@ -205,22 +206,26 @@ constexpr uint32_t MIN_HEAP_FOR_KEPT_SESSION = 20000;
+ bool s_sessionHandshakePaid = false;
+ 
+ #if TAILNET_PROBE_CATALOG_LIVE
+-// Catalog probe: KOReaderSyncClient's wolfSSL gate (35000 free and a 20000 block) for a
+-// new handshake; the kept-session floor stays. Logs which floor applies.
+ extern "C" void tailnet_probe_window_begin(const char* what);
+ extern "C" void tailnet_probe_window_mark(const char* what, const char* phase);
+ extern "C" void tailnet_probe_window_end(const char* what, const char* phase);
+-constexpr uint32_t PROBE_MIN_FREE_HEAP_FOR_TLS = 35000;
+-constexpr uint32_t PROBE_MIN_MAX_ALLOC_FOR_TLS = 20000;
++#endif
++
++#if CROSSINK_TAILNET_SYNC_TLS_FLOOR
++// 55000 dates from mbedTLS. Every BookOrbit request now runs over wolfSSL, so a new
++// handshake takes a wolfSSL-sized gate: this much free heap (CROSSINK_TAILNET_SYNC_TLS_FLOOR,
++// 35000 like KOReaderSyncClient) and a largest block of CROSSINK_TAILNET_SYNC_TLS_BLOCK
++// (24576: measured X3 handshake peaks reach 24.0 KB, and a 13.3 KB block failed one at
++// 44 KB free). On the X4s the free count is internal RAM, where 55000 refused syncs that
++// fit. The kept-session floor stays.
++constexpr uint32_t NEW_SESSION_MIN_FREE_HEAP = CROSSINK_TAILNET_SYNC_TLS_FLOOR;
++constexpr uint32_t NEW_SESSION_MIN_MAX_ALLOC = CROSSINK_TAILNET_SYNC_TLS_BLOCK;
+ uint32_t requiredHeapFloor() {
+-  if (s_sessionHandshakePaid) {
+-    LOG_INF("BookOrbit", "probe floor: kept session, %u free", (unsigned)MIN_HEAP_FOR_KEPT_SESSION);
+-    return MIN_HEAP_FOR_KEPT_SESSION;
+-  }
++  if (s_sessionHandshakePaid) return MIN_HEAP_FOR_KEPT_SESSION;
+   const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+-  LOG_INF("BookOrbit", "probe floor: new TLS session, %u free and a %u block (largest now %u)",
+-          (unsigned)PROBE_MIN_FREE_HEAP_FOR_TLS, (unsigned)PROBE_MIN_MAX_ALLOC_FOR_TLS, (unsigned)maxAlloc);
+-  return maxAlloc < PROBE_MIN_MAX_ALLOC_FOR_TLS ? UINT32_MAX : PROBE_MIN_FREE_HEAP_FOR_TLS;
++  LOG_INF("BookOrbit", "TLS floor: new session needs %u free and a %u block (largest now %u)",
++          (unsigned)NEW_SESSION_MIN_FREE_HEAP, (unsigned)NEW_SESSION_MIN_MAX_ALLOC, (unsigned)maxAlloc);
++  return maxAlloc < NEW_SESSION_MIN_MAX_ALLOC ? UINT32_MAX : NEW_SESSION_MIN_FREE_HEAP;
+ }
+ #else
+ uint32_t requiredHeapFloor() { return s_sessionHandshakePaid ? MIN_HEAP_FOR_KEPT_SESSION : MIN_HEAP_FOR_TLS; }
+@@ -460,6 +465,8 @@ int sendBookOrbitRequest(const char* method, const std::string& url, const JsonB
+     http.end();
+   }
+   logHeapStats("After request");
++  CROSSINK_TAILNET_LOG_STACK("after a BookOrbit TLS request");
++  CROSSINK_TAILNET_TLS_ARENA_LOG("BookOrbit request");
+ #if TAILNET_PROBE_CATALOG_LIVE
+   tailnet_probe_window_end("BookOrbit request", probeFirstBytes ? "whole request (no body)" : "body");
+ #endif
+diff --git a/lib/GfxRenderer/FontCacheManager.cpp b/lib/GfxRenderer/FontCacheManager.cpp
+index a4437da0..85b93755 100644
+--- a/lib/GfxRenderer/FontCacheManager.cpp
++++ b/lib/GfxRenderer/FontCacheManager.cpp
+@@ -7,6 +7,7 @@
+ #include <Utf8.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "FontCacheManager.h"
+@@ -144,8 +145,26 @@ uint8_t FontCacheManager::resolveScanStyle(int fontId, EpdFontFamily::Style styl
+   return baseStyle;
+ }
+ 
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++void FontCacheManager::allocScanCodepoints() {
++  if (scanCodepoints_ != nullptr) return;
++  scanCodepoints_ = static_cast<uint32_t*>(malloc((MAX_SCAN_CODEPOINTS + 1) * sizeof(uint32_t)));
++  if (scanCodepoints_ == nullptr) {
++    LOG_ERR("FCM", "No memory for the scan codepoints; glyphs will load on demand");
++  }
++}
++
++void FontCacheManager::freeScanCodepoints() {
++  free(scanCodepoints_);
++  scanCodepoints_ = nullptr;
++}
++#endif
++
+ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::Style style) {
+   if (!text || *text == '\0') return;
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++  if (scanCodepoints_ == nullptr) return;
++#endif
+ 
+   uint8_t fontSlot = scanFontCount_;
+   for (uint8_t i = 0; i < scanFontCount_; i++) {
+@@ -206,11 +225,21 @@ FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager, const Pr
+   manager_->scanFontCount_ = 0;
+   manager_->scanOverflowWarned_ = false;
+   memset(manager_->scanGroupCounts_, 0, sizeof(manager_->scanGroupCounts_));
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++  manager_->allocScanCodepoints();
++#endif
+ }
+ 
+ bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
+   manager_->scanMode_ = ScanMode::None;
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++  if (manager_->scanCodepointCount_ == 0) {
++    manager_->freeScanCodepoints();
++    return true;
++  }
++#else
+   if (manager_->scanCodepointCount_ == 0) return true;
++#endif
+ 
+   std::sort(manager_->scanCodepoints_, manager_->scanCodepoints_ + manager_->scanCodepointCount_);
+ 
+@@ -246,6 +275,9 @@ bool FontCacheManager::PrewarmScope::endScanAndPrewarm() {
+   manager_->scanCodepointCount_ = 0;
+   manager_->scanFontCount_ = 0;
+   memset(manager_->scanGroupCounts_, 0, sizeof(manager_->scanGroupCounts_));
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++  manager_->freeScanCodepoints();
++#endif
+   return ok;
+ }
+ 
+diff --git a/lib/GfxRenderer/FontCacheManager.h b/lib/GfxRenderer/FontCacheManager.h
+index 4a5c093b..1d450a75 100644
+--- a/lib/GfxRenderer/FontCacheManager.h
++++ b/lib/GfxRenderer/FontCacheManager.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <CrossInkTailnetCuts.h>
+ #include <EpdFontFamily.h>
+ 
+ #include <cstdint>
+@@ -67,7 +68,15 @@ class FontCacheManager {
+ 
+   uint8_t resolveScanStyle(int fontId, EpdFontFamily::Style style) const;
+   int scanFontIds_[MAX_SCAN_FONTS] = {};
++#if CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND
++  // Allocated by each PrewarmScope and freed once it has prewarmed (nullptr outside one,
++  // or when the allocation failed: glyphs then load on demand).
++  uint32_t* scanCodepoints_ = nullptr;
++  void allocScanCodepoints();
++  void freeScanCodepoints();
++#else
+   uint32_t scanCodepoints_[MAX_SCAN_CODEPOINTS + 1] = {};
++#endif
+   uint16_t scanGroupCounts_[SCAN_GROUP_COUNT] = {};
+   uint16_t scanCodepointCount_ = 0;
+   uint8_t scanFontCount_ = 0;
+diff --git a/lib/MiniBidi/BidiUtils.cpp b/lib/MiniBidi/BidiUtils.cpp
+index 88aabc0c..666cf83b 100644
+--- a/lib/MiniBidi/BidiUtils.cpp
++++ b/lib/MiniBidi/BidiUtils.cpp
+@@ -7,11 +7,14 @@ extern "C" {
+ #undef when
+ #undef otherwise
+ 
++#include <CrossInkTailnetCuts.h>
+ #include <Logging.h>
+ #include <Utf8.h>
+ 
+ #include <cstring>
++#include <memory>
+ #include <mutex>
++#include <new>
+ 
+ // Guards the static bidi_char buffers in applyBidiVisual() and
+ // computeVisualWordOrder().  The bidi+shaping pipeline is not reentrant;
+@@ -39,8 +42,18 @@ bool isNaturalDirectionClass(const uchar cls) {
+ // each other, so one buffer is reused instead of a per-function static — saving
+ // ~1.5 KB of always-resident RAM. Not reentrant (same assumption as the
+ // previous per-function statics).
++#if CROSSINK_TAILNET_BIDI_ON_DEMAND
++// Allocated per call, under bidiMutex, instead: only RTL text reaches these functions,
++// and a boot that draws none no longer carries 3 KB of .bss for it.
++std::unique_ptr<bidi_char[]> allocBidiBuffer() {
++  std::unique_ptr<bidi_char[]> buffer(new (std::nothrow) bidi_char[BIDI_MAX_LINE]);
++  if (!buffer) LOG_ERR("BIDI", "No memory for a %u byte bidi buffer", (unsigned)(BIDI_MAX_LINE * sizeof(bidi_char)));
++  return buffer;
++}
++#else
+ bidi_char sharedBidiLine[BIDI_MAX_LINE];
+ bidi_char sharedBidiShaped[BIDI_MAX_LINE];
++#endif
+ 
+ }  // namespace
+ 
+@@ -97,8 +110,17 @@ bool applyBidiVisual(const char* utf8, std::string& out, int paragraphLevel) {
+   if (!utf8 || !*utf8) return false;
+   const std::lock_guard<std::mutex> lock(bidiMutex);
+ 
++#if CROSSINK_TAILNET_BIDI_ON_DEMAND
++  const auto lineBuffer = allocBidiBuffer();
++  if (!lineBuffer) return false;
++  const auto shapedBuffer = allocBidiBuffer();
++  if (!shapedBuffer) return false;
++  bidi_char* const line = lineBuffer.get();
++  bidi_char* const shaped = shapedBuffer.get();
++#else
+   bidi_char* const line = sharedBidiLine;
+   bidi_char* const shaped = sharedBidiShaped;
++#endif
+   int count = 0;
+   int lastBase = -1;           // last non-formatter character (mintty's ibase)
+   uint8_t pendingJoiners = 0;  // ZWJ/ZWNJ seen since lastBase
+@@ -184,7 +206,13 @@ bool computeVisualWordOrder(const std::vector<std::string>& words, bool paragrap
+   if (nWords <= 1 || nWords > BIDI_MAX_LINE) return false;
+   const std::lock_guard<std::mutex> lock(bidiMutex);
+ 
++#if CROSSINK_TAILNET_BIDI_ON_DEMAND
++  const auto lineBuffer = allocBidiBuffer();
++  if (!lineBuffer) return false;
++  bidi_char* const line = lineBuffer.get();
++#else
+   bidi_char* const line = sharedBidiLine;
++#endif
+   int count = 0;
+   bool truncated = false;
+ 
+diff --git a/src/BookOrbitHomeStore.cpp b/src/BookOrbitHomeStore.cpp
+index ea675cce..b177e6d9 100644
+--- a/src/BookOrbitHomeStore.cpp
++++ b/src/BookOrbitHomeStore.cpp
+@@ -277,6 +277,8 @@ bool refresh(const StopCheck shouldStop, const CoverSizes& sizes) {
+   // Each shelf lists what the settings chose; the dashboard below fills the Discover ones.
+   for (int i = 0; i < BookOrbitHomeSnapshot::SHELVES; i++) next->shelves[i].source = BOOKORBIT_STORE.getHomeShelf(i);
+ 
++  // The dashboard, shelves, total and covers below share one TLS connection.
++  BookOrbitCatalogClient::Session catalogSession;
+   HalFile file;
+   if (!Storage.openFileForWrite("BookOrbit", TMP_PATH, file)) return false;
+   // The year's minutes follow the struct: reserve its place, then come back to it.
+@@ -349,6 +351,7 @@ bool shelvesFollowSettings() {
+ }
+ 
+ bool refreshShelfOptions() {
++  BookOrbitCatalogClient::Session catalogSession;  // every page on one TLS connection
+   // Written as the pages arrive, so no list of them waits in RAM beside the TLS session;
+   // the count goes into the header at the end, and the old file stays until then.
+   HalFile file;
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index 1654b084..6aba1394 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -1,6 +1,7 @@
+ #include "BookOrbitCatalogBrowserActivity.h"
+ 
+ #include <BoardConfig.h>
++#include <CrossInkTailnetCuts.h>
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
+@@ -15,6 +16,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <iterator>
++#include <optional>
+ #include <utility>
+ 
+ #include "./BookOrbitCatalogListCache.h"
+@@ -53,6 +55,8 @@
+ namespace fui = freeink::ui;
+ 
+ namespace {
++// BookOrbitCatalogCounts::wantToRead when the shelf was not asked about (CROSSINK_TAILNET_SKIP_ROOT_COUNTS).
++constexpr int UNCOUNTED_WANT_TO_READ = -2;
+ using Entry = BookOrbitCatalogBrowserActivity::Entry;
+ 
+ constexpr fui::ActionId ACTION_ROW = 1;
+@@ -444,6 +448,9 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
+   if (!cacheHit && !allowNetwork) {
+     return false;
+   }
++  // The root's requests share one TLS connection; it closes before the rows are drawn.
++  std::optional<BookOrbitCatalogClient::Session> catalogSession;
++  if (allowNetwork) catalogSession.emplace();
+   if (!cacheHit && !BookOrbitCatalogClient::fetchRootSections(sections)) {
+     state = BrowserState::ERROR;
+     errorMessage = BookOrbitCatalogClient::lastFetchBadResponse ? tr(STR_BOOKORBIT_CATALOG_BAD_RESPONSE)
+@@ -460,10 +467,21 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
+   // with the listings. Non-fatal — an older server without the dashboard just
+   // shows the sections without counts.
+   BookOrbitCatalogCounts counts;
++#if CROSSINK_TAILNET_SKIP_ROOT_COUNTS
++  // The counts are decorative and cost three requests: only cached ones are shown. The
++  // Want to read row, which the dashboard request also discovers, is shown without a count.
++  if (!BookOrbitCatalogListCache::loadCatalogCounts(counts)) {
++    LOG_INF("BookOrbit", "Catalog root: entry counts skipped (none cached)");
++    counts = BookOrbitCatalogCounts{};
++    counts.wantToRead = UNCOUNTED_WANT_TO_READ;
++  }
++#else
+   if (!BookOrbitCatalogListCache::loadCatalogCounts(counts) && allowNetwork &&
+       BookOrbitCatalogClient::fetchCatalogCounts(counts)) {
+     BookOrbitCatalogListCache::saveCatalogCounts(counts);
+   }
++#endif
++  catalogSession.reset();
+   const auto sectionCount = [&counts](const std::string& id) {
+     if (id == "all-books" || id == "recent") return counts.totalBooks;
+     if (id == "continue-reading") return counts.inProgress;
+@@ -493,11 +511,11 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
+   }
+   // The want-to-read shelf BookOrbit's own plugin shows, which the server does not list
+   // among its sections. After them, so the rows above keep their places.
+-  if (counts.wantToRead >= 0) {
++  if (counts.wantToRead >= 0 || counts.wantToRead == UNCOUNTED_WANT_TO_READ) {
+     Entry wantToRead;
+     wantToRead.type = EntryType::SECTION;
+     wantToRead.title = tr(STR_BOOKORBIT_WANT_TO_READ);
+-    addCountBadge(wantToRead, counts.wantToRead);
++    if (counts.wantToRead >= 0) addCountBadge(wantToRead, counts.wantToRead);
+     wantToRead.sectionId = BookOrbitCatalogClient::WANT_TO_READ_SHELF;
+     entries.push_back(std::move(wantToRead));
+   }
+diff --git a/src/activities/network/WifiSelectionActivity.cpp b/src/activities/network/WifiSelectionActivity.cpp
+index 20709756..b6ce206d 100644
+--- a/src/activities/network/WifiSelectionActivity.cpp
++++ b/src/activities/network/WifiSelectionActivity.cpp
+@@ -1,5 +1,6 @@
+ #include "WifiSelectionActivity.h"
+ 
++#include <CrossInkTailnetCuts.h>
+ #include <GfxRenderer.h>
+ #include <HalClock.h>
+ #include <I18n.h>
+@@ -759,6 +760,9 @@ void WifiSelectionActivity::checkConnectionStatus() {
+     sConnectionAttemptLoggingActive = false;
+ #endif
+     LOG_INF("WIFI", "Connected to ssid=%s ip=%s rssi=%d", selectedSSID.c_str(), connectedIP.c_str(), WiFi.RSSI());
++#if CROSSINK_TAILNET_TLS_ARENA
++    tlsArenaReserve();  // before Tailscale takes its share of the heap
++#endif
+     tailnet_wifi_joined();
+ 
+ #if defined(ENABLE_SERIAL_LOG) && LOG_LEVEL >= 2
+diff --git a/src/main.cpp b/src/main.cpp
+index e12fc035..63de5fce 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -84,6 +84,8 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+ #endif
+ #endif
+ 
++#include <CrossInkTailnetCuts.h>
++
+ #include "AppVersion.h"
+ #include "BookOrbitCredentialStore.h"
+ #include "CrossPointSettings.h"
+@@ -371,6 +373,32 @@ constexpr uint32_t SILENT_REBOOT_READER_CLEAN_IMAGE_BASE = 1U << 0;
+ constexpr uint32_t SLEEP_SYNC_WAKE_MAGIC = 0xC1EAB027;
+ constexpr uint32_t SILENT_READER_PAGE_BUILD_MAGIC = 0xC1EAB017;
+ constexpr uint32_t SILENT_READER_PAGE_BUILD_AUTO_TURN = 1U << 0;
++
++#if CROSSINK_TAILNET_NET_LOOP_STACK && defined(ARDUINO_ARCH_ESP32) && !defined(SIMULATOR)
++// The loopTask stack this boot was given (getArduinoLoopTaskStackSize() below).
++static size_t loopTaskStackBytes = 0;
++
++// Overrides FreeInkUI's weak 16 KB: a network boot (WiFi, TLS, the network screens) was
++// measured using about 3 KB of it, and the rest is heap the boot needs. Arduino asks
++// before setup(), while the silent-reboot token is still unread; reader and Home boots
++// keep 16 KB. Logging is not up yet, so the choice is logged with the high-water marks.
++size_t getArduinoLoopTaskStackSize(void) {
++  const uint32_t target = silentRebootTarget & ~(SILENT_REBOOT_FRONTLIGHT_VALID | SILENT_REBOOT_FRONTLIGHT_ON);
++  const bool networkBoot = silentRebootMagic == SILENT_REBOOT_MAGIC && isNetworkBootTargetValue(target) &&
++                           target >= static_cast<uint32_t>(NetworkBootTarget::OTA);
++  loopTaskStackBytes = networkBoot ? CROSSINK_TAILNET_NET_LOOP_STACK : 16 * 1024;
++  return loopTaskStackBytes;
++}
++
++void crossinkTailnetLogStackHighWater(const char* where) {
++  // uxTaskGetStackHighWaterMark counts bytes on ESP-IDF.
++  LOG_INF("MEM", "Stack high-water %s: task %s, %u bytes never used (loopTask stack %u)", where,
++          pcTaskGetName(nullptr), static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
++          static_cast<unsigned>(loopTaskStackBytes));
++}
++#elif CROSSINK_TAILNET_NET_LOOP_STACK
++void crossinkTailnetLogStackHighWater(const char*) {}
++#endif
+ constexpr uint32_t NETWORK_RENDER_TASK_STACK_BYTES = 8192;
+ // FreeType's anti-aliased rasterizer reserves a 16 KiB scratch pool on its
+ // caller's stack. Scalable fonts are S3-only, so leave C3's constrained reader
+@@ -1778,6 +1806,9 @@ void setup() {
+       LOG_INF("BOOT", "Minimal network boot ready: target=%lu free=%u maxAlloc=%u",
+               static_cast<unsigned long>(snapshotTarget), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+       tailnet_network_phase_begin(snapshotTarget);
++#if CROSSINK_TAILNET_TLS_ARENA
++      tlsArenaArmForBoot(snapshotTarget);
++#endif
+       break;
+     case BootResume::SplashlessWake:
+       // One-shot flag: re-arm the splash for the next ordinary boot. Save
+diff --git a/src/network/BookOrbitCatalogClient.cpp b/src/network/BookOrbitCatalogClient.cpp
+index 5f8099ea..b5ad1da4 100644
+--- a/src/network/BookOrbitCatalogClient.cpp
++++ b/src/network/BookOrbitCatalogClient.cpp
+@@ -4,6 +4,7 @@
+ #ifdef SIMULATOR
+ #include <ArduinoJsonStringCompat.h>
+ #endif
++#include <CrossInkTailnetCuts.h>
+ #include <HalStorage.h>
+ #include <Logging.h>
+ #include <strings.h>
+@@ -12,6 +13,8 @@
+ #include <cctype>
+ #include <cstdio>
+ #include <cstring>
++#include <functional>
++#include <memory>
+ 
+ #include "BookOrbitCredentialStore.h"
+ #include "BookOrbitHomeStore.h"
+@@ -19,6 +22,10 @@
+ #include "DaysFromCivil.h"
+ #include "activities/reader/ReadingStatsUtils.h"
+ #include "Tailnet.h"
++#if CROSSINK_TAILNET_CATALOG_KEEPALIVE && defined(FREEINK_NET_WOLFSSL)
++#include <Memory.h>
++#include <SecureHttpClient.h>
++#endif
+ 
+ bool BookOrbitCatalogClient::lastFetchBadResponse = false;
+ 
+@@ -75,12 +82,30 @@ struct FileJsonReader {
+   }
+ };
+ 
++#if CROSSINK_TAILNET_CATALOG_KEEPALIVE && defined(FREEINK_NET_WOLFSSL)
++// Non-null while a BookOrbitCatalogClient::Session is alive: catalog requests then share its
++// keep-alive connection. A server that closed it costs a new handshake on the next request
++// (SecureHttpClient retries a dead kept socket once, on a fresh connection).
++std::unique_ptr<freeink::SecureHttpClient> s_catalogConnection;
++#endif
++
++// The connection a catalog request runs on: the Session's, or nullptr for a fresh one.
++freeink::SecureHttpClient* catalogConnection() {
++#if CROSSINK_TAILNET_CATALOG_KEEPALIVE && defined(FREEINK_NET_WOLFSSL)
++  return s_catalogConnection.get();
++#else
++  return nullptr;
++#endif
++}
++
++using FilterBuilder = std::function<void(JsonDocument&)>;
++
+ // Catalog responses carry full book metadata (descriptions, series, covers...) and can
+ // exceed the largest free heap block, especially while the TLS session is still holding
+ // tens of KB. Buffering them in a std::string aborts on OOM (throwing operator new with
+ // -fno-exceptions), so stream the body to a temp file on SD instead and parse it from
+ // there with a filter that keeps only the handful of fields we actually read.
+-bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument& outDoc) {
++bool fetchJson(const std::string& url, const FilterBuilder& buildFilter, JsonDocument& outDoc) {
+   constexpr char TMP_PATH[] = "/.crosspoint/bookorbit_catalog.json";
+   BookOrbitCatalogClient::lastFetchBadResponse = false;
+ 
+@@ -94,6 +119,11 @@ bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument&
+   // Only meaningful on the esp_http_client path, kept for the fallback: body bytes arriving
+   // with the headers get cached via realloc in steps of this size.
+   options.clientRxBufferSize = 2048;
++  options.wolfSslClient = catalogConnection();
++#if !CROSSINK_TAILNET_FILTER_AFTER_TLS
++  JsonDocument filter;
++  buildFilter(filter);
++#endif
+   HttpDownloader::DownloadError err = HttpDownloader::HTTP_ERROR;
+ #if TAILNET_PROBE_CATALOG_LIVE
+   // Catalog requests go through HttpDownloader: a fresh wolfSSL session each, no heap
+@@ -107,6 +137,8 @@ bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument&
+     LOG_ERR("BookOrbit", "Catalog fetch attempt %d failed (err=%d, http=%d)", attempt + 1, static_cast<int>(err),
+             HttpDownloader::lastHttpStatus);
+   }
++  CROSSINK_TAILNET_LOG_STACK("after a catalog fetch");
++  CROSSINK_TAILNET_TLS_ARENA_LOG("catalog request");
+   if (err != HttpDownloader::OK) {
+     // The server was reachable but didn't serve this path: 404/405 = endpoint missing
+     // (BookOrbit version without the KOReader catalog API, or wrong server URL); a
+@@ -127,6 +159,12 @@ bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument&
+     return false;
+   }
+ 
++#if CROSSINK_TAILNET_FILTER_AFTER_TLS
++  // Built only now: the request's TLS session is gone, so the filter's nodes never share
++  // the heap with its handshake.
++  JsonDocument filter;
++  buildFilter(filter);
++#endif
+   FileJsonReader reader{file};
+   const DeserializationError error = deserializeJson(outDoc, reader, DeserializationOption::Filter(filter));
+ 
+@@ -178,16 +216,41 @@ bool isSupportedSection(const std::string& sectionId) {
+ }
+ }  // namespace
+ 
++#if CROSSINK_TAILNET_CATALOG_KEEPALIVE && defined(FREEINK_NET_WOLFSSL)
++BookOrbitCatalogClient::Session::Session() {
++  if (s_catalogConnection) return;  // nested: the outer Session's connection is shared
++  s_catalogConnection = makeUniqueNoThrow<freeink::SecureHttpClient>();
++  if (!s_catalogConnection) {
++    LOG_ERR("BookOrbit", "Catalog session allocation failed; requests will open their own connections");
++    return;
++  }
++  owner_ = true;
++  s_catalogConnection->setReuse(true);
++  LOG_INF("BookOrbit", "Catalog session open: requests share one TLS connection");
++}
++
++BookOrbitCatalogClient::Session::~Session() {
++  if (!owner_ || !s_catalogConnection) return;
++  s_catalogConnection->end();
++  s_catalogConnection.reset();
++  LOG_INF("BookOrbit", "Catalog session closed");
++}
++#else
++BookOrbitCatalogClient::Session::Session() {}
++BookOrbitCatalogClient::Session::~Session() {}
++#endif
++
+ bool BookOrbitCatalogClient::fetchRootSections(std::vector<BookOrbitCatalogSection>& outSections) {
+   outSections.clear();
+   if (!BOOKORBIT_STORE.hasCredentials()) return false;
+ 
+   const std::string url = BOOKORBIT_STORE.getBaseUrl() + "/plugin/catalog/root";
+-  JsonDocument filter;
+-  filter["sections"][0]["section"] = true;
+-  filter["sections"][0]["title"] = true;
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["sections"][0]["section"] = true;
++    filter["sections"][0]["title"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(url, filter, doc)) return false;
++  if (!fetchJson(url, buildFilter, doc)) return false;
+ 
+   for (JsonObjectConst section : doc["sections"].as<JsonArrayConst>()) {
+     const char* id = section["section"] | "";
+@@ -279,10 +342,11 @@ BookOrbitCatalogBook bookFromItem(JsonObjectConst item) {
+ }  // namespace
+ 
+ int BookOrbitCatalogClient::fetchBookTotal(const BookOrbitBookQuery& query) {
+-  JsonDocument filter;
+-  filter["total"] = true;
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["total"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(booksUrl(query, 1, 1), filter, doc)) {
++  if (!fetchJson(booksUrl(query, 1, 1), buildFilter, doc)) {
+     LOG_ERR("BookOrbit", "Book total unavailable for sort=%s readStatus=%s", query.sort.c_str(),
+             query.readStatus.c_str());
+     return -1;
+@@ -313,15 +377,16 @@ bool BookOrbitCatalogClient::fetchCatalogCounts(BookOrbitCatalogCounts& outCount
+   // sections ignores the parameter, and the missing shelf hides the root's entry for it.
+   const std::string url =
+       BOOKORBIT_STORE.getBaseUrl() + "/plugin/catalog/dashboard?section=" + std::string(WANT_TO_READ_SHELF);
+-  JsonDocument filter;
+-  filter["browseCounts"]["libraries"] = true;
+-  filter["browseCounts"]["authors"] = true;
+-  filter["browseCounts"]["series"] = true;
+-  filter["browseCounts"]["collections"] = true;
+-  filter["browseCounts"]["smartScopes"] = true;
+-  filter["section"]["books"][0]["formats"] = true;
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["browseCounts"]["libraries"] = true;
++    filter["browseCounts"]["authors"] = true;
++    filter["browseCounts"]["series"] = true;
++    filter["browseCounts"]["collections"] = true;
++    filter["browseCounts"]["smartScopes"] = true;
++    filter["section"]["books"][0]["formats"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(url, filter, doc)) return false;
++  if (!fetchJson(url, buildFilter, doc)) return false;
+ 
+   outCounts.libraries = doc["browseCounts"]["libraries"] | -1;
+   outCounts.authors = doc["browseCounts"]["authors"] | -1;
+@@ -388,37 +453,37 @@ int readBooks(JsonArrayConst books, BookOrbitHomeBook* out, const int capacity)
+ bool BookOrbitCatalogClient::fetchHomeDashboard(BookOrbitHomeSnapshot& out, HalFile& yearOut) {
+   if (!BOOKORBIT_STORE.hasCredentials()) return false;
+ 
+-  JsonDocument filter;
+-  filter["displayName"] = true;
+-  filter["totalBooks"] = true;
+-  filter["browseCounts"]["authors"] = true;
+-  filter["browseCounts"]["series"] = true;
+-  filter["browseCounts"]["collections"] = true;
+-  for (const char* list : {"continueReading", "discover"}) {
+-    JsonObject book = filter[list][0].to<JsonObject>();
+-    book["id"] = true;
+-    book["title"] = true;
+-    book["formats"] = true;
+-    book["hasCover"] = true;
+-    book["updatedAt"] = true;
+-    book["progressPercentage"] = true;
+-  }
+-  filter["readingGoal"]["goalBooks"] = true;
+-  filter["readingGoal"]["completedBooks"] = true;
+-  filter["readingGoal"]["year"] = true;
+-  filter["readingStreak"]["currentStreak"] = true;
+-  filter["readingStreak"]["longestStreak"] = true;
+-  filter["readingStreak"]["lastSevenDays"] = true;
+-  filter["highlightOfTheDay"]["text"] = true;
+-  filter["highlightOfTheDay"]["bookTitle"] = true;
+-  filter["readingYear"]["startDate"] = true;
+-  filter["readingYear"]["minutes"] = true;
+-  filter["achievements"]["next"]["name"] = true;
+-  filter["achievements"]["next"]["threshold"] = true;
+-  filter["achievements"]["next"]["currentProgress"] = true;
+-
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["displayName"] = true;
++    filter["totalBooks"] = true;
++    filter["browseCounts"]["authors"] = true;
++    filter["browseCounts"]["series"] = true;
++    filter["browseCounts"]["collections"] = true;
++    for (const char* list : {"continueReading", "discover"}) {
++      JsonObject book = filter[list][0].to<JsonObject>();
++      book["id"] = true;
++      book["title"] = true;
++      book["formats"] = true;
++      book["hasCover"] = true;
++      book["updatedAt"] = true;
++      book["progressPercentage"] = true;
++    }
++    filter["readingGoal"]["goalBooks"] = true;
++    filter["readingGoal"]["completedBooks"] = true;
++    filter["readingGoal"]["year"] = true;
++    filter["readingStreak"]["currentStreak"] = true;
++    filter["readingStreak"]["longestStreak"] = true;
++    filter["readingStreak"]["lastSevenDays"] = true;
++    filter["highlightOfTheDay"]["text"] = true;
++    filter["highlightOfTheDay"]["bookTitle"] = true;
++    filter["readingYear"]["startDate"] = true;
++    filter["readingYear"]["minutes"] = true;
++    filter["achievements"]["next"]["name"] = true;
++    filter["achievements"]["next"]["threshold"] = true;
++    filter["achievements"]["next"]["currentProgress"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(BOOKORBIT_STORE.getBaseUrl() + "/plugin/catalog/dashboard", filter, doc)) return false;
++  if (!fetchJson(BOOKORBIT_STORE.getBaseUrl() + "/plugin/catalog/dashboard", buildFilter, doc)) return false;
+ 
+   copyText(out.displayName, doc["displayName"] | "");
+   out.totalBooks = doc["totalBooks"] | -1;
+@@ -487,8 +552,11 @@ HttpDownloader::DownloadError BookOrbitCatalogClient::downloadThumbnail(const in
+   options.extraHeaders = authHeaders();
+   options.transport = HttpDownloader::Transport::WOLFSSL;
+   options.clientRxBufferSize = 2048;
++  options.wolfSslClient = catalogConnection();
+   if (shouldStop != nullptr) options.shouldCancel = shouldStop;
+-  return HttpDownloader::downloadToFile(url, destPath, nullptr, nullptr, "", "", std::move(options));
++  const auto result = HttpDownloader::downloadToFile(url, destPath, nullptr, nullptr, "", "", std::move(options));
++  CROSSINK_TAILNET_TLS_ARENA_LOG("cover request");
++  return result;
+ }
+ 
+ bool BookOrbitCatalogClient::fetchBooks(const BookOrbitBookQuery& query, const int page, BookOrbitBookPage& outPage) {
+@@ -497,13 +565,14 @@ bool BookOrbitCatalogClient::fetchBooks(const BookOrbitBookQuery& query, const i
+ 
+   if (!query.shelf.empty()) {
+     // A shelf is one short list in the server's order, and it is not narrowed to EPUBs.
+-    JsonDocument filter;
+-    filter["section"]["books"][0]["id"] = true;
+-    filter["section"]["books"][0]["title"] = true;
+-    filter["section"]["books"][0]["authors"] = true;
+-    filter["section"]["books"][0]["formats"] = true;
++    const auto buildFilter = [&](JsonDocument& filter) {
++      filter["section"]["books"][0]["id"] = true;
++      filter["section"]["books"][0]["title"] = true;
++      filter["section"]["books"][0]["authors"] = true;
++      filter["section"]["books"][0]["formats"] = true;
++    };
+     JsonDocument doc;
+-    if (!fetchJson(booksUrl(query, page, PAGE_SIZE), filter, doc)) return false;
++    if (!fetchJson(booksUrl(query, page, PAGE_SIZE), buildFilter, doc)) return false;
+     JsonArrayConst books = doc["section"]["books"].as<JsonArrayConst>();
+     outPage.books.reserve(books.size());
+     for (JsonObjectConst item : books) {
+@@ -520,22 +589,23 @@ bool BookOrbitCatalogClient::fetchBooks(const BookOrbitBookQuery& query, const i
+   const bool withLetters = page == 1 && (sort == "title" || sort == "author");
+   const std::string url = booksUrl(query, page, PAGE_SIZE, withLetters);
+ 
+-  JsonDocument filter;
+-  filter["page"] = true;
+-  filter["total"] = true;
+-  filter["size"] = true;
+-  filter["items"][0]["id"] = true;
+-  filter["items"][0]["title"] = true;
+-  filter["items"][0]["authors"] = true;
+-  // Only what the sort's list sections need: a series name per row costs heap.
+-  if (bySeries) filter["items"][0]["seriesName"] = true;
+-  if (byDateAdded) filter["items"][0]["addedAt"] = true;
+-  if (withLetters) {
+-    filter["buckets"][0]["key"] = true;
+-    filter["buckets"][0]["index"] = true;
+-  }
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["page"] = true;
++    filter["total"] = true;
++    filter["size"] = true;
++    filter["items"][0]["id"] = true;
++    filter["items"][0]["title"] = true;
++    filter["items"][0]["authors"] = true;
++    // Only what the sort's list sections need: a series name per row costs heap.
++    if (bySeries) filter["items"][0]["seriesName"] = true;
++    if (byDateAdded) filter["items"][0]["addedAt"] = true;
++    if (withLetters) {
++      filter["buckets"][0]["key"] = true;
++      filter["buckets"][0]["index"] = true;
++    }
++  };
+   JsonDocument doc;
+-  if (!fetchJson(url, filter, doc)) return false;
++  if (!fetchJson(url, buildFilter, doc)) return false;
+ 
+   outPage.page = doc["page"] | page;
+   outPage.total = doc["total"] | 0;
+@@ -567,15 +637,16 @@ bool BookOrbitCatalogClient::fetchSectionEntries(const std::string& sectionId, c
+     url += "?page=" + std::to_string(page);
+   }
+ 
+-  JsonDocument filter;
+-  filter["page"] = true;
+-  filter["hasNext"] = true;
+-  filter["items"][0]["id"] = true;
+-  filter["items"][0]["title"] = true;
+-  filter["items"][0]["count"] = true;
+-  filter["items"][0]["seriesId"] = true;
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["page"] = true;
++    filter["hasNext"] = true;
++    filter["items"][0]["id"] = true;
++    filter["items"][0]["title"] = true;
++    filter["items"][0]["count"] = true;
++    filter["items"][0]["seriesId"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(url, filter, doc)) return false;
++  if (!fetchJson(url, buildFilter, doc)) return false;
+ 
+   outPage.page = doc["page"] | page;
+   outPage.hasNext = doc["hasNext"] | false;
+@@ -608,16 +679,17 @@ bool BookOrbitCatalogClient::fetchBookDetail(const int64_t bookId, BookOrbitBook
+   // per-reader id BookOrbitSyncClient reports as device_id in progress updates.
+   const std::string url = BOOKORBIT_STORE.getBaseUrl() + "/plugin/catalog/books/" + std::to_string(bookId) +
+                           "?deviceId=" + BookOrbitSyncClient::deviceId();
+-  JsonDocument filter;
+-  filter["id"] = true;
+-  filter["title"] = true;
+-  filter["authors"] = true;
+-  filter["files"][0]["id"] = true;
+-  filter["files"][0]["format"] = true;
+-  filter["files"][0]["sizeBytes"] = true;
+-  filter["files"][0]["devicePath"] = true;
++  const auto buildFilter = [&](JsonDocument& filter) {
++    filter["id"] = true;
++    filter["title"] = true;
++    filter["authors"] = true;
++    filter["files"][0]["id"] = true;
++    filter["files"][0]["format"] = true;
++    filter["files"][0]["sizeBytes"] = true;
++    filter["files"][0]["devicePath"] = true;
++  };
+   JsonDocument doc;
+-  if (!fetchJson(url, filter, doc)) return false;
++  if (!fetchJson(url, buildFilter, doc)) return false;
+ 
+   outDetail.id = doc["id"] | bookId;
+   outDetail.title = std::string(doc["title"] | "");
+diff --git a/src/network/BookOrbitCatalogClient.h b/src/network/BookOrbitCatalogClient.h
+index 1bb8e078..81a5969e 100644
+--- a/src/network/BookOrbitCatalogClient.h
++++ b/src/network/BookOrbitCatalogClient.h
+@@ -145,6 +145,23 @@ class BookOrbitCatalogClient {
+   // UI distinguish "check your connection" from "check your server".
+   static bool lastFetchBadResponse;
+ 
++  /**
++   * Keeps one TLS connection open across a burst of catalog requests (catalog open, a Home
++   * refresh), as BookOrbitSyncClient::Session does for a sync: they pay one handshake
++   * instead of one each. Without CROSSINK_TAILNET_CATALOG_KEEPALIVE it does nothing.
++   * Do not hold one across a user decision, nor across a book download (its own connection).
++   */
++  class Session {
++   public:
++    Session();
++    ~Session();
++    Session(const Session&) = delete;
++    Session& operator=(const Session&) = delete;
++
++   private:
++    bool owner_ = false;
++  };
++
+   /** Fetch the catalog root sections list. Returns false on any failure. */
+   static bool fetchRootSections(std::vector<BookOrbitCatalogSection>& outSections);
+ 
+diff --git a/src/network/HttpDownloader.cpp b/src/network/HttpDownloader.cpp
+index 59ce9f0b..a6f5de54 100644
+--- a/src/network/HttpDownloader.cpp
++++ b/src/network/HttpDownloader.cpp
+@@ -111,6 +111,15 @@ class FullTlsRecordScope {
+   explicit FullTlsRecordScope(const bool requested) { fullTlsRecordRequested = requested; }
+   ~FullTlsRecordScope() { fullTlsRecordRequested = false; }
+ };
++
++// DownloadOptions::wolfSslClient for the request in progress (downloads are synchronous).
++freeink::SecureHttpClient* keptWolfSslClient = nullptr;
++
++class KeptWolfSslClientScope {
++ public:
++  explicit KeptWolfSslClientScope(freeink::SecureHttpClient* client) { keptWolfSslClient = client; }
++  ~KeptWolfSslClientScope() { keptWolfSslClient = nullptr; }
++};
+ #endif
+ 
+ struct Sink {
+@@ -176,7 +185,8 @@ HttpDownloader::DownloadError runGetWolfSsl(const std::string& url, const std::s
+     const bool sendAuthorization = sendCredentials && !username.empty() && !password.empty();
+     const HttpDownloader::HeaderList& hopHeaders = sendCredentials ? extraHeaders : kNoHeaders;
+ 
+-    freeink::SecureHttpClient http;
++    freeink::SecureHttpClient oneShot;
++    freeink::SecureHttpClient& http = keptWolfSslClient != nullptr ? *keptWolfSslClient : oneShot;
+     http.setTimeout(HTTP_TIMEOUT_MS);
+     // SecureNet does not yet expose ESP-IDF's CA bundle. This matches the
+     // existing KOSync transport; cross-origin hops omit all credentials.
+@@ -586,6 +596,8 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string&
+ #if defined(FREEINK_NET_WOLFSSL)
+   const FullTlsRecordScope fullTlsRecordScope(options.largeBody);
+   (void)fullTlsRecordScope;
++  const KeptWolfSslClientScope keptWolfSslClientScope(options.wolfSslClient);
++  (void)keptWolfSslClientScope;
+ #endif
+ 
+   const size_t bufferSize = options.bufferSize > 0 ? options.bufferSize : DEFAULT_DOWNLOAD_BUFFER_SIZE;
+diff --git a/src/network/HttpDownloader.h b/src/network/HttpDownloader.h
+index 9cca52c4..00c89f32 100644
+--- a/src/network/HttpDownloader.h
++++ b/src/network/HttpDownloader.h
+@@ -8,6 +8,10 @@
+ #include <utility>
+ #include <vector>
+ 
++namespace freeink {
++class SecureHttpClient;
++}
++
+ /**
+  * HTTP client utility for fetching content and downloading files.
+  * Streams requests through the configured HTTP transport so large downloads
+@@ -61,6 +65,11 @@ class HttpDownloader {
+     // steps of this size, competing with the TLS record buffer for the largest free block.
+     size_t clientRxBufferSize = 0;
+ 
++    // WOLFSSL transport only: run the request on this caller-owned client instead of a new
++    // one, so a keep-alive connection it holds is reused (no handshake) and stays open for
++    // the caller's next request. nullptr: a fresh connection, closed when the request ends.
++    freeink::SecureHttpClient* wolfSslClient = nullptr;
++
+     // Borrowed only for this synchronous request. Credentials -- Basic auth and
+     // extraHeaders alike -- are sent only to this origin; empty keeps the request
+     // URL as the credential origin, so a redirect to another host never sees them.
+diff --git a/src/network/SavedWifiConnect.cpp b/src/network/SavedWifiConnect.cpp
+index cbd6c63d..145bf57f 100644
+--- a/src/network/SavedWifiConnect.cpp
++++ b/src/network/SavedWifiConnect.cpp
+@@ -1,6 +1,7 @@
+ #include "SavedWifiConnect.h"
+ 
+ #include <Arduino.h>
++#include <CrossInkTailnetCuts.h>
+ #include <Logging.h>
+ #include <WiFi.h>
+ 
+@@ -53,6 +54,9 @@ bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck sh
+       LOG_INF("WIFI", "Joined %s (rssi=%d)", credential.ssid.c_str(), WiFi.RSSI());
+       // Next time, the network that answered here is the first one tried.
+       WIFI_STORE.setLastConnectedSsid(credential.ssid);
++#if CROSSINK_TAILNET_TLS_ARENA
++      tlsArenaReserve();  // before Tailscale takes its share of the heap
++#endif
+       tailnet_wifi_joined();
+       return true;
+     }
+@@ -167,4 +171,7 @@ void SavedWifiConnect::disconnect() {
+   delay(100);
+   WiFi.mode(WIFI_OFF);
+   delay(100);
++#if CROSSINK_TAILNET_TLS_ARENA
++  tlsArenaRelease();
++#endif
+ }
+diff --git a/src/network/TlsArena.cpp b/src/network/TlsArena.cpp
+new file mode 100644
+index 00000000..1290547a
+--- /dev/null
++++ b/src/network/TlsArena.cpp
+@@ -0,0 +1,246 @@
++// A reserved wolfSSL arena for the BookOrbit and catalog requests (CROSSINK_TAILNET_TLS_ARENA).
++//
++// On the X3 the live catalog failed with 44 KB free but a 13 KB largest block: each request
++// needs 14-24 KB of wolfSSL memory, and the heap's holes no longer held it (-112/-125). The
++// arena takes one block while the heap still has a large one (WiFi joined, Tailscale not yet
++// started) and serves the wolfSSL allocations of the task that runs those requests.
++//
++// Routing: allocations by the calling task (the loop task, which arms the arena), so DERP's
++// wolfSSL in MicroLink's tunnel task keeps using the heap. Frees and reallocs go by address,
++// so a buffer freed from any task returns to where it came from. An allocation the arena
++// cannot hold falls back to the heap.
++#include <CrossInkTailnetCuts.h>
++
++#if CROSSINK_TAILNET_TLS_ARENA && defined(FREEINK_NET_WOLFSSL) && !defined(SIMULATOR)
++#include <Arduino.h>
++#include <Logging.h>
++#include <esp_heap_caps.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <wolfssl/wolfcrypt/settings.h>
++#include <wolfssl/wolfcrypt/memory.h>
++
++#include <cstdlib>
++#include <cstring>
++
++#include "SilentRestart.h"
++
++namespace {
++constexpr size_t ARENA_BYTES = static_cast<size_t>(CROSSINK_TAILNET_TLS_ARENA) & ~static_cast<size_t>(7);
++constexpr size_t HEADER = 8;               // keeps every block 8-byte aligned
++constexpr size_t MIN_SPLIT = HEADER + 16;  // smaller remainders stay with the block
++
++struct Block {
++  uint32_t size;  // header included
++  uint32_t used;
++};
++
++// Guards everything below. Nothing inside it allocates or logs.
++portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
++uint8_t* s_arena = nullptr;
++TaskHandle_t s_requestTask = nullptr;
++bool s_armed = false;
++bool s_releasePending = false;
++size_t s_inUse = 0;
++size_t s_peak = 0;
++uint32_t s_liveBlocks = 0;
++uint32_t s_heapFallbacks = 0;
++
++bool s_hooksInstalled = false;
++wolfSSL_Malloc_cb s_prevMalloc = nullptr;
++wolfSSL_Free_cb s_prevFree = nullptr;
++wolfSSL_Realloc_cb s_prevRealloc = nullptr;
++
++Block* blockAt(const size_t offset) { return reinterpret_cast<Block*>(s_arena + offset); }
++
++bool inArena(const void* ptr) {
++  const auto* p = static_cast<const uint8_t*>(ptr);
++  return s_arena != nullptr && p >= s_arena + HEADER && p < s_arena + ARENA_BYTES;
++}
++
++// First fit. Under s_lock.
++void* arenaAlloc(const size_t size) {
++  if (s_arena == nullptr) return nullptr;
++  const size_t need = HEADER + ((size + 7) & ~static_cast<size_t>(7));
++  for (size_t offset = 0; offset < ARENA_BYTES; offset += blockAt(offset)->size) {
++    Block* block = blockAt(offset);
++    if (block->used || block->size < need) continue;
++    if (block->size - need >= MIN_SPLIT) {
++      Block* rest = blockAt(offset + need);
++      rest->size = block->size - need;
++      rest->used = 0;
++      block->size = need;
++    }
++    block->used = 1;
++    s_inUse += block->size;
++    if (s_inUse > s_peak) s_peak = s_inUse;
++    s_liveBlocks++;
++    return reinterpret_cast<uint8_t*>(block) + HEADER;
++  }
++  return nullptr;
++}
++
++// Frees and merges every run of free neighbours. Under s_lock. Returns the arena to hand
++// back to the heap when a pending release can now complete, else nullptr.
++uint8_t* arenaFree(void* ptr) {
++  Block* block = reinterpret_cast<Block*>(static_cast<uint8_t*>(ptr) - HEADER);
++  block->used = 0;
++  s_inUse -= block->size;
++  s_liveBlocks--;
++  for (size_t offset = 0; offset < ARENA_BYTES; offset += blockAt(offset)->size) {
++    Block* current = blockAt(offset);
++    if (current->used) continue;
++    while (offset + current->size < ARENA_BYTES && !blockAt(offset + current->size)->used) {
++      current->size += blockAt(offset + current->size)->size;
++    }
++  }
++  if (!s_releasePending || s_liveBlocks != 0) return nullptr;
++  uint8_t* arena = s_arena;
++  s_arena = nullptr;
++  s_releasePending = false;
++  return arena;
++}
++
++void* heapMalloc(const size_t size) { return s_prevMalloc ? s_prevMalloc(size) : malloc(size); }
++void heapFree(void* ptr) { s_prevFree ? s_prevFree(ptr) : free(ptr); }
++void* heapRealloc(void* ptr, const size_t size) { return s_prevRealloc ? s_prevRealloc(ptr, size) : realloc(ptr, size); }
++
++void* hookMalloc(size_t size) {
++  if (size != 0 && s_arena != nullptr && xTaskGetCurrentTaskHandle() == s_requestTask) {
++    portENTER_CRITICAL(&s_lock);
++    void* ptr = arenaAlloc(size);
++    if (ptr == nullptr && s_arena != nullptr) s_heapFallbacks++;
++    portEXIT_CRITICAL(&s_lock);
++    if (ptr != nullptr) return ptr;
++  }
++  return heapMalloc(size);
++}
++
++void hookFree(void* ptr) {
++  if (ptr == nullptr) return;
++  bool mine = false;
++  uint8_t* released = nullptr;
++  portENTER_CRITICAL(&s_lock);
++  if (inArena(ptr)) {
++    mine = true;
++    released = arenaFree(ptr);
++  }
++  portEXIT_CRITICAL(&s_lock);
++  if (released != nullptr) heap_caps_free(released);
++  if (!mine) heapFree(ptr);
++}
++
++void* hookRealloc(void* ptr, size_t size) {
++  if (ptr == nullptr) return hookMalloc(size);
++  if (size == 0) {
++    hookFree(ptr);
++    return nullptr;
++  }
++  size_t oldSize = 0;
++  portENTER_CRITICAL(&s_lock);
++  if (inArena(ptr)) oldSize = reinterpret_cast<Block*>(static_cast<uint8_t*>(ptr) - HEADER)->size - HEADER;
++  portEXIT_CRITICAL(&s_lock);
++  if (oldSize == 0) return heapRealloc(ptr, size);  // a heap block stays on the heap
++  void* moved = hookMalloc(size);
++  if (moved == nullptr) return nullptr;
++  memcpy(moved, ptr, oldSize < size ? oldSize : size);
++  hookFree(ptr);
++  return moved;
++}
++
++bool armsArena(const uint32_t target) {
++  switch (static_cast<NetworkBootTarget>(target)) {
++    case NetworkBootTarget::BOOKORBIT_SYNC:
++    case NetworkBootTarget::BOOKORBIT_SLEEP_SYNC:
++    case NetworkBootTarget::BOOKORBIT_CATALOG:
++    case NetworkBootTarget::BOOKORBIT_HOME_REFRESH:
++    case NetworkBootTarget::BOOKORBIT_HOME_SHELVES:
++      return true;
++    default:
++      // Not OTA (mbedTLS needs that heap) nor BOOKORBIT_DOWNLOAD, whose 16 KB record
++      // buffer wants the heap's largest block whole.
++      return false;
++  }
++}
++}  // namespace
++
++void tlsArenaArmForBoot(const uint32_t networkBootTarget) {
++  s_armed = armsArena(networkBootTarget);
++  s_requestTask = xTaskGetCurrentTaskHandle();
++  if (s_armed) LOG_INF("TLS", "TLS arena: armed for this boot (%u bytes, task %s)", (unsigned)ARENA_BYTES,
++                       pcTaskGetName(nullptr));
++}
++
++void tlsArenaReserve() {
++  if (!s_armed || s_arena != nullptr) return;
++  const uint32_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++  auto* arena = static_cast<uint8_t*>(heap_caps_malloc(ARENA_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
++  if (arena == nullptr) {
++    LOG_ERR("TLS", "TLS arena: cannot reserve %u bytes (largest block %u); wolfSSL uses the heap",
++            (unsigned)ARENA_BYTES, (unsigned)largestBefore);
++    return;
++  }
++  auto* first = reinterpret_cast<Block*>(arena);
++  first->size = ARENA_BYTES;
++  first->used = 0;
++  if (!s_hooksInstalled) {
++    wolfSSL_GetAllocators(&s_prevMalloc, &s_prevFree, &s_prevRealloc);
++    wolfSSL_SetAllocators(hookMalloc, hookFree, hookRealloc);
++    s_hooksInstalled = true;
++  }
++  portENTER_CRITICAL(&s_lock);
++  s_inUse = 0;
++  s_peak = 0;
++  s_liveBlocks = 0;
++  s_heapFallbacks = 0;
++  s_releasePending = false;
++  s_arena = arena;
++  portEXIT_CRITICAL(&s_lock);
++  LOG_INF("TLS", "TLS arena: reserved %u bytes (largest block was %u, now %u; free %u)", (unsigned)ARENA_BYTES,
++          (unsigned)largestBefore, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
++          (unsigned)ESP.getFreeHeap());
++}
++
++void tlsArenaRelease() {
++  uint8_t* released = nullptr;
++  uint32_t live = 0;
++  portENTER_CRITICAL(&s_lock);
++  if (s_arena != nullptr) {
++    live = s_liveBlocks;
++    if (live == 0) {
++      released = s_arena;
++      s_arena = nullptr;
++    } else {
++      s_releasePending = true;  // the last free hands it back
++    }
++  }
++  portEXIT_CRITICAL(&s_lock);
++  if (released != nullptr) {
++    heap_caps_free(released);
++    LOG_INF("TLS", "TLS arena: released");
++  } else if (live != 0) {
++    LOG_INF("TLS", "TLS arena: release waits for %u live blocks", (unsigned)live);
++  }
++}
++
++void tlsArenaLogRequestPeak(const char* what) {
++  portENTER_CRITICAL(&s_lock);
++  const bool active = s_arena != nullptr;
++  const size_t peak = s_peak;
++  const size_t inUse = s_inUse;
++  const uint32_t fallbacks = s_heapFallbacks;
++  s_peak = s_inUse;
++  s_heapFallbacks = 0;
++  portEXIT_CRITICAL(&s_lock);
++  if (!active) return;
++  LOG_INF("TLS", "TLS arena: peak %u of %u (%s; %u still in use, %u allocations went to the heap)", (unsigned)peak,
++          (unsigned)ARENA_BYTES, what, (unsigned)inUse, (unsigned)fallbacks);
++}
++
++#elif CROSSINK_TAILNET_TLS_ARENA
++// No wolfSSL (simulator): nothing to reserve.
++void tlsArenaArmForBoot(uint32_t) {}
++void tlsArenaReserve() {}
++void tlsArenaRelease() {}
++void tlsArenaLogRequestPeak(const char*) {}
++#endif
+diff --git a/src/util/DictionaryLookupWorker.cpp b/src/util/DictionaryLookupWorker.cpp
+index a74212e3..81ec2aed 100644
+--- a/src/util/DictionaryLookupWorker.cpp
++++ b/src/util/DictionaryLookupWorker.cpp
+@@ -11,7 +11,13 @@ DictionaryLookupWorker& DictionaryLookupWorker::instance() {
+ 
+ bool DictionaryLookupWorker::start(DictionaryLookupController& owner) {
+   if (taskHandle_ == nullptr) {
++#if CROSSINK_TAILNET_DICT_STACK_ON_DEMAND
++    // Stack and TCB from the heap on the first lookup, kept for the boot: a network boot
++    // never looks a word up, so it no longer carries them in .bss.
++    if (xTaskCreate(taskEntry, "DictLookup", kStackBytes, this, 1, &taskHandle_) != pdPASS) taskHandle_ = nullptr;
++#else
+     taskHandle_ = xTaskCreateStatic(taskEntry, "DictLookup", kStackBytes, this, 1, stack_, &taskStorage_);
++#endif
+     if (taskHandle_ == nullptr) {
+       LOG_ERR("DICT", "Could not start static dictionary lookup worker");
+       return false;
+diff --git a/src/util/DictionaryLookupWorker.h b/src/util/DictionaryLookupWorker.h
+index 87d0abf6..4775ee41 100644
+--- a/src/util/DictionaryLookupWorker.h
++++ b/src/util/DictionaryLookupWorker.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <CrossInkTailnetCuts.h>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+ 
+@@ -31,8 +32,10 @@ class DictionaryLookupWorker {
+   static void taskEntry(void* context);
+   void run();
+ 
++#if !CROSSINK_TAILNET_DICT_STACK_ON_DEMAND
+   StaticTask_t taskStorage_ = {};
+   StackType_t stack_[kStackWords] = {};
++#endif
+   TaskHandle_t taskHandle_ = nullptr;
+   std::atomic<DictionaryLookupController*> owner_{nullptr};
+ };
