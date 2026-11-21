@@ -145,7 +145,11 @@ SWITCHES = {
     # wolfSSL arena for BookOrbit/catalog requests, bytes (0 = off): one block reserved
     # when WiFi joins, before Tailscale (and before the framebuffer is parked, so it never
     # sits in the framebuffer's hole), so a fragmented heap cannot fail a handshake.
-    "CROSSINK_TAILNET_TLS_ARENA":         (24576,  0,      0),
+    # X3 int3: a fresh catalog handshake peaked at 23,200 of 24,576 and spilled 3 allocations
+    # to the heap; 28 KB (with best fit) is meant to hold a whole handshake (check the spill lines).
+    "CROSSINK_TAILNET_TLS_ARENA":         (28672,  0,      0),
+    # Arena placement: best fit keeps the large free run whole. Inert without an arena.
+    "CROSSINK_TAILNET_TLS_ARENA_BEST_FIT": (1,     1,      1),
     "CROSSINK_TAILNET_WIFI_FAST_JOIN":    (1,      1,      1),      # patch 0005: last channel+BSSID first
     # Patch 0007: a download boot that ran with the network parked (the C3 with Tailscale)
     # restarts into the catalog at the listing it came from instead of ending on Home.
