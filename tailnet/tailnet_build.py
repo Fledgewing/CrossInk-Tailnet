@@ -73,7 +73,10 @@ def _process_project_deps_with_tailnet(env):
     if not has_psram:
         # No PSRAM: the map-response buffers come from internal RAM.
         ml_env.Append(CPPDEFINES=[("CONFIG_ML_H2_BUFFER_SIZE_KB", 48), ("CONFIG_ML_JSON_BUFFER_SIZE_KB", 48),
-                                  ("CONFIG_ML_MAX_PEERS", 8)])
+                                  ("CONFIG_ML_MAX_PEERS", 8),
+                                  # The fork's small-memory client mode (Fledgewing/microlink,
+                                  # crossink branch): the X3 has ~58 KB free once WiFi is up.
+                                  ("CONFIG_ML_LITE", 1)])
 
     build_dir = os.path.join(env.subst("$BUILD_DIR"), "tailnet")
     objs = []
