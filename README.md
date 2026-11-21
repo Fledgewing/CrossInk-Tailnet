@@ -29,6 +29,31 @@ CI says so if it stops applying.
 
 The partition table is never changed (that can only be done over USB).
 
+### X3 (rc2 / v2.0) differences
+
+CrossInk 2.x plus Tailscale does not fit the ESP32-C3's app slot, so the `default` build
+(X3 and the C3 X4) of CrossInk 2.x leaves out four upstream features. The X4 Pro and X4 Classic
+keep everything. Each is a switch in `tailnet/tailnet_build.py` (`CROSSINK_TAILNET_NO_*`).
+
+| Removed on the X3 | Workaround |
+|---|---|
+| Nearby transfer (send a book, nearby position and stats sync) | Use File Transfer (web) or the SD card to move books. |
+| mDNS (`<name>.local`) | Connect Calibre and the web file transfer with the IP address shown on the reader's screen. |
+| Plugins (hub, catalog, plugin events, the web plugin pages) | None on the X3. |
+| Language and hyphenation pack downloads | Install from the SD card (below). Packs already on the card keep working. |
+
+To install from the SD card, download `crossink-languages-<version>.zip` from the
+CrossInk-Bookorbit release that matches the firmware (upstream CrossInk's packs lack this fork's
+screens). Copy its `.crossink` folder to the root of the SD card. It holds both
+`.crossink/languages` and `.crossink/hyphenation` (`hyph-<code>.cphyph`). Then:
+
+- **Languages:** pick one in **Settings > System > Device > Language**.
+- **Hyphenation:** open **Settings > Reader > Page Layout > Hyphenation Packs** and select a
+  pack marked **Install**. Installed packs offer **Delete** only. To update a pack, delete it,
+  copy the new file and install it again.
+
+Where the downloads used to be, the reader shows where to copy the files.
+
 ## First install
 
 Flash the `.bin` for your reader from the latest release the same way you install CrossInk from

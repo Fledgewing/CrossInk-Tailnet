@@ -1,0 +1,499 @@
+diff --git a/src/CrossPointSettings.cpp b/src/CrossPointSettings.cpp
+index b293d575..85307aa0 100644
+--- a/src/CrossPointSettings.cpp
++++ b/src/CrossPointSettings.cpp
+@@ -1125,6 +1125,9 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
+   } else {
+     pluginsEnabled = clamp(doc["pluginsEnabled"] | uint8_t{0}, 2, 0);
+   }
++#if CROSSINK_TAILNET_NO_PLUGINS
++  pluginsEnabled = 0;  // CrossInk-Tailnet X3 build without plugins: a saved "on" reads as off.
++#endif
+   pluginHubPromptHidden = clamp(doc["pluginHubPromptHidden"] | uint8_t{0}, 2, 0);
+ 
+   if (bookOrbitShortcutsCarried) LOG_INF("CPS", "Carried BookOrbit Sync shortcuts over to their new numbers");
+diff --git a/src/QuickActions.h b/src/QuickActions.h
+index 6793b90c..161cd9d7 100644
+--- a/src/QuickActions.h
++++ b/src/QuickActions.h
+@@ -112,6 +112,10 @@ inline bool isActionAvailable(const uint8_t action) {
+   // file still holding it simply finds it unavailable, exactly as a frontlight
+   // toggle is unavailable on a board with no frontlight.
+   if (action == CrossPointSettings::SYNC_PROGRESS) return false;
++#endif
++#if CROSSINK_TAILNET_NO_NEARBY
++  // CrossInk-Tailnet X3 build without Nearby transfer; a saved slot holding it finds it unavailable.
++  if (action == CrossPointSettings::NEARBY_POSITION_SYNC) return false;
+ #endif
+   if (action == CrossPointSettings::READING_STATS && !SETTINGS.shouldTrackReadingStats()) return false;
+   if (action == CrossPointSettings::PREVIOUS_PAGE || action == CrossPointSettings::NEARBY_POSITION_SYNC ||
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index f19b021a..3a67b3cf 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1174,7 +1174,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
+ #endif
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_TAILSCALE, SettingAction::Tailscale));
++#if !CROSSINK_TAILNET_NO_PLUGINS
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_PLUGINS, SettingAction::Plugins));
++#endif
+ #if !FREEINK_DEVICE_PICCO
+   // Picco retains the vendor recovery slot and has no spare application slot.
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 3c4a5ad4..00b67cc9 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -1,6 +1,8 @@
+ #include "ActivityManager.h"
+ 
++#if !CROSSINK_TAILNET_NO_PLUGINS
+ #include "activities/plugins/PluginCatalogActivity.h"
++#endif
+ 
+ #if CROSSINK_SCALABLE_FONTS
+ #include <HalScalableFont.h>
+@@ -45,8 +47,10 @@
+ #include "home/RecentBookProgress.h"
+ #include "library/LibraryActivity.h"
+ #include "network/CrossPointWebServerActivity.h"
++#if !CROSSINK_TAILNET_NO_NEARBY
+ #include "network/NearbyBookTransferActivity.h"
+ #include "network/NearbyStatsSyncActivity.h"
++#endif
+ #include "network/UsbDriveActivity.h"
+ #include "reader/BookReadingStats.h"
+ #include "reader/BookStatsActivity.h"
+@@ -975,6 +979,12 @@ void ActivityManager::goToFileTransfer(std::string returnBookPath) {
+ }
+ 
+ bool ActivityManager::goToNearbyBookSend(std::string path, const bool returnToReader) {
++#if CROSSINK_TAILNET_NO_NEARBY
++  // CrossInk-Tailnet X3 build without Nearby transfer: no entry offers it.
++  (void)path;
++  (void)returnToReader;
++  return false;
++#else
+   auto activity = makeUniqueNoThrow<NearbyBookTransferActivity>(
+       renderer, mappedInput, NearbyBookTransferActivity::Mode::Send, std::move(path), returnToReader);
+   if (!activity) {
+@@ -983,9 +993,11 @@ bool ActivityManager::goToNearbyBookSend(std::string path, const bool returnToRe
+   }
+   replaceActivity(std::move(activity));
+   return true;
++#endif
+ }
+ 
+ void ActivityManager::goToNearbyBookReceive() {
++#if !CROSSINK_TAILNET_NO_NEARBY
+   auto activity =
+       makeUniqueNoThrow<NearbyBookTransferActivity>(renderer, mappedInput, NearbyBookTransferActivity::Mode::Receive);
+   if (!activity) {
+@@ -993,6 +1005,7 @@ void ActivityManager::goToNearbyBookReceive() {
+     return;
+   }
+   replaceActivity(std::move(activity));
++#endif
+ }
+ 
+ void ActivityManager::goToCalibreWireless(const std::string& returnBookPath) {
+@@ -1051,8 +1064,10 @@ bool ActivityManager::resumeFileTransferFromNetworkBoot(const uint32_t payload)
+ }
+ 
+ void ActivityManager::goToNearbyStatsSync() {
++#if !CROSSINK_TAILNET_NO_NEARBY
+   if (!SETTINGS.shouldTrackReadingStats()) return;
+   replaceActivity(std::make_unique<NearbyStatsSyncActivity>(renderer, mappedInput));
++#endif
+ }
+ 
+ void ActivityManager::goToSettings(const bool dismissOnUpSwipe, const bool openLanguageDownloads,
+@@ -1086,6 +1101,11 @@ void ActivityManager::goToLibrary() {
+ }
+ 
+ bool ActivityManager::goToPlugins(const bool networkBootReady) {
++#if CROSSINK_TAILNET_NO_PLUGINS
++  // CrossInk-Tailnet X3 build without plugins: nothing offers Plugins; a stale boot target goes Home.
++  (void)networkBootReady;
++  return false;
++#else
+ #ifndef SIMULATOR
+   if (!networkBootReady) {
+     // Hub installation and catalog parsing need the same clean heap as OPDS.
+@@ -1102,6 +1122,7 @@ bool ActivityManager::goToPlugins(const bool networkBootReady) {
+   }
+   replaceActivity(std::move(plugins));
+   return true;
++#endif
+ }
+ 
+ void ActivityManager::goToBrowser() {
+diff --git a/src/activities/home/BookActions.cpp b/src/activities/home/BookActions.cpp
+index 95eadea5..3fdf09e7 100644
+--- a/src/activities/home/BookActions.cpp
++++ b/src/activities/home/BookActions.cpp
+@@ -156,6 +156,10 @@ bool hasClearableBookCache(const std::string& path) {
+ }
+ 
+ bool canSendNearby(const std::string& path) {
++#if CROSSINK_TAILNET_NO_NEARBY
++  (void)path;
++  return false;  // CrossInk-Tailnet X3 build without Nearby transfer: hides every Send to Nearby row.
++#endif
+   return FsHelpers::hasEpubExtension(path) || FsHelpers::hasTxtExtension(path) || FsHelpers::hasXtcExtension(path) ||
+          FsHelpers::hasPngExtension(path) || FsHelpers::hasBmpExtension(path);
+ }
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index 01fe232a..ecc14598 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -821,7 +821,7 @@ void HomeActivity::onEnter() {
+ 
+   Activity::onEnter();
+ 
+-  hasPlugins = SETTINGS.pluginsEnabled != 0;
++  hasPlugins = !CROSSINK_TAILNET_NO_PLUGINS && SETTINGS.pluginsEnabled != 0;
+   if (UITheme::hasCoverGridHome()) {
+     coverGridUi = makeUniqueNoThrow<CoverGridHomeUi>(renderer);
+     if (!coverGridUi) LOG_ERR("HOME", "Cannot allocate cover grid UI; using standard Home");
+diff --git a/src/activities/network/CalibreConnectActivity.cpp b/src/activities/network/CalibreConnectActivity.cpp
+index 9a45edbc..11115def 100644
+--- a/src/activities/network/CalibreConnectActivity.cpp
++++ b/src/activities/network/CalibreConnectActivity.cpp
+@@ -1,6 +1,16 @@
+ #include "CalibreConnectActivity.h"
+ 
++#if CROSSINK_TAILNET_NO_MDNS
++// CrossInk-Tailnet X3 build without mDNS: Calibre finds the reader by its IP (shown on screen).
++namespace {
++struct NoMdns {
++  void end() {}
++  bool begin(const char*) { return false; }
++} MDNS;
++}  // namespace
++#else
+ #include <ESPmDNS.h>
++#endif
+ #include <GfxRenderer.h>
+ #include <I18n.h>
+ #include <LibraryBuilder.h>
+diff --git a/src/activities/network/CrossPointWebServerActivity.cpp b/src/activities/network/CrossPointWebServerActivity.cpp
+index 7b962d4d..f2eb173d 100644
+--- a/src/activities/network/CrossPointWebServerActivity.cpp
++++ b/src/activities/network/CrossPointWebServerActivity.cpp
+@@ -1,7 +1,17 @@
+ #include "CrossPointWebServerActivity.h"
+ 
+ #include <DNSServer.h>
++#if CROSSINK_TAILNET_NO_MDNS
++// CrossInk-Tailnet X3 build without mDNS: the server is reached by its IP, which every screen shows.
++namespace {
++struct NoMdns {
++  void end() {}
++  bool begin(const char*) { return false; }
++} MDNS;
++}  // namespace
++#else
+ #include <ESPmDNS.h>
++#endif
+ #include <GfxRenderer.h>
+ #include <I18n.h>
+ #include <LibraryBuilder.h>
+@@ -51,12 +61,18 @@ void stopDnsServer() {
+ }
+ 
+ void restartMdns(const char* hostname, const char* tag) {
++#if CROSSINK_TAILNET_NO_MDNS
++  (void)hostname;
++  (void)tag;
++  return;
++#else
+   MDNS.end();
+   if (MDNS.begin(hostname)) {
+     LOG_DBG(tag, "mDNS started: http://%s.local/", hostname);
+   } else {
+     LOG_DBG(tag, "WARNING: mDNS failed to start");
+   }
++#endif
+ }
+ 
+ // 0..4 bars from RSSI (dBm), with 3 dBm hysteresis on currentBars to suppress flicker.
+@@ -216,6 +232,7 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode)
+   networkMode = mode;
+   isApMode = (mode == NetworkMode::CREATE_HOTSPOT);
+ 
++#if !CROSSINK_TAILNET_NO_NEARBY
+   if (mode == NetworkMode::NEARBY_STATS_SYNC) {
+     activityManager.goToNearbyStatsSync();
+     return;
+@@ -224,6 +241,7 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode)
+     activityManager.goToNearbyBookReceive();
+     return;
+   }
++#endif
+ 
+   if (!networkBootReady) {
+     switch (mode) {
+@@ -598,8 +616,14 @@ void CrossPointWebServerActivity::renderServerRunning() const {
+                       EpdFontFamily::BOLD);
+     startY += height10 + metrics.verticalSpacing * 2;
+ 
++#if CROSSINK_TAILNET_NO_MDNS
++    // No mDNS: the IP URL is the primary one (QR code and text); the captive DNS still answers any name.
++    std::string hostnameUrl = std::string("http://") + connectedIP + "/";
++    std::string ipUrl;
++#else
+     std::string hostnameUrl = std::string("http://") + AP_HOSTNAME + ".local/";
+     std::string ipUrl = tr(STR_OR_HTTP_PREFIX) + connectedIP + "/";
++#endif
+ 
+     // Show QR code for URL
+     const Rect qrBoundsUrl(safe.x + metrics.contentSidePadding, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
+@@ -630,9 +654,11 @@ void CrossPointWebServerActivity::renderServerRunning() const {
+     renderer.drawCenteredText(UI_10_FONT_ID, startY, webInfo.c_str(), true);
+     startY += height10 + 5;
+ 
++#if !CROSSINK_TAILNET_NO_MDNS
+     // Also show hostname URL
+     std::string hostnameUrl = std::string(tr(STR_OR_HTTP_PREFIX)) + AP_HOSTNAME + ".local/";
+     renderer.drawCenteredText(SMALL_FONT_ID, startY, hostnameUrl.c_str(), true);
++#endif
+   }
+ 
+   const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_EXIT)), "", "", "");
+diff --git a/src/activities/network/NetworkModeSelectionActivity.cpp b/src/activities/network/NetworkModeSelectionActivity.cpp
+index 265d8362..9a67610c 100644
+--- a/src/activities/network/NetworkModeSelectionActivity.cpp
++++ b/src/activities/network/NetworkModeSelectionActivity.cpp
+@@ -50,10 +50,12 @@ constexpr MenuEntry MENU_ENTRIES[] = {
+      MenuSection::SyncServer},
+     {NetworkMode::SYNC_CLIPPINGS, StrId::STR_SYNC_CLIPPINGS, StrId::STR_SYNC_CLIPPINGS_DESC, UIIcon::BookmarkIcon,
+      MenuSection::SyncServer},
++#if !CROSSINK_TAILNET_NO_NEARBY
+     {NetworkMode::NEARBY_BOOK_RECEIVE, StrId::STR_RECEIVE_NEARBY_BOOK, StrId::STR_RECEIVE_NEARBY_BOOK_DESC,
+      UIIcon::Transfer, MenuSection::Nearby},
+     {NetworkMode::NEARBY_STATS_SYNC, StrId::STR_NEARBY_STATS_SYNC, StrId::STR_NEARBY_STATS_SYNC_DESC, UIIcon::Transfer,
+      MenuSection::Nearby},
++#endif
+ };
+ constexpr int MENU_ENTRY_COUNT = sizeof(MENU_ENTRIES) / sizeof(MENU_ENTRIES[0]);
+ static_assert(MENU_ENTRY_COUNT <= NetworkModeSelectionActivity::MAX_MENU_ROWS, "Raise MAX_MENU_ROWS");
+diff --git a/src/activities/reader/EpubReaderActivity.cpp b/src/activities/reader/EpubReaderActivity.cpp
+index d6114592..9f072389 100644
+--- a/src/activities/reader/EpubReaderActivity.cpp
++++ b/src/activities/reader/EpubReaderActivity.cpp
+@@ -64,7 +64,9 @@
+ #include "KOReaderSyncActivity.h"
+ #include "LookedUpWordsActivity.h"
+ #include "MappedInputManager.h"
++#if !CROSSINK_TAILNET_NO_NEARBY
+ #include "NearbyBookPositionSyncActivity.h"
++#endif
+ #include "PageWordGeometry.h"
+ #include "ProgressMapper.h"
+ #include "QrDisplayActivity.h"
+@@ -4809,6 +4811,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+       break;
+     }
+     case EpubReaderMenuAction::NEARBY_POSITION_SYNC: {
++#if CROSSINK_TAILNET_NO_NEARBY
++      break;  // CrossInk-Tailnet X3 build without Nearby transfer.
++#else
+       const int currentPage = section ? section->currentPage : nextPageNumber;
+       const int totalPages = section ? section->estimatedTotalPages() : std::max(1, cachedChapterTotalPageCount);
+       std::optional<uint16_t> paragraphIndex;
+@@ -4879,6 +4884,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuAction action, const
+       pauseReadingPaceTimer("nearby_position_sync");
+       activityManager.replaceActivity(std::move(syncActivity));
+       break;
++#endif
+     }
+     case EpubReaderMenuAction::BOOKMARK_TOGGLE: {
+       const int bookmarkPageCount = section ? section->estimatedTotalPages() : 0;
+diff --git a/src/activities/reader/EpubReaderMenuModel.h b/src/activities/reader/EpubReaderMenuModel.h
+index 41944453..15d7ab9f 100644
+--- a/src/activities/reader/EpubReaderMenuModel.h
++++ b/src/activities/reader/EpubReaderMenuModel.h
+@@ -230,8 +230,10 @@ constexpr ReaderDrawerCatalog makeReaderDrawerCatalog(const ReaderDrawerAvailabi
+   if (available.buttonDevice) {
+     if (available.hasBookOrbitSync) location.add(ReaderDrawerCatalogItem::BookOrbitSync);
+     if (available.hasKOReaderSync) location.add(ReaderDrawerCatalogItem::SyncProgress);
++#if !CROSSINK_TAILNET_NO_NEARBY
+     location.add(ReaderDrawerCatalogItem::NearbyPositionSync);
+     location.add(ReaderDrawerCatalogItem::SendNearbyBook);
++#endif
+   }
+   location.add(ReaderDrawerCatalogItem::Screenshot);
+   location.add(ReaderDrawerCatalogItem::DisplayQr);
+diff --git a/src/activities/settings/HyphenationManagerActivity.cpp b/src/activities/settings/HyphenationManagerActivity.cpp
+index d7c8980a..8fe55296 100644
+--- a/src/activities/settings/HyphenationManagerActivity.cpp
++++ b/src/activities/settings/HyphenationManagerActivity.cpp
+@@ -82,10 +82,29 @@ void HyphenationManagerActivity::select() {
+     if (HyphenationPackStore::hasSource(code))
+       apply(false);
+     else
++#if CROSSINK_TAILNET_NO_ASSET_DOWNLOADS
++    {
++      // CrossInk-Tailnet X3 build without asset downloads: an SD copy is the way to install.
++      RenderLock lock(*this);
++      const char* ok[] = {tr(STR_OK)};
++      popup_.show(catalog_->labels[selected_], ok, 1, 0, [this](int) { pending_ = Pending::List; },
++                  OptionPopup::Note("Copy hyphenation files to /.crossink/hyphenation on the SD card.", ""));
++      popup_.setCancelCallback([this] { pending_ = Pending::List; });
++      requestUpdate();
++    }
++#else
+       connect();
++#endif
+     return;
+   }
+   RenderLock lock(*this);
++#if CROSSINK_TAILNET_NO_ASSET_DOWNLOADS
++  const char* options[] = {tr(STR_DELETE), tr(STR_CANCEL)};  // No Update: nothing downloads on this build.
++  popup_.show(
++      catalog_->labels[selected_], options, 2, 1,
++      [this](int index) { pending_ = index == 0 ? Pending::Remove : Pending::List; },
++      OptionPopup::Note(tr(STR_HYPHENATION_APPLY_HINT), ""));
++#else
+   const char* options[] = {tr(STR_UPDATE), tr(STR_DELETE), tr(STR_CANCEL)};
+   popup_.show(
+       catalog_->labels[selected_], options, 3, 2,
+@@ -93,6 +112,7 @@ void HyphenationManagerActivity::select() {
+                                      : index == 1 ? Pending::Remove
+                                                   : Pending::List; },
+       OptionPopup::Note(tr(STR_HYPHENATION_APPLY_HINT), ""));
++#endif
+   popup_.setCancelCallback([this] { pending_ = Pending::List; });
+   requestUpdate();
+ }
+diff --git a/src/activities/settings/ReleaseNotesActivity.cpp b/src/activities/settings/ReleaseNotesActivity.cpp
+index 83fe4452..2171303b 100644
+--- a/src/activities/settings/ReleaseNotesActivity.cpp
++++ b/src/activities/settings/ReleaseNotesActivity.cpp
+@@ -78,6 +78,9 @@ void ReleaseNotesActivity::onEnter() {
+   // translations, a saved non-English language with no installed pack runs as English.
+   const char* code = SETTINGS.languageCode;
+   updateOffered = releaseNotesOfferLanguageUpdate(code, I18N.getCode(), APP_STATE.releaseNotesUpdateTried);
++#if CROSSINK_TAILNET_NO_ASSET_DOWNLOADS
++  updateOffered = false;  // No downloads on this build: the action opens the copy-to-SD note instead.
++#endif
+   languageIndex = static_cast<int>(I18n::languageFromCode(code));
+   page = 0;
+   layout();
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 18067984..5129675a 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -864,6 +864,17 @@ int SettingsActivity::languageSourceIndex(const char* code) const {
+ void SettingsActivity::openLanguageDownloads() {
+   RenderLock lock(*this);
+   optionPopup.clear();
++#if CROSSINK_TAILNET_NO_ASSET_DOWNLOADS
++  // CrossInk-Tailnet X3 build without asset downloads: packs copied to the SD card still load
++  // (Language picks them); say where they go instead of offering a download.
++  {
++    static constexpr StrId OK[] = {StrId::STR_OK};
++    optionPopup.show(StrId::STR_DOWNLOAD_LANGUAGES, OK, 1, 0, [](int) {},
++                     OptionPopup::Note("Copy language files to /.crossink/languages on the SD card.", ""));
++    requestUpdate();
++    return;
++  }
++#endif
+   languageCatalog.reset();
+   // Reuse the same bounded offline catalog as Language to tell installed languages
+   // from ones to install; online TLS/catalog RAM is acquired only after the
+diff --git a/src/activities/util/FrontlightPanelActivity.cpp b/src/activities/util/FrontlightPanelActivity.cpp
+index 7bbc50eb..4190ebf3 100644
+--- a/src/activities/util/FrontlightPanelActivity.cpp
++++ b/src/activities/util/FrontlightPanelActivity.cpp
+@@ -246,7 +246,14 @@ void FrontlightPanelActivity::openSyncDialog() {
+   // BookOrbit is this fork's sync provider; upstream's KOReader entry keeps its
+   // guard so the list follows the CROSSINK_APP_CAP_KOREADER_SYNC build switch
+   // (preprocessor-only: the macro is not defined on every environment).
+-#if CROSSINK_APP_CAP_KOREADER_SYNC
++#if CROSSINK_TAILNET_NO_NEARBY && CROSSINK_APP_CAP_KOREADER_SYNC
++  static constexpr std::array<StrId, 2> OPTIONS = {StrId::STR_BOOKORBIT_SYNC, StrId::STR_SYNC_BOOK};
++  static constexpr std::array<FrontlightPanelAction, 2> ACTIONS = {FrontlightPanelAction::BookOrbitSync,
++                                                                   FrontlightPanelAction::SyncProgress};
++#elif CROSSINK_TAILNET_NO_NEARBY
++  static constexpr std::array<StrId, 1> OPTIONS = {StrId::STR_BOOKORBIT_SYNC};
++  static constexpr std::array<FrontlightPanelAction, 1> ACTIONS = {FrontlightPanelAction::BookOrbitSync};
++#elif CROSSINK_APP_CAP_KOREADER_SYNC
+   static constexpr std::array<StrId, 4> OPTIONS = {StrId::STR_BOOKORBIT_SYNC, StrId::STR_SYNC_BOOK,
+                                                    StrId::STR_NEARBY_POSITION_SYNC, StrId::STR_SEND_NEARBY_BOOK};
+   static constexpr std::array<FrontlightPanelAction, 4> ACTIONS = {
+diff --git a/src/main.cpp b/src/main.cpp
+index ade86acb..4fc95b63 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -2151,6 +2151,9 @@ void setup() {
+         launched = activityManager.resumeFileTransferFromNetworkBoot(snapshotPayload);
+         break;
+       case NetworkBootTarget::DOWNLOAD_ASSETS: {
++#if CROSSINK_TAILNET_NO_ASSET_DOWNLOADS
++        break;  // CrossInk-Tailnet X3 build: packs are copied to the SD card; nothing downloads them.
++#endif
+         if (!AssetDownloadActivity::validBootPayload(snapshotPayload)) break;
+         auto assets = makeUniqueNoThrow<AssetDownloadActivity>(renderer, mappedInputManager, snapshotPayload);
+         if (assets) {
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index 0485147a..b5e027ff 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -475,6 +475,10 @@ void CrossPointWebServer::begin() {
+     server->sendHeader("Content-Encoding", "gzip");
+     server->send_P(200, "application/javascript", PluginHostJs, PluginHostJsCompressedSize);
+   });
++#if CROSSINK_TAILNET_NO_PLUGINS
++  // CrossInk-Tailnet X3 build without plugins: answer as a device with plugins turned off.
++  server->on("/api/plugins", HTTP_GET, [this] { server->send(403, "text/plain", "plugin system disabled"); });
++#else
+   server->on("/api/plugins", HTTP_GET, [this] { handlePluginList(); });
+   server->on("/plugin", HTTP_GET, [this] { handlePluginFile(); });
+   server->on("/plugins-run", HTTP_GET, [this] { handlePluginRunnerPage(); });
+@@ -482,11 +486,14 @@ void CrossPointWebServer::begin() {
+   server->on("/api/plugin-jobs/claim", HTTP_GET, [this] { handlePluginJobClaim(); });
+   server->on("/api/plugin-jobs/complete", HTTP_POST, [this] { handlePluginJobComplete(); });
+   server->on("/api/plugin-jobs/status", HTTP_GET, [this] { handlePluginJobStatus(); });
++#endif
++#if !CROSSINK_TAILNET_NO_PLUGINS
+   server->on("/api/relay", HTTP_POST, [this] { handleRelay(); });
+   server->on("/api/crypto", HTTP_POST, [this] { handleCrypto(); });
+   server->on("/api/fetch", HTTP_POST, [this] { handleFetch(); });
+   server->on("/api/book-key", HTTP_POST, [this] { handleBookKey(); });
+   server->on("/api/plugin-fs", HTTP_POST, [this] { handlePluginFs(); }, [this] { handlePluginFsUpload(); });
++#endif
+   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
+   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
+   server->on("/download", HTTP_GET, [this] { handleDownload(); });
+diff --git a/src/util/PluginEvents.cpp b/src/util/PluginEvents.cpp
+index b89acad7..60e58c7c 100644
+--- a/src/util/PluginEvents.cpp
++++ b/src/util/PluginEvents.cpp
+@@ -1,5 +1,19 @@
+ #include "PluginEvents.h"
+ 
++#if CROSSINK_TAILNET_NO_PLUGINS
++// CrossInk-Tailnet X3 build without plugins: no subscriptions, nothing is queued or sent.
++namespace pluginevents {
++void refreshSubscriptions() {}
++void pollOnline() {}
++void prepareSleep(const char*, int, bool) {}
++bool anySubscriber(Event) { return false; }
++uint8_t subscriptionMask(const char*) { return 0; }
++bool wantsConnectAny() { return false; }
++void emit(Event, const Var*, size_t) {}
++void drain(GfxRenderer*, size_t) {}
++}  // namespace pluginevents
++#else
++
+ #include <ArduinoJson.h>
+ #include <HalStorage.h>
+ #include <LibraryBuilder.h>
+@@ -543,3 +557,4 @@ void prepareSleep(const char* book, int progress, bool allowNetwork) {
+ }
+ 
+ }  // namespace pluginevents
++#endif  // CROSSINK_TAILNET_NO_PLUGINS

@@ -164,19 +164,40 @@ SWITCHES = {
     # framebuffer back with WiFi and Tailscale kept when the heap has the block; else WiFi goes off and
     # an upload chosen restarts the sync pre-answered. The X4s never park (no-op there).
     "CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK": (1,   0,      0),
+    # --- CrossInk 2.x flash cuts (X3 only: rc2 plus Tailscale is ~199 KB over the C3's 6.25 MB app slot).
+    # Each removes one upstream feature from the build the way upstream drops OPDS there: no menu entry,
+    # a saved setting that points at it reads as unavailable. Inert on CrossInk 1.6 (no such code).
+    "CROSSINK_TAILNET_NO_NEARBY":         (1,      0,      0),      # Nearby book/position/stats transfer
+    "CROSSINK_TAILNET_NO_MDNS":           (1,      0,      0),      # web server/Calibre by IP only
+    "CROSSINK_TAILNET_NO_PLUGINS":        (1,      0,      0),      # plugin hub, catalog, events, web routes
+    "CROSSINK_TAILNET_NO_ASSET_DOWNLOADS": (1,     0,      0),      # language/hyphenation packs: copy to SD
+    # wolfSSL error-code text (logs show the number); no run-time cost.
+    "CROSSINK_TAILNET_WOLFSSL_NO_ERROR_STRINGS": (1, 0,     0),
 }
 # Switches that stand for wolfSSL defines rather than a define of their own.
 WOLFSSL_SWITCH_DEFINES = {
     "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": ["WOLFSSL_RSA_PUBLIC_ONLY", "WOLFSSL_NO_CLIENT_AUTH"],
     "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": ["NO_SESSION_CACHE"],
+    "CROSSINK_TAILNET_WOLFSSL_NO_ERROR_STRINGS": ["NO_ERROR_STRINGS"],
 }
 SWITCH_COLUMN = pioenv if pioenv in SWITCH_ENVS else ("x4-pro" if has_psram else "default")
+
+
+# The CrossInk 2.x flash cuts: CrossInk 1.6 fits without them (and its X3 build still needs mDNS).
+V2_ONLY_SWITCHES = ("CROSSINK_TAILNET_NO_NEARBY", "CROSSINK_TAILNET_NO_MDNS", "CROSSINK_TAILNET_NO_PLUGINS",
+                    "CROSSINK_TAILNET_NO_ASSET_DOWNLOADS", "CROSSINK_TAILNET_WOLFSSL_NO_ERROR_STRINGS")
+try:
+    CROSSINK_MAJOR = int(str(env.GetProjectConfig().get("crossink", "version")).split(".")[0])  # noqa: F821
+except Exception:
+    CROSSINK_MAJOR = 1
 
 
 def switch_value(name):
     """The switch's value for this build (env var, else its row); None = header default."""
     if name in os.environ:
         return int(os.environ[name], 0)
+    if name in V2_ONLY_SWITCHES and CROSSINK_MAJOR < 2:
+        return 0
     return SWITCHES[name][SWITCH_ENVS.index(SWITCH_COLUMN)]
 
 
@@ -206,6 +227,15 @@ for _name, _value in SWITCH_VALUES.items():
     else:
         _global_defines.append((_name, _value))
 env.Append(CPPDEFINES=_global_defines)  # noqa: F821
+
+# CROSSINK_TAILNET_NO_MDNS: the Arduino ESPmDNS library is linked as objects, so its global MDNS
+# responder would keep ~22 KB of IDF mdns even with nothing calling it. Leave the library out.
+if SWITCH_VALUES.get("CROSSINK_TAILNET_NO_MDNS"):
+    _cfg = env.GetProjectConfig()  # noqa: F821
+    _section = "env:" + pioenv
+    _ignored = list(_cfg.get(_section, "lib_ignore", []) or [])
+    if "ESPmDNS" not in _ignored:
+        _cfg.set(_section, "lib_ignore", _ignored + ["ESPmDNS"])
 
 # The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL): the application already compiles Arduino-wolfSSL from
 # source, and its session is ~5 KB once connected against the prebuilt

@@ -178,6 +178,7 @@ jobs:
 
             Install over the air from the reader (Settings > Check for updates) once it runs a
             CrossInk-Tailnet build, or flash the .bin for your reader from an SD card or USB.
+            ${{ startsWith(needs.resolve.outputs.upstream_tag, 'v2.') && 'The X3 build leaves out Nearby transfer, mDNS, Plugins and language/hyphenation downloads (see "X3 (rc2 / v2.0) differences" in the README for workarounds). The X4 Pro and X4 Classic keep everything.' || '' }}
 
             upstream=${{ needs.resolve.outputs.upstream_tag }} overlay=${{ github.sha }}
           files: firmware/*.bin
