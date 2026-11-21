@@ -1,0 +1,99 @@
+diff --git a/src/network/HttpDownloader.cpp b/src/network/HttpDownloader.cpp
+index e5c26421..de806134 100644
+--- a/src/network/HttpDownloader.cpp
++++ b/src/network/HttpDownloader.cpp
+@@ -126,6 +126,71 @@ class ProgressNotifier {
+   const HttpDownloader::ProgressCallback* progress_ = nullptr;
+ };
+ 
++// Throughput of one file download, logged every ~10 s and once at the end:
++// how fast it went and where the time went (writing to the SD card vs waiting
++// for the next bytes, i.e. the network and TLS). Runs on the downloading task
++// between reads, never inside a lock.
++class DownloadRateLog {
++ public:
++  static constexpr uint32_t INTERVAL_MS = 10000;
++
++  bool write(const std::function<bool(const uint8_t*, size_t)>& out, const uint8_t* data, const size_t len,
++             const size_t downloaded, const size_t total) {
++    const uint32_t nowUs = micros();
++    if (startMs_ == 0) {
++      startMs_ = millis();
++      lastLogMs_ = startMs_;
++      startBytes_ = downloaded;
++      lastLogBytes_ = downloaded;
++    } else {
++      waitUs_ += nowUs - lastEndUs_;
++    }
++    const bool ok = out(data, len);
++    lastEndUs_ = micros();
++    sdUs_ += lastEndUs_ - nowUs;
++    bytes_ += len;
++    const uint32_t now = millis();
++    if (now - lastLogMs_ >= INTERVAL_MS) {
++      const size_t at = downloaded + len;
++      const uint32_t ms = now - lastLogMs_;
++      LOG_INF("HTTP", "Download progress: %u KB of %u KB, %u KB/s (last %lu s: SD write %lu ms, waiting %lu ms)",
++              static_cast<unsigned>(at / 1024), static_cast<unsigned>(total / 1024),
++              static_cast<unsigned>((at - lastLogBytes_) * 1000ULL / 1024 / (ms ? ms : 1)),
++              static_cast<unsigned long>(ms / 1000), static_cast<unsigned long>((sdUs_ - lastSdUs_) / 1000),
++              static_cast<unsigned long>((waitUs_ - lastWaitUs_) / 1000));
++      lastLogMs_ = now;
++      lastLogBytes_ = at;
++      lastSdUs_ = sdUs_;
++      lastWaitUs_ = waitUs_;
++    }
++    return ok;
++  }
++
++  void summary(const bool ok) const {
++    if (startMs_ == 0) return;
++    const uint32_t ms = millis() - startMs_;
++    LOG_INF("HTTP", "Download %s: %u KB in %lu.%01lu s, average %u KB/s (SD write %lu ms, waiting %lu ms)",
++            ok ? "done" : "stopped", static_cast<unsigned>(bytes_ / 1024), static_cast<unsigned long>(ms / 1000),
++            static_cast<unsigned long>(ms % 1000 / 100),
++            static_cast<unsigned>(bytes_ * 1000ULL / 1024 / (ms ? ms : 1)), static_cast<unsigned long>(sdUs_ / 1000),
++            static_cast<unsigned long>(waitUs_ / 1000));
++    // Which path the bytes took (direct or the DERP relay) and its round trip.
++    tailnet_log_path("Download");
++  }
++
++ private:
++  uint32_t startMs_ = 0;
++  uint32_t lastLogMs_ = 0;
++  uint32_t lastEndUs_ = 0;
++  uint64_t sdUs_ = 0;
++  uint64_t waitUs_ = 0;
++  uint64_t lastSdUs_ = 0;
++  uint64_t lastWaitUs_ = 0;
++  size_t bytes_ = 0;
++  size_t startBytes_ = 0;
++  size_t lastLogBytes_ = 0;
++};
++
+ #if defined(FREEINK_NET_WOLFSSL)
+ // DownloadOptions::wolfSslClient for the request in progress (downloads are synchronous).
+ freeink::SecureHttpClient* keptWolfSslClient = nullptr;
+@@ -826,7 +891,13 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string&
+     return fileOpen;
+   };
+ 
+-  sink.write = [&](const uint8_t* data, size_t len) { return openOutputFile() && file.write(data, len) == len; };
++  const std::function<bool(const uint8_t*, size_t)> writeFile = [&](const uint8_t* data, size_t len) {
++    return openOutputFile() && file.write(data, len) == len;
++  };
++  DownloadRateLog rateLog;
++  sink.write = [&](const uint8_t* data, size_t len) {
++    return rateLog.write(writeFile, data, len, sink.downloaded, sink.total);
++  };
+ 
+   DownloadError result = HTTP_ERROR;
+   HttpDownloadResume::RetryBudget budget;
+@@ -874,6 +945,7 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string&
+     }
+   } while (true);
+   if (insufficientSpace) result = INSUFFICIENT_SPACE;
++  rateLog.summary(result == OK);
+ 
+   if (result != OK) {
+     LOG_ERR("HTTP", "Transfer failed: error=%d downloaded=%zu expected=%zu preservePartial=%d resumePartial=%d",

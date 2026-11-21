@@ -23,6 +23,10 @@ on:
         description: "CrossInk-Bookorbit tag to build (empty = latest release)"
         required: false
         type: string
+      patch_series:
+        description: "Overlay patch series (v1.6 or v2.0; empty = from the upstream version)"
+        required: false
+        type: string
       force_release:
         description: "Publish even if this upstream tag + overlay commit was already released"
         required: false
@@ -133,6 +137,9 @@ jobs:
           uv pip install --python ~/.platformio/penv/bin/python "pioarduino==${PIO_CORE}"
 
       - name: Apply the overlay
+        # overlay/patches/v1.6 for CrossInk 1.6.x, v2.0 for 2.x (picked from the tag).
+        env:
+          CROSSINK_PATCH_SERIES: ${{ inputs.patch_series }}
         run: overlay/scripts/apply.sh upstream
 
       - name: Set the release version

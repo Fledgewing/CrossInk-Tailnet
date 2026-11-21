@@ -12,12 +12,11 @@ This is an **overlay**, not a fork. CrossInk's source is used as released; the o
 | Shim | `tailnet/shim` | Starts MicroLink when WiFi gets an address, stops it when WiFi goes away; answers tailnet names (`bookorbit`, `bookorbit.<tailnet>.ts.net`) for every HTTP client in the firmware |
 | Settings screen | `tailnet/ui` | **Settings > Tailscale**: on/off, status and address, log in (QR code) and log out |
 | Build hook | `tailnet/tailnet_build.py` + `overlay/platformio.local.ini` | Compiles the above into CrossInk's normal PlatformIO build and points the updater at this repo's releases |
-| Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row |
-| Framebuffer hook | `overlay/patches/0002-park-framebuffer-for-tailscale.patch` | X3/X4 only: frees the display framebuffer while Tailscale runs in a sync's network boot (`tailnet/shim/TailnetNetPhase.h`) |
+| CrossInk patches | `overlay/patches/v1.6/` (CrossInk 1.6.x), `overlay/patches/v2.0/` (CrossInk 2.x) | One numbered series per upstream line: the Settings row (0001), the framebuffer freed while Tailscale runs in a network boot on the X3/X4 (0002, `tailnet/shim/TailnetNetPhase.h`), and the memory and download changes after them |
 
 When CrossInk-Bookorbit releases, the daily CI run rebuilds the new tag with the overlay and
-publishes a release here. The only thing that can need hand work is the two small patches, and
-CI says so if it stops applying.
+publishes a release here. The only thing that can need hand work is the patch series for that upstream
+line, and CI says so if it stops applying. The shim, MicroLink and the switch table are shared by both lines.
 
 ## Readers
 
@@ -173,8 +172,15 @@ CrossInk-Tailnet/scripts/apply.sh CrossInk-Bookorbit
 cd CrossInk-Bookorbit && pio run -e x4-pro    # or x4-classic, default
 ```
 
-`apply.sh` only touches git-ignored paths plus the settings patch in CrossInk, applies the MicroLink
-patch to this repo's submodule, and is safe to rerun.
+`apply.sh` picks the patch series from the checkout's CrossInk version (`[crossink] version` in its
+`platformio.ini`, else its tag): 1.6.x uses `overlay/patches/v1.6`, 2.x uses `overlay/patches/v2.0`, and
+any other version stops with an error. `apply.sh --series v1.6|v2.0 <checkout>` (or
+`CROSSINK_PATCH_SERIES=v2.0`) chooses one explicitly. Besides that series it only touches git-ignored
+paths in CrossInk, and it is safe to rerun.
+
+CrossInk 1.6 and 2.x build on different pioarduino platforms that share one framework package
+directory, so keep a separate PlatformIO home for each, e.g.
+`PLATFORMIO_CORE_DIR=~/.platformio-rc2 pio run -e default` for 2.x.
 
 ## Licence
 
