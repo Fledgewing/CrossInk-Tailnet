@@ -189,6 +189,8 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
   }
 }
 
+extern "C" uint32_t tailnet_network_boot_target(void) { return s_target; }
+
 extern "C" bool tailnet_boot_parks(void) { return s_armed.load() && tailnet_enabled() && tailnet_joined(); }
 
 extern "C" bool tailnet_end_parked_network(void) {

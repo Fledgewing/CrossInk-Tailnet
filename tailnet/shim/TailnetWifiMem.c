@@ -29,6 +29,11 @@
 //    window kept <= min(2 x static RX, dynamic RX) as the guide requires: 6.
 // The buffer cuts above are TAILNET_WIFI_STATIC_RX/DYNAMIC_RX/DYNAMIC_TX (the C3).
 //
+// Two tiers, chosen per boot (tierForBoot()): the live catalog keeps the framebuffer
+// and runs on the small counts (TAILNET_WIFI_STATIC_RX/...), while the boots that park
+// it (syncs, the download, Home refresh, login) have the heap for more and take
+// TAILNET_WIFI_PARKED_* (the X3: 3/8/8, RX mgmt 5). AMPDU TX stays off in both.
+//
 // Further cuts, each its own switch:
 //  - TAILNET_WIFI_RX_MGMT: static RX management buffers 5 -> N (Kconfig range
 //    1..10; ~500 B each). They take beacons, probe responses and auth/assoc
@@ -57,9 +62,13 @@
 #include <esp_wifi.h>
 #include <esp_private/wifi_os_adapter.h>
 
+#include "TailnetNetPhase.h"
 #include "TailnetSysSwitches.h"
 
 void tailnet_log_emit(const char* format, ...);  // TailnetLog.cpp
+// TailnetNetPhase.cpp (CrossInk side). Weak: the framework's lib-builder pass links the
+// shim without CrossInk's sources, where every boot takes the small tier.
+__attribute__((weak)) uint32_t tailnet_network_boot_target(void);
 
 // Buffer counts, per env from the switch table in tailnet_build.py (the X3:
 // 2/4/4); 0 keeps the framework's count. ESP-IDF's floors: static RX >= 2,
@@ -79,8 +88,57 @@ void tailnet_log_emit(const char* format, ...);  // TailnetLog.cpp
 #ifndef TAILNET_WIFI_DYNAMIC_TX
 #define TAILNET_WIFI_DYNAMIC_TX TAILNET_WIFI_COUNT_DEFAULT(8)
 #endif
+// Parked tier (per env in tailnet_build.py): the counts for a network boot that parks the
+// framebuffer (or never draws while WiFi is up) and so has ~80-118 KB free; any
+// count 0 = that boot takes the counts above.
+#ifndef TAILNET_WIFI_PARKED_STATIC_RX
+#define TAILNET_WIFI_PARKED_STATIC_RX 0
+#endif
+#ifndef TAILNET_WIFI_PARKED_DYNAMIC_RX
+#define TAILNET_WIFI_PARKED_DYNAMIC_RX 0
+#endif
+#ifndef TAILNET_WIFI_PARKED_DYNAMIC_TX
+#define TAILNET_WIFI_PARKED_DYNAMIC_TX 0
+#endif
+#ifndef TAILNET_WIFI_PARKED_RX_MGMT
+#define TAILNET_WIFI_PARKED_RX_MGMT 0
+#endif
+#define TAILNET_WIFI_PARKED_TIER                                                                   \
+  (TAILNET_WIFI_PARKED_STATIC_RX > 0 && TAILNET_WIFI_PARKED_DYNAMIC_RX > 0 && TAILNET_WIFI_PARKED_DYNAMIC_TX > 0)
 // The buffer cut (with AMPDU TX off and the RX BA window cap) runs when any count is set.
-#define TAILNET_WIFI_SMALL_BUFFERS (TAILNET_WIFI_STATIC_RX > 0 || TAILNET_WIFI_DYNAMIC_RX > 0 || TAILNET_WIFI_DYNAMIC_TX > 0)
+#define TAILNET_WIFI_SMALL_BUFFERS                                                                 \
+  (TAILNET_WIFI_STATIC_RX > 0 || TAILNET_WIFI_DYNAMIC_RX > 0 || TAILNET_WIFI_DYNAMIC_TX > 0 || TAILNET_WIFI_PARKED_TIER)
+
+// One tier of counts; 0 keeps the framework's.
+typedef struct {
+  const char* name;
+  int static_rx, dynamic_rx, dynamic_tx, rx_mgmt;
+} wifi_tier_t;
+
+// The tier for this boot, from its network boot target (TailnetNetPhase.cpp records it
+// before WiFi starts; the RTC token itself is cleared by then). Parked boots: BookOrbit
+// sync 8, sleep sync 9, download 10, Home refresh 12, Home shelves 13, login 64 and
+// BookOrbit authentication 65. Everything else, the live catalog (11) first, keeps the
+// small counts: its framebuffer stays allocated.
+static wifi_tier_t tierForBoot(uint32_t target) {
+  wifi_tier_t tier = {"small", TAILNET_WIFI_STATIC_RX, TAILNET_WIFI_DYNAMIC_RX, TAILNET_WIFI_DYNAMIC_TX,
+                      TAILNET_WIFI_RX_MGMT};
+#if TAILNET_WIFI_PARKED_TIER
+  switch (target) {
+    case 8: case 9: case 10: case 12: case 13: case 64: case 65: {
+      const wifi_tier_t parked = {"parked", TAILNET_WIFI_PARKED_STATIC_RX, TAILNET_WIFI_PARKED_DYNAMIC_RX,
+                                  TAILNET_WIFI_PARKED_DYNAMIC_TX, TAILNET_WIFI_PARKED_RX_MGMT};
+      tier = parked;
+      break;
+    }
+    default:
+      break;
+  }
+#else
+  (void)target;
+#endif
+  return tier;
+}
 
 #if TAILNET_WIFI_ALLOC_COUNT
 // The driver keeps the osi_funcs pointer for as long as WiFi is initialised.
@@ -186,11 +244,16 @@ esp_err_t __real_esp_wifi_init(const wifi_init_config_t* config);
 esp_err_t __wrap_esp_wifi_init(const wifi_init_config_t* config) {
   if (config == NULL || config->magic != WIFI_INIT_CONFIG_MAGIC) return __real_esp_wifi_init(config);
   wifi_init_config_t cfg = *config;
+  const uint32_t target = tailnet_network_boot_target ? tailnet_network_boot_target() : 0;
+  const wifi_tier_t tier = tierForBoot(target);
 #if TAILNET_WIFI_SMALL_BUFFERS
-  cfg.static_rx_buf_num = lower(cfg.static_rx_buf_num, TAILNET_WIFI_STATIC_RX);
-  cfg.dynamic_rx_buf_num = lower(cfg.dynamic_rx_buf_num, TAILNET_WIFI_DYNAMIC_RX);
+  tailnet_log_emit("I tailnet: WiFi tier %s (boot target %lu): static RX %d, dynamic RX %d, dynamic TX %d, "
+                   "RX mgmt %d (0 = framework's)\n",
+                   tier.name, (unsigned long)target, tier.static_rx, tier.dynamic_rx, tier.dynamic_tx, tier.rx_mgmt);
+  cfg.static_rx_buf_num = lower(cfg.static_rx_buf_num, tier.static_rx);
+  cfg.dynamic_rx_buf_num = lower(cfg.dynamic_rx_buf_num, tier.dynamic_rx);
   if (cfg.dynamic_rx_buf_num < cfg.static_rx_buf_num) cfg.dynamic_rx_buf_num = cfg.static_rx_buf_num;
-  if (cfg.tx_buf_type == 1) cfg.dynamic_tx_buf_num = lower(cfg.dynamic_tx_buf_num, TAILNET_WIFI_DYNAMIC_TX);
+  if (cfg.tx_buf_type == 1) cfg.dynamic_tx_buf_num = lower(cfg.dynamic_tx_buf_num, tier.dynamic_tx);
   cfg.ampdu_tx_enable = 0;
   if (cfg.ampdu_rx_enable) {
     int win = 2 * cfg.static_rx_buf_num;
@@ -203,16 +266,14 @@ esp_err_t __wrap_esp_wifi_init(const wifi_init_config_t* config) {
                    config->dynamic_tx_buf_num, cfg.dynamic_tx_buf_num, config->ampdu_tx_enable, config->rx_ba_win,
                    cfg.rx_ba_win);
 #endif
-#if TAILNET_WIFI_RX_MGMT >= 1 && TAILNET_WIFI_RX_MGMT <= 10
-  if (cfg.rx_mgmt_buf_num > TAILNET_WIFI_RX_MGMT) cfg.rx_mgmt_buf_num = TAILNET_WIFI_RX_MGMT;
-#endif
+  if (tier.rx_mgmt >= 1 && tier.rx_mgmt <= 10 && cfg.rx_mgmt_buf_num > tier.rx_mgmt) cfg.rx_mgmt_buf_num = tier.rx_mgmt;
 #if TAILNET_WIFI_NO_NVS
   cfg.nvs_enable = 0;
 #endif
 #if TAILNET_WIFI_ALLOC_COUNT
   cfg.osi_funcs = countingOsi(cfg.osi_funcs);
 #endif
-#if TAILNET_WIFI_RX_MGMT || TAILNET_WIFI_NO_NVS || TAILNET_STACK_LOG
+#if TAILNET_WIFI_RX_MGMT || TAILNET_WIFI_PARKED_RX_MGMT || TAILNET_WIFI_NO_NVS || TAILNET_STACK_LOG
   const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   const esp_err_t err = __real_esp_wifi_init(&cfg);
   tailnet_log_emit("I tailnet: esp_wifi_init: RX mgmt %d->%d, NVS %d->%d; heap %u -> %u\n", config->rx_mgmt_buf_num,

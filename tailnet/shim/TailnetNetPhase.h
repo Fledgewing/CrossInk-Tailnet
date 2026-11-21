@@ -53,6 +53,9 @@ bool tailnet_end_parked_network(void);
 // main.cpp, once the minimal network boot is ready. Arms parking for the boots
 // listed above (target is a NetworkBootTarget value), on the C3 only.
 void tailnet_network_phase_begin(uint32_t target);
+// This boot's network boot target as given to tailnet_network_phase_begin(); 0 in
+// any other boot. TailnetWifiMem.c picks the WiFi buffer tier from it.
+uint32_t tailnet_network_boot_target(void);
 
 // Render task, before an activity renders. False: the framebuffer is parked,
 // skip this render (it is drawn once the framebuffer is back).

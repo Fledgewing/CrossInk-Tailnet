@@ -92,10 +92,18 @@ SWITCHES = {
     "TAILNET_WORKER_STACK":               (4096,   6144,   6144),   # worker stack bytes; 6144: X3 used ~2.6 KB
     # --- WiFi driver init (shim/TailnetWifiMem.c). Buffer counts: 0 = the framework's
     # count; any count set also turns AMPDU TX off and caps the RX BA window.
+    # Small tier: the live catalog (framebuffer kept) and every boot not listed below.
     "TAILNET_WIFI_STATIC_RX":             (2,      0,      0),
     "TAILNET_WIFI_DYNAMIC_RX":            (4,      0,      0),
     "TAILNET_WIFI_DYNAMIC_TX":            (4,      0,      0),
     "TAILNET_WIFI_RX_MGMT":               (3,      0,      0),      # RX mgmt buffers 5 -> 3 (0 = keep)
+    # Parked tier: boots that park the framebuffer or draw nothing while WiFi is up
+    # (syncs 8/9, download 10, Home refresh/shelves 12/13, login/auth 64/65), ~80-118 KB free.
+    # All three counts set = the tier is on; AMPDU TX stays off.
+    "TAILNET_WIFI_PARKED_STATIC_RX":      (3,      0,      0),
+    "TAILNET_WIFI_PARKED_DYNAMIC_RX":     (8,      0,      0),
+    "TAILNET_WIFI_PARKED_DYNAMIC_TX":     (8,      0,      0),
+    "TAILNET_WIFI_PARKED_RX_MGMT":        (5,      0,      0),      # the framework's 5
     "TAILNET_WIFI_NO_NVS":                (1,      1,      1),      # WiFi driver config never in NVS
     "TAILNET_WIFI_ALLOC_COUNT":           (0,      0,      0),      # measurement: WiFi driver heap totals
     # --- Network boots (ui/TailnetNetPhase.cpp)
