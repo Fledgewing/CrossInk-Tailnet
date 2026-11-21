@@ -1,4 +1,4 @@
 [submodule "third_party/microlink"]
 	path = third_party/microlink
-	url = https://github.com/CamM2325/microlink
-	ignore = dirty
+	url = https://github.com/Fledgewing/microlink
+	branch = crossink

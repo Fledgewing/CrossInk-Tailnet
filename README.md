@@ -8,12 +8,11 @@ This is an **overlay**, not a fork. CrossInk's source is used as released; the o
 
 | Piece | Where | What it does |
 |---|---|---|
-| MicroLink | `third_party/microlink` (submodule, pinned tag) | Tailscale-compatible WireGuard client for ESP32 |
+| MicroLink | `third_party/microlink` (submodule: the `crossink` branch of [our fork](https://github.com/Fledgewing/microlink)) | Tailscale-compatible WireGuard client for ESP32, with our changes (closest relay region, per-peer relays) on top |
 | Shim | `tailnet/shim` | Starts MicroLink when WiFi gets an address, stops it when WiFi goes away; answers tailnet names (`bookorbit`, `bookorbit.<tailnet>.ts.net`) for every HTTP client in the firmware |
 | Settings screen | `tailnet/ui` | **Settings > Tailscale**: on/off, status and address, log in (QR code) and log out |
 | Build hook | `tailnet/tailnet_build.py` + `overlay/platformio.local.ini` | Compiles the above into CrossInk's normal PlatformIO build and points the updater at this repo's releases |
 | Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row: the only edit to CrossInk's source |
-| MicroLink patch | `overlay/patches-microlink/0001-relay-regions.patch` | Closest relay region and per-peer relays (below), applied to the pinned MicroLink |
 
 When CrossInk-Bookorbit releases, the daily CI run rebuilds the new tag with the overlay and
 publishes a release here. The only thing that can need hand work is the small settings patch, and
