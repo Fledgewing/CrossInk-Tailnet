@@ -43,6 +43,52 @@ has_psram = env.BoardConfig().get("build.mcu", "") == "esp32s3"  # noqa: F821
 # leaves out, and SP math for P-384 keeps the handshake peak at ~24 KB instead
 # of ~43 KB with fast-math bignums. These apply to the whole wolfSSL library.
 derp_wolfssl = not has_psram
+
+# --- Per-device switches ---------------------------------------------------------
+# One row per switch: its value for each env. `default` is the ESP32-C3 build
+# (X3/X4), `x4-pro` and `x4-classic` the ESP32-S3 readers (8 MB PSRAM). An env
+# not listed takes the column of its chip (C3 -> default, S3 -> x4-pro).
+# Pure improvements are on everywhere; trade-offs (smaller stacks, queues or
+# buffers) only for `default`. Each value is a -D for the whole build (CrossInk,
+# MicroLink, the shim); override one for a build with the environment, e.g.
+# TAILNET_STACK_TCPIP=3072 pio run -e default. The #ifndef defaults in the
+# headers (shim/TailnetSysSwitches.h, ...) apply only without this table.
+SWITCH_ENVS = ("default", "x4-pro", "x4-classic")
+SWITCHES = {
+    #                                 default  x4-pro  x4-classic
+    # System (shim/TailnetSysSwitches.h). Stack sizes are bytes, 0 = the
+    # framework's own size; the proposed C3 size is in each comment, to set
+    # from the X3's stack report (TAILNET_STACK_LOG).
+    "TAILNET_STACK_LOG":            (1,      0,      0),     # measurement: task stack report
+    "TAILNET_TASK_STACK_WRAP":      (1,      0,      0),     # links the size table below
+    "TAILNET_STACK_ESP_TIMER":      (0,      0,      0),     # 4096 -> 4096 proposed (measure)
+    "TAILNET_STACK_TCPIP":          (0,      0,      0),     # 4096 -> 3072 proposed
+    "TAILNET_STACK_ARDUINO_EVENTS": (0,      0,      0),     # 4096 -> 2560 proposed
+    "TAILNET_STACK_SYS_EVT":        (0,      0,      0),     # 2048 -> 2048 proposed (measure)
+    "TAILNET_STACK_WIFI":           (0,      0,      0),     # driver's own size; measure first
+    "TAILNET_STACK_TMR_SVC":        (0,      0,      0),     # 2560 -> 1536 proposed (no SW timers)
+    "TAILNET_LAZY_WORKER":          (1,      1,      1),     # tailnet worker only while needed
+    "TAILNET_WORKER_STACK":         (6144,   6144,   6144),  # worker stack bytes (measure, then shrink on C3)
+    "TAILNET_WIFI_SMALL_BUFFERS":   (1,      0,      0),     # WiFi RX/TX buffer cut (was CONFIG_ML_LITE)
+    "TAILNET_WIFI_RX_MGMT":         (3,      0,      0),     # RX mgmt buffers 5 -> 3 (0 = keep)
+    "TAILNET_WIFI_NO_NVS":          (1,      1,      1),     # WiFi driver config never in NVS
+    "TAILNET_WIFI_ALLOC_COUNT":     (0,      0,      0),     # measurement: WiFi driver heap totals
+    "CROSSINK_TAILNET_WIFI_FAST_JOIN": (1,   1,      1),     # patch 0005: last channel+BSSID first
+}
+
+
+def switch_values():
+    col = pioenv if pioenv in SWITCH_ENVS else ("x4-pro" if has_psram else "default")
+    i = SWITCH_ENVS.index(col)
+    out = []
+    for name, row in SWITCHES.items():
+        out.append((name, int(os.environ.get(name, row[i]))))
+    return out
+
+
+SWITCH_VALUES = dict(switch_values())
+env.Append(CPPDEFINES=list(SWITCH_VALUES.items()))  # noqa: F821
+print("Tailnet switches for " + pioenv + ": " + ", ".join(f"{k}={v}" for k, v in SWITCH_VALUES.items()))
 if derp_wolfssl:
     env.Append(CPPDEFINES=["WOLFSSL_SHA384", "WOLFSSL_SHA512", "WOLFSSL_SP_384"])  # noqa: F821
 
@@ -157,10 +203,16 @@ def _process_project_deps_with_tailnet(env):
                           # prebuilt ERROR-only log level
                           "-Wl,--wrap=esp_log",
                           # TailnetTlsMem.c: mbedTLS buffers in PSRAM
-                          "-Wl,--wrap=esp_mbedtls_mem_calloc"])
-    if not has_psram:
-        # TailnetWifiMem.c: fewer WiFi driver buffers (C3 only, CONFIG_ML_LITE)
-        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_init"])
+                          "-Wl,--wrap=esp_mbedtls_mem_calloc",
+                          # TailnetWifiMem.c: the WiFi init switches
+                          "-Wl,--wrap=esp_wifi_init"])
+    if SWITCH_VALUES["TAILNET_TASK_STACK_WRAP"]:
+        # TailnetStacks.c: task stack sizes by name, and the timer task's
+        env.Append(LINKFLAGS=["-Wl,--wrap=xTaskCreatePinnedToCore",
+                              "-Wl,--wrap=vApplicationGetTimerTaskMemory"])
+    if SWITCH_VALUES["TAILNET_STACK_LOG"]:
+        # TailnetStacks.c: the stack report before WiFi goes off
+        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_stop"])
 
 
 env.AddMethod(_process_project_deps_with_tailnet, "ProcessProjectDeps")  # noqa: F821

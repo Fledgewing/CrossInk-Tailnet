@@ -25,6 +25,7 @@
 #include "activities/ActivityManager.h"
 #include "activities/RenderLock.h"
 #include "Tailnet.h"
+#include "TailnetSysSwitches.h"
 #include "network/SavedWifiConnect.h"
 
 extern GfxRenderer renderer;  // main.cpp
@@ -173,6 +174,8 @@ extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
 }
 
 extern "C" void tailnet_wifi_joined(void) {
+  tailnet_stack_report("WiFi joined");  // TailnetStacks.c (TAILNET_STACK_LOG)
   // Returns at once unless this boot runs Tailscale (tailnet_permit_start()).
   tailnet_wait_ready(20000);
+  if (tailnet_status() == TAILNET_CONNECTED) tailnet_stack_report("Tailscale ready");
 }
