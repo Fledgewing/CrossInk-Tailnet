@@ -91,7 +91,7 @@ bool s_relay_matched = false;  // worker only: one match-server restart per WiFi
 // the framebuffer's memory (TailnetNetPhase.h): tailnet_permit_start().
 std::atomic<bool> s_permit{false};
 std::atomic<bool> s_register_only{false};  // the login boot: register, nothing more
-bool s_low_memory = false;                 // worker only: stopped for memory this WiFi session
+std::atomic<bool> s_low_memory{false};     // stopped for memory this WiFi session (written by the worker)
 // Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
 // stop working well before 0, and a session would only spin retries.
 constexpr size_t LOW_MEMORY_BYTES = 8 * 1024;
@@ -351,7 +351,7 @@ void startMl() {
 
 void reconcile() {
 #if CONFIG_ML_LITE
-  const bool want = s_wifi_up && loadEnabled() && s_permit.load() && !s_low_memory;
+  const bool want = s_wifi_up && loadEnabled() && s_permit.load() && !s_low_memory.load();
 #else
   const bool want = s_wifi_up && loadEnabled();
 #endif
@@ -533,6 +533,15 @@ extern "C" bool tailnet_wait_connected(uint32_t timeout_ms) {
   for (;;) {
     const tailnet_status_t st = tailnet_status();
     if (st == TAILNET_CONNECTED) return true;
+#if CONFIG_ML_LITE
+    // A network boot's first request can come right after GOT_IP, before the
+    // worker has parked the framebuffer and started MicroLink: give it a moment.
+    if (st == TAILNET_OFF && s_permit.load() && !s_low_memory.load() && loadEnabled() &&
+        (xTaskGetTickCount() - start) < pdMS_TO_TICKS(3000) && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(timeout_ms)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+#endif
     // Only a start in progress is worth waiting for; off, failed or waiting
     // for a login will not change within a request's timeout.
     if (st != TAILNET_STARTING && st != TAILNET_RECONNECTING) return false;

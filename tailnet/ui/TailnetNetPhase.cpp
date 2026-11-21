@@ -32,11 +32,14 @@ extern GfxRenderer renderer;  // main.cpp
 namespace {
 
 // NetworkBootTarget values (SilentRestart.h) whose screens need no answer while
-// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_HOME_REFRESH, and
-// the overlay's own login boot. (A sync that asks which position to keep is
-// covered by the tick's fallback.) Only these boots run Tailscale on the C3.
+// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_HOME_REFRESH,
+// BOOKORBIT_HOME_SHELVES (it fetches, turns WiFi off, then shows the pickers),
+// and the overlay's own login and BookOrbit authentication boots. (A sync that
+// asks which position to keep is covered by the tick's fallback.) Only these
+// boots run Tailscale on the C3.
 bool parksFor(uint32_t target) {
-  return target == 8 || target == 9 || target == 12 || target == TAILNET_LOGIN_TARGET;
+  return target == 8 || target == 9 || target == 12 || target == 13 || target == TAILNET_LOGIN_TARGET ||
+         target == TAILNET_BOOKORBIT_AUTH_TARGET;
 }
 
 std::atomic<bool> s_armed{false};
