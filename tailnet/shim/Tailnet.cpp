@@ -29,6 +29,7 @@ void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, 
 void tailnet_ml_set_forced_region(microlink_t* ml, uint16_t region);
 void tailnet_ml_request_handshake(microlink_t* ml, uint32_t vpn_ip);
 bool tailnet_ml_tunnel_up(microlink_t* ml, uint32_t vpn_ip);
+void tailnet_ml_path(const microlink_t* ml, uint32_t vpn_ip, char* out, size_t len);
 uint16_t tailnet_ml_home_region(const microlink_t* ml);
 uint16_t tailnet_ml_peer_region(const microlink_t* ml, uint32_t vpn_ip);
 int tailnet_ml_regions(const microlink_t* ml, uint16_t* ids, char (*codes)[8], int max);
@@ -387,6 +388,11 @@ void prepareMl(bool control_fallback) {
   // to in the peer cache. A control session as fallback may start by itself
   // only with the framebuffer parked: with it kept (catalog) there is no room.
   microlink_cached_start_peer(s_ml, serverIp(), control_fallback);
+  // ML_LITE_NO_DIRECT 2 (the X3): a parked boot (download, sync, login, Home's
+  // refresh) has the room for the direct path's UDP socket, net_io task and
+  // DISCO; with the framebuffer kept (the live catalog) it stays DERP only.
+  // Where no direct path forms, traffic stays on DERP.
+  microlink_set_direct_path(s_ml, control_fallback);
 #else
   (void)control_fallback;
 #endif
@@ -959,6 +965,15 @@ extern "C" void tailnet_permit_start(bool register_only) {
 #else
   (void)register_only;
 #endif
+}
+
+// Which path carries traffic to the server now, with its round trip: one log
+// line for a transfer's summary (e.g. "direct 192.168.1.20:41641, rtt 4 ms").
+extern "C" void tailnet_log_path(const char* what) {
+  char path[64];
+  if (!s_ml) return;
+  tailnet_ml_path(s_ml, serverIp(), path, sizeof(path));
+  TLOGI("%s: path %s", what ? what : "transfer", path);
 }
 
 extern "C" void tailnet_probe_permit_unparked(void) {

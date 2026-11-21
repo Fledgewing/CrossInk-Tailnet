@@ -57,7 +57,7 @@ SWITCHES = {
     "CONFIG_ML_LITE":                     (1,      None,   None),
     "ML_LITE_TASKS":                      (1,      0,      0),      # DERP + WireGuard in one task
     "ML_LITE_CONTEXT":                    (1,      0,      0),      # small microlink_t, few peers
-    "ML_LITE_NO_DIRECT":                  (1,      0,      0),      # DERP only, no STUN/UDP
+    "ML_LITE_NO_DIRECT":                  (2,      0,      0),      # 2: DERP only with the framebuffer kept; parked boots may go direct
     "ML_LITE_SMALL_FILTER":               (1,      0,      0),
     "ML_LITE_DERP_WOLFSSL":               (1,      0,      0),      # DERP TLS on wolfSSL
     "ML_LITE_CONTROL_PLAIN":              (1,      0,      0),      # control on port 80, 443 fallback
@@ -72,6 +72,8 @@ SWITCHES = {
     "ML_LITE_RX_ONEBUF":                  (1,      0,      0),      # relayed packets: one buffer, decrypted in place
     "ML_LITE_SMALL_QUEUES":               (1,      0,      0),      # wg_rx 4, derp_tx 4, disco 1, peer_update 4
     "ML_LITE_NACL_CACHE_SLOTS":           (2,      0,      0),      # DISCO shared keys (0 = 24)
+    "ML_WG_REKEY_AFTER_S":                (0,      0,      0),      # test: WireGuard rekey after N s (0 = 120)
+    "ML_DERP_RATE_LOG":                   (1,      1,      1),      # measurement: relay rate/drops/busy every 10 s
     "ML_LITE_MAX_PEERS":                  (1,      None,   None),   # peer table with ML_LITE_CONTEXT
     "ML_TASK_TUNNEL_STACK":               (5120,   None,   None),   # ~3.2 KB used after DERP TLS (X3 log)
     "CONFIG_ML_MAX_PEERS":                (8,      None,   None),
