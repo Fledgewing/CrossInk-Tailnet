@@ -115,6 +115,15 @@ bool tailnet_wait_ready(uint32_t timeout_ms);
 // Before turning WiFi off: waits (up to timeout_ms) for a running control
 // session to finish.
 void tailnet_wait_idle(uint32_t timeout_ms);
+// Catalog probe (c3-catalog-probe): start Tailscale in this boot without
+// parking the framebuffer; one log line of heap numbers for a named step.
+void tailnet_probe_permit_unparked(void);
+void tailnet_probe_heap(const char* step);
+// A request's heap window: begin (free and largest before), mark at a phase
+// boundary (the lowest point since the last call), end (the last phase).
+void tailnet_probe_window_begin(const char* what);
+void tailnet_probe_window_mark(const char* what, const char* phase);
+void tailnet_probe_window_end(const char* what, const char* phase);
 
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.

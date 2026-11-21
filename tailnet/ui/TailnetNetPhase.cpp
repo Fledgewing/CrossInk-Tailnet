@@ -66,6 +66,12 @@ bool unparkLocked() {
 }  // namespace
 
 extern "C" void tailnet_network_phase_begin(uint32_t target) {
+#if TAILNET_PROBE_CATALOG_LIVE
+  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG, screen kept
+    tailnet_probe_permit_unparked();
+    return;
+  }
+#endif
   // The S3 readers keep the framebuffer in PSRAM and run Tailscale anywhere.
   if (!tailnet_lite() || !parksFor(target)) return;
   s_armed = true;
@@ -147,6 +153,6 @@ extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
 }
 
 extern "C" void tailnet_wifi_joined(void) {
-  if (!s_armed.load()) return;  // only the parked boots run Tailscale on the C3
+  // Returns at once unless this boot runs Tailscale (tailnet_permit_start()).
   tailnet_wait_ready(20000);
 }

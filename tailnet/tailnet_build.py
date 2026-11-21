@@ -67,6 +67,29 @@ WG_CRYPTO = ["blake2s.c", "chacha20.c", "chacha20poly1305.c", "poly1305-donna.c"
 _orig_process_project_deps = env.ProcessProjectDeps  # noqa: F821
 
 
+# --- Catalog probe (branch c3-catalog-probe only, C3 only) ----------------------
+# Each cut has its own switch: set the environment variable to 0 to turn it
+# off, e.g. TAILNET_PROBE_TUNNEL_STACK=0 pio run -e default.
+def _probe_switch(name, default="1"):
+    return os.environ.get(name, default) != "0"
+
+
+PROBE_DEFINES = []
+if not has_psram:
+    if _probe_switch("TAILNET_PROBE_CATALOG_LIVE"):  # Tailscale in the catalog boot, screen kept
+        PROBE_DEFINES.append(("TAILNET_PROBE_CATALOG_LIVE", 1))
+    if _probe_switch("TAILNET_PROBE_TUNNEL_STACK"):  # a. tunnel task stack 8192 -> 5120
+        PROBE_DEFINES.append(("ML_TASK_TUNNEL_STACK", 5120))
+    if _probe_switch("TAILNET_PROBE_DERP_TRIM"):  # b. DERP region table: home + peers' regions only
+        PROBE_DEFINES.append(("ML_LITE_DERP_TRIM", 1))
+    if _probe_switch("TAILNET_PROBE_WIFI_SMALL"):  # c. WiFi static RX 2, dynamic RX 4, dynamic TX 4
+        PROBE_DEFINES += [("TAILNET_WIFI_STATIC_RX", 2), ("TAILNET_WIFI_DYNAMIC_RX", 4), ("TAILNET_WIFI_DYNAMIC_TX", 4)]
+    if _probe_switch("TAILNET_PROBE_ONE_PEER"):  # d. peer table 2 -> 1
+        PROBE_DEFINES.append(("ML_LITE_MAX_PEERS", 1))
+    print("Tailnet catalog probe switches: " + ", ".join(f"{k}={v}" for k, v in PROBE_DEFINES))
+env.Append(CPPDEFINES=[d for d in PROBE_DEFINES if d[0] == "TAILNET_PROBE_CATALOG_LIVE"])  # noqa: F821  CrossInk + ui
+
+
 def _process_project_deps_with_tailnet(env):
     _orig_process_project_deps()
     ml_env = env.Clone()
@@ -88,6 +111,7 @@ def _process_project_deps_with_tailnet(env):
                                   # The fork's small-memory client mode (Fledgewing/microlink,
                                   # crossink branch): the X3 has ~58 KB free once WiFi is up.
                                   ("CONFIG_ML_LITE", 1)])
+        ml_env.Append(CPPDEFINES=PROBE_DEFINES)
 
     if derp_wolfssl:
         # ml_derp.c includes wolfSSL; the defines (WOLFSSL_USER_SETTINGS, ...)

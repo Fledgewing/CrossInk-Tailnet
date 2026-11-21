@@ -92,6 +92,7 @@ bool s_relay_matched = false;  // worker only: one match-server restart per WiFi
 // the framebuffer's memory (TailnetNetPhase.h): tailnet_permit_start().
 std::atomic<bool> s_permit{false};
 std::atomic<bool> s_register_only{false};  // the login boot: register, nothing more
+std::atomic<bool> s_unparked{false};       // catalog probe: run with the framebuffer kept
 std::atomic<bool> s_low_memory{false};     // stopped for memory this WiFi session (written by the worker)
 // Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
 // stop working well before 0, and a session would only spin retries.
@@ -314,7 +315,9 @@ void startMl() {
 #if CONFIG_ML_LITE
   // TailnetNetPhase.h: hand the display's framebuffer to the heap first. The
   // C3 cannot hold both, so no framebuffer parked, no MicroLink.
-  if (!tailnet_display_park || !tailnet_display_park()) {
+  if (s_unparked.load()) {
+    TLOGI("Catalog probe: starting with the framebuffer kept");
+  } else if (!tailnet_display_park || !tailnet_display_park()) {
     TLOGW("Not starting: the display framebuffer could not be parked");
     return;
   }
@@ -758,6 +761,52 @@ extern "C" void tailnet_permit_start(bool register_only) {
 #else
   (void)register_only;
 #endif
+}
+
+extern "C" void tailnet_probe_permit_unparked(void) {
+#if CONFIG_ML_LITE
+  s_unparked = true;
+  tailnet_permit_start(false);
+#endif
+}
+
+extern "C" void tailnet_probe_heap(const char* step) {
+  TLOGI("probe %s: heap free %u, largest %u, lowest so far %u (internal free %u)", step,
+                   (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                   (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+// A request's heap window: the lowest point of each phase, via ESP-IDF's
+// local minimum monitor (restarted at every phase boundary).
+static bool s_probe_window = false;
+
+static size_t probeLocalLow() { return heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT); }
+
+static void probeRestartMonitor() {
+  if (s_probe_window) heap_caps_monitor_local_minimum_free_size_stop();
+  s_probe_window = heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
+}
+
+extern "C" void tailnet_probe_window_begin(const char* what) {
+  TLOGI("probe %s: before: heap free %u, largest %u", what, (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  probeRestartMonitor();
+}
+
+extern "C" void tailnet_probe_window_mark(const char* what, const char* phase) {
+  const size_t free_now = esp_get_free_heap_size();
+  TLOGI("probe %s: %s: lowest %u (drop %d from free now %u), largest now %u", what, phase, (unsigned)probeLocalLow(),
+        (int)free_now - (int)probeLocalLow(), (unsigned)free_now,
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  probeRestartMonitor();
+}
+
+extern "C" void tailnet_probe_window_end(const char* what, const char* phase) {
+  tailnet_probe_window_mark(what, phase);
+  if (s_probe_window) heap_caps_monitor_local_minimum_free_size_stop();
+  s_probe_window = false;
+  TLOGI("probe %s: done; lowest since boot %u", what, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
 }
 
 extern "C" tailnet_status_t tailnet_login_session(uint32_t timeout_ms) {
