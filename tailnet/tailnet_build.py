@@ -115,6 +115,9 @@ def _process_project_deps_with_tailnet(env):
                           "-Wl,--wrap=esp_log",
                           # TailnetTlsMem.c: mbedTLS buffers in PSRAM
                           "-Wl,--wrap=esp_mbedtls_mem_calloc"])
+    if not has_psram:
+        # TailnetWifiMem.c: fewer WiFi driver buffers (C3 only, CONFIG_ML_LITE)
+        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_init"])
 
 
 env.AddMethod(_process_project_deps_with_tailnet, "ProcessProjectDeps")  # noqa: F821
