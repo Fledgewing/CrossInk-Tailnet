@@ -1,0 +1,119 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index f333c4d8..ee0bb49c 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -91,6 +91,15 @@
+ #define CROSSINK_TAILNET_PACKED_ROWS 0
+ #endif
+ 
++// A screen that waits for input in a boot that parked the framebuffer for Tailscale (the
++// BookOrbit sync's "which position to keep?"): the overlay first takes the framebuffer back
++// with WiFi and Tailscale kept up, so the choice runs over the kept connection. Only when it
++// does not fit is WiFi turned off; an upload chosen then restarts the BookOrbit sync with the
++// choice pre-answered (BOOKORBIT_SYNC_PAYLOAD_UPLOAD_LOCAL) instead of failing offline.
++#ifndef CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK
++#define CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/SilentRestart.h b/src/SilentRestart.h
+index e1e6ce32..9f95ecc0 100644
+--- a/src/SilentRestart.h
++++ b/src/SilentRestart.h
+@@ -46,6 +46,9 @@ constexpr uint32_t BOOKORBIT_SYNC_PAYLOAD_HAS_PARAGRAPH = 1u << 16;
+ // (Mirrors the KOReader sync orientation payload.)
+ constexpr uint32_t BOOKORBIT_SYNC_PAYLOAD_ORIENTATION_SHIFT = 17u;
+ constexpr uint32_t BOOKORBIT_SYNC_PAYLOAD_ORIENTATION_MASK = 0x7u << BOOKORBIT_SYNC_PAYLOAD_ORIENTATION_SHIFT;
++// Bit 20 (CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK): the user already chose "upload this device's
++// position" in a sync whose network was turned off for the prompt; this sync uploads it.
++constexpr uint32_t BOOKORBIT_SYNC_PAYLOAD_UPLOAD_LOCAL = 1u << 20;
+ // BOOKORBIT_SLEEP_SYNC payload: Power was still held when the device went to sleep (a
+ // long-press sleep), so that press belongs to the sleep gesture and must be released
+ // before a press can wake the device out of the sync.
+diff --git a/src/activities/reader/BookOrbitSyncActivity.cpp b/src/activities/reader/BookOrbitSyncActivity.cpp
+index 233202a0..594bb340 100644
+--- a/src/activities/reader/BookOrbitSyncActivity.cpp
++++ b/src/activities/reader/BookOrbitSyncActivity.cpp
+@@ -9,6 +9,7 @@
+ #include <HalClock.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
++#include <CrossInkTailnetCuts.h>
+ #include <Logging.h>
+ #include <Memory.h>
+ #include <WallClock.h>
+@@ -573,6 +574,14 @@ void BookOrbitSyncActivity::performSync() {
+     if (stopIfWoken()) return;
+   }
+ 
++  if (preAnsweredUpload && (result == BookOrbitSyncClient::OK || result == BookOrbitSyncClient::NOT_FOUND)) {
++    // Asked and answered in the boot before (its network was off for the prompt).
++    LOG_INF("BookOrbit", "Prompt answered before the restart: uploading this device's position");
++    preAnsweredUpload = false;
++    performUpload();
++    return;
++  }
++
+   if (result == BookOrbitSyncClient::NOT_FOUND) {
+     if (smartSyncEnabled() || sleepSync) {
+       LOG_DBG("BookOrbit", "Smart sync: no remote progress, uploading local %.6f", localProgress.percentage);
+@@ -1836,6 +1845,23 @@ size_t BookOrbitSyncActivity::uploadQueuedStats() {
+ }
+ 
+ void BookOrbitSyncActivity::performUpload() {
++#if CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK
++  // The overlay turned WiFi off to show the prompt (the framebuffer did not fit beside
++  // Tailscale): the upload cannot run in this boot. Restart into the sync with the choice.
++  if (!sleepSync && tailnet_prompt_dropped_network()) {
++    const uint32_t orientationPayload =
++        readerOrientation < CrossPointSettings::ORIENTATION_COUNT
++            ? (static_cast<uint32_t>(readerOrientation) + 1) << BOOKORBIT_SYNC_PAYLOAD_ORIENTATION_SHIFT
++            : 0;
++    const uint32_t paragraphPayload =
++        currentParagraphIndex ? (BOOKORBIT_SYNC_PAYLOAD_HAS_PARAGRAPH | *currentParagraphIndex) : 0;
++    const uint32_t payload = BOOKORBIT_SYNC_PAYLOAD_UPLOAD_LOCAL | orientationPayload | paragraphPayload;
++    LOG_INF("BookOrbit", "Prompt: restarting with the choice saved (upload this device's position)");
++    syncSession.reset();
++    silentRestartToNetwork(NetworkBootTarget::BOOKORBIT_SYNC, payload);
++    return;  // only reached when a deep sleep in progress suppressed the restart
++  }
++#endif
+   {
+     RenderLock lock(*this);
+     state = UPLOADING;
+diff --git a/src/activities/reader/BookOrbitSyncActivity.h b/src/activities/reader/BookOrbitSyncActivity.h
+index 03be4a28..2dc08f55 100644
+--- a/src/activities/reader/BookOrbitSyncActivity.h
++++ b/src/activities/reader/BookOrbitSyncActivity.h
+@@ -49,6 +49,9 @@ class BookOrbitSyncActivity final : public Activity {
+         remotePosition{},
+         localProgress(std::move(localKoPos)) {}
+ 
++  // The restart payload carried BOOKORBIT_SYNC_PAYLOAD_UPLOAD_LOCAL: upload without asking.
++  void preAnswerUpload() { preAnsweredUpload = true; }
++
+   void onEnter() override;
+   void onExit() override;
+   void loop() override;
+@@ -100,6 +103,7 @@ class BookOrbitSyncActivity final : public Activity {
+   bool stopIfWoken();
+ 
+   State state = WIFI_SELECTION;
++  bool preAnsweredUpload = false;  // preAnswerUpload()
+   std::string statusMessage;
+   std::string documentHash;
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index f489265d..63e7534f 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -666,6 +666,7 @@ bool startGlobalBookOrbitSync(const bool networkBootReady, const uint32_t payloa
+   auto syncActivity = makeUniqueNoThrow<BookOrbitSyncActivity>(
+       renderer, mappedInputManager, epubPath, spineIndex, pageNumber, totalPagesInSpine, std::move(localKoPos),
+       std::move(localChapterName), paragraphIndex, networkBootReady, readerOrientation, sleepSync);
++  if (syncActivity && (payload & BOOKORBIT_SYNC_PAYLOAD_UPLOAD_LOCAL) != 0) syncActivity->preAnswerUpload();
+   if (!syncActivity) {
+     LOG_ERR("MAIN", "OOM: BookOrbit sync activity (free=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+     return false;

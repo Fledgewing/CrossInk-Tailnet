@@ -160,6 +160,10 @@ SWITCHES = {
     # restarts into the catalog at the listing it came from instead of ending on Home.
     # Inert on the S3 readers: nothing parks there, they download in place and stay in the catalog.
     "CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG": (1, 1,     1),
+    # Patch 0011: a screen waiting for input in a parked boot (the sync's position prompt) gets the
+    # framebuffer back with WiFi and Tailscale kept when the heap has the block; else WiFi goes off and
+    # an upload chosen restarts the sync pre-answered. The X4s never park (no-op there).
+    "CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK": (1,   0,      0),
 }
 # Switches that stand for wolfSSL defines rather than a define of their own.
 WOLFSSL_SWITCH_DEFINES = {

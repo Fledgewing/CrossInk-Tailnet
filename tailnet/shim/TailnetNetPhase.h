@@ -56,6 +56,10 @@ void tailnet_network_phase_begin(uint32_t target);
 // This boot's network boot target as given to tailnet_network_phase_begin(); 0 in
 // any other boot. TailnetWifiMem.c picks the WiFi buffer tier from it.
 uint32_t tailnet_network_boot_target(void);
+// True once a screen that waited for input made this boot turn WiFi off to get the
+// framebuffer back (CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK found no room for it beside
+// Tailscale): a choice that needs the network must restart instead of failing offline.
+bool tailnet_prompt_dropped_network(void);
 
 // Render task, before an activity renders. False: the framebuffer is parked,
 // skip this render (it is drawn once the framebuffer is back).

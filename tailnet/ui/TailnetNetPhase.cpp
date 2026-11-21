@@ -63,6 +63,7 @@ std::atomic<bool> s_pending{false};   // a render was skipped
 uint32_t s_last_tick = 0;             // main task only
 uint32_t s_idle_since = 0;
 bool s_escalated = false;
+std::atomic<bool> s_prompt_dropped{false};  // tailnet_prompt_dropped_network()
 // TAILNET_PARK_DURING_CONNECT: the live catalog boot may park while a control
 // session runs (tailnet_wifi_joined(), catalogConnect()).
 std::atomic<bool> s_connect_park{false};
@@ -191,6 +192,8 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
 
 extern "C" uint32_t tailnet_network_boot_target(void) { return s_target; }
 
+extern "C" bool tailnet_prompt_dropped_network(void) { return s_prompt_dropped.load(); }
+
 extern "C" bool tailnet_boot_parks(void) { return s_armed.load() && tailnet_enabled() && tailnet_joined(); }
 
 extern "C" bool tailnet_end_parked_network(void) {
@@ -265,6 +268,24 @@ extern "C" void tailnet_display_tick(void) {
   }
   if (!s_escalated && now - s_idle_since >= 2000) {
     s_escalated = true;
+#if CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK
+    // Take the framebuffer back beside Tailscale when the heap has the block (a sync's
+    // cached start leaves ~77 KB): the prompt's choice then runs over the kept connection.
+    const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    bool back;
+    {
+      RenderLock lock;
+      back = unparkLocked();
+    }
+    if (back) {
+      LOG_INF("TNET", "Prompt with the network kept (largest %u)", static_cast<unsigned>(largest));
+      if (s_pending.exchange(false)) activityManager.requestUpdate(true);
+      return;
+    }
+    s_prompt_dropped = true;
+    LOG_ERR("TNET", "Prompt: the framebuffer does not fit beside Tailscale (largest %u); turning WiFi off",
+            static_cast<unsigned>(largest));
+#endif
     LOG_ERR("TNET", "A screen waits for input while Tailscale holds the framebuffer's memory; turning WiFi off");
     SavedWifiConnect::disconnect();
   }
