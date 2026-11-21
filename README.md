@@ -12,10 +12,11 @@ This is an **overlay**, not a fork. CrossInk's source is used as released; the o
 | Shim | `tailnet/shim` | Starts MicroLink when WiFi gets an address, stops it when WiFi goes away; answers tailnet names (`bookorbit`, `bookorbit.<tailnet>.ts.net`) for every HTTP client in the firmware |
 | Settings screen | `tailnet/ui` | **Settings > Tailscale**: on/off, status and address, log in (QR code) and log out |
 | Build hook | `tailnet/tailnet_build.py` + `overlay/platformio.local.ini` | Compiles the above into CrossInk's normal PlatformIO build and points the updater at this repo's releases |
-| Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row: the only edit to CrossInk's source |
+| Settings hook | `overlay/patches/0001-tailscale-settings-entry.patch` | Seven lines adding the Settings row |
+| Framebuffer hook | `overlay/patches/0002-park-framebuffer-for-tailscale.patch` | X3/X4 only: frees the display framebuffer while Tailscale runs in a sync's network boot (`tailnet/shim/TailnetNetPhase.h`) |
 
 When CrossInk-Bookorbit releases, the daily CI run rebuilds the new tag with the overlay and
-publishes a release here. The only thing that can need hand work is the small settings patch, and
+publishes a release here. The only thing that can need hand work is the two small patches, and
 CI says so if it stops applying.
 
 ## Readers

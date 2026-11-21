@@ -17,6 +17,7 @@
 #include <atomic>
 
 extern "C" {
+#include "TailnetNetPhase.h"
 #include "microlink.h"
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
 void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, char* peer, size_t len);
@@ -273,6 +274,10 @@ void storePin(uint32_t ip) {
 
 void startMl() {
   if (s_running) return;
+#if CONFIG_ML_LITE
+  // TailnetNetPhase.h: hand the display's framebuffer to the heap first.
+  if (tailnet_display_park) tailnet_display_park();
+#endif
   if (!s_ml) {
     microlink_config_t cfg = {};
     cfg.auth_key = nullptr;     // interactive login; nothing secret in the image
@@ -304,6 +309,17 @@ void reconcile() {
   const bool want = s_wifi_up && loadEnabled();
   if (want && !s_running) startMl();
   if (!want && s_running) stopMl();
+#if CONFIG_ML_LITE
+  if (!s_wifi_up) {
+    // Free the context too (microlink_init again on the next start), so the
+    // display can get its framebuffer back in one block.
+    if (s_ml && !s_running) {
+      microlink_destroy(s_ml);
+      s_ml = nullptr;
+    }
+    if (tailnet_display_unpark) tailnet_display_unpark();
+  }
+#endif
 }
 
 void workerTask(void*) {

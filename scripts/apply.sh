@@ -5,7 +5,8 @@
 #   platformio.local.ini  (copied from overlay/)
 #   tailnet               (symlink to this repo's tailnet/, excluded via .git/info/exclude)
 #   src/tailnet           (symlink to tailnet/ui, built with CrossInk's own sources)
-# and applies overlay/patches/*.patch (the Settings row). MicroLink's changes
+# and applies overlay/patches/*.patch (the Settings row; on the C3, the
+# framebuffer freed while Tailscale runs: TailnetNetPhase.h). MicroLink's changes
 # live on the crossink branch of the Fledgewing/microlink fork (the submodule).
 # A patch that no longer applies stops here with an error: that is the one
 # place an upstream update can need overlay work.
