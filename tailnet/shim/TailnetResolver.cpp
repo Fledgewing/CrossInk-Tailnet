@@ -65,7 +65,9 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
     uint32_t ip = tailnet_resolve(nodename);
     if (!ip && mayBeTailnetName(nodename)) {
       tailnet_start_on_demand(nodename);  // lite builds: a boot that starts Tailscale only when needed
-      if (tailnet_wait_connected(WAIT_MS)) ip = tailnet_resolve(nodename);
+      char what[64];
+      snprintf(what, sizeof(what), "resolve %.48s", nodename);
+      if (tailnet_wait_connected_for(what, WAIT_MS)) ip = tailnet_resolve(nodename);
     }
     if (ip) {
       char lit[16];
