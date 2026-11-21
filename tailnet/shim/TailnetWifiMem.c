@@ -69,6 +69,7 @@ void tailnet_log_emit(const char* format, ...);  // TailnetLog.cpp
 // TailnetNetPhase.cpp (CrossInk side). Weak: the framework's lib-builder pass links the
 // shim without CrossInk's sources, where every boot takes the small tier.
 __attribute__((weak)) uint32_t tailnet_network_boot_target(void);
+__attribute__((weak)) bool tailnet_wifi_parked_boot(uint32_t target);
 
 // Buffer counts, per env from the switch table in tailnet_build.py (the X3:
 // 2/4/4); 0 keeps the framework's count. ESP-IDF's floors: static RX >= 2,
@@ -116,23 +117,18 @@ typedef struct {
 } wifi_tier_t;
 
 // The tier for this boot, from its network boot target (TailnetNetPhase.cpp records it
-// before WiFi starts; the RTC token itself is cleared by then). Parked boots: BookOrbit
-// sync 8, sleep sync 9, download 10, Home refresh 12, Home shelves 13, login 64 and
-// BookOrbit authentication 65. Everything else, the live catalog (11) first, keeps the
-// small counts: its framebuffer stays allocated.
+// before WiFi starts; the RTC token itself is cleared by then). Parked boots
+// (tailnet_wifi_parked_boot()): BookOrbit sync, sleep sync, download, Home refresh, Home
+// shelves, login and BookOrbit authentication. Everything else, the live catalog first,
+// keeps the small counts: its framebuffer stays allocated.
 static wifi_tier_t tierForBoot(uint32_t target) {
   wifi_tier_t tier = {"small", TAILNET_WIFI_STATIC_RX, TAILNET_WIFI_DYNAMIC_RX, TAILNET_WIFI_DYNAMIC_TX,
                       TAILNET_WIFI_RX_MGMT};
 #if TAILNET_WIFI_PARKED_TIER
-  switch (target) {
-    case 8: case 9: case 10: case 12: case 13: case 64: case 65: {
-      const wifi_tier_t parked = {"parked", TAILNET_WIFI_PARKED_STATIC_RX, TAILNET_WIFI_PARKED_DYNAMIC_RX,
-                                  TAILNET_WIFI_PARKED_DYNAMIC_TX, TAILNET_WIFI_PARKED_RX_MGMT};
-      tier = parked;
-      break;
-    }
-    default:
-      break;
+  if (target && tailnet_wifi_parked_boot && tailnet_wifi_parked_boot(target)) {
+    const wifi_tier_t parked = {"parked", TAILNET_WIFI_PARKED_STATIC_RX, TAILNET_WIFI_PARKED_DYNAMIC_RX,
+                                TAILNET_WIFI_PARKED_DYNAMIC_TX, TAILNET_WIFI_PARKED_RX_MGMT};
+    tier = parked;
   }
 #else
   (void)target;

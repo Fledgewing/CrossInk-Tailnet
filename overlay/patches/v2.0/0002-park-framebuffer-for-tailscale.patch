@@ -1,0 +1,234 @@
+diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
+index 2851cc0b..41a31e46 100644
+--- a/lib/hal/HalDisplay.h
++++ b/lib/hal/HalDisplay.h
+@@ -91,6 +91,9 @@ class HalDisplay {
+ 
+   // Access to frame buffer
+   uint8_t* getFrameBuffer() const;
++  // Tailnet overlay (TailnetNetPhase.h): free it while Tailscale runs, then get it back.
++  void releaseFrameBuffer() { einkDisplay.releaseBuffers(); }
++  bool reallocFrameBuffer() { return einkDisplay.reallocBuffers(); }
+ 
+   // Lend the framebuffer's ~48 KB STORAGE to a memory-hungry phase (chapter
+   // builds) without freeing it: the allocation never moves, so repeated loans
+diff --git a/src/SilentRestart.h b/src/SilentRestart.h
+index 02f6f783..37ce218d 100644
+--- a/src/SilentRestart.h
++++ b/src/SilentRestart.h
+@@ -3,6 +3,8 @@
+ #include <cstdint>
+ #include <string>
+ 
++#include "TailnetNetPhase.h"
++
+ // ESP.restart() with an RTC_NOINIT flag that survives the reboot, so setup()
+ // skips the boot splash and routes straight to a destination. Used to clear
+ // heap fragmentation accumulated during a wifi session.
+@@ -77,6 +79,8 @@ constexpr bool isNetworkBootTargetValue(const uint32_t value) {
+     case NetworkBootTarget::BOOKORBIT_CATALOG:
+     case NetworkBootTarget::BOOKORBIT_HOME_REFRESH:
+     case NetworkBootTarget::BOOKORBIT_HOME_SHELVES:
++    case static_cast<NetworkBootTarget>(TAILNET_LOGIN_TARGET):
++    case static_cast<NetworkBootTarget>(TAILNET_BOOKORBIT_AUTH_TARGET):
+       return true;
+   }
+   return false;
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 846717aa..3c4a5ad4 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -61,6 +61,7 @@
+ #include "util/FullScreenMessageActivity.h"
+ #include "util/SwipeAdjustment.h"
+ #include "util/TwoFingerSwipe.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace {
+ constexpr uint32_t FILE_TRANSFER_MODE_MASK = 0xFF;
+@@ -504,7 +505,7 @@ void ActivityManager::renderTaskLoop() {
+     entryRenderRequested = false;
+     TouchRegistry::getInstance().setEnabled(mappedInput.hasTouch());
+     TouchRegistry::getInstance().beginFrame();
+-    if (currentActivity) {
++    if (currentActivity && tailnet_display_render_gate()) {
+       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
+       // Apply Night Mode to each activity's normal-polarity frame. SleepActivity
+       // preserves it for retained pages and clears it for generated sleep screens.
+@@ -533,6 +534,7 @@ void ActivityManager::renderTaskLoop() {
+ }
+ 
+ void ActivityManager::loop() {
++  tailnet_display_tick();
+   if (currentActivity && currentActivity->requiresExclusiveStorageLoop()) {
+     currentActivity->loop();
+     // USB Drive normally restarts the device rather than replacing itself. The
+@@ -1164,6 +1166,7 @@ bool ActivityManager::goToBookOrbitCatalog(BookOrbitCatalogLink link) {
+ }
+ 
+ void ActivityManager::goToBookOrbitAuth() {
++  if (tailnet_redirect_bookorbit_auth()) return;
+   // Replace for the same reason as the catalog: authentication is a TLS session, and the
+   // settings screens it is reached through hold 15-20KB that the handshake needs. Nothing
+   // is lost by dropping them — the activity ends in a silentRestart() to the home screen
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index 6e04d795..0192f6f0 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -47,6 +47,8 @@
+ #include "util/BookCacheUtils.h"
+ #include "util/BookOrbitDevicePath.h"
+ #include "util/StringUtils.h"
++#include "network/SavedWifiConnect.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace fui = freeink::ui;
+ 
+@@ -346,6 +348,13 @@ void BookOrbitCatalogBrowserActivity::onEnter() {
+     return;
+   }
+ 
++  if (pendingDownload.fileId != 0 && tailnet_boot_parks()) {
++    // C3 + Tailscale: the panel keeps this screen while the framebuffer is parked.
++    showDownloadScreen(pendingDownload.title);
++    requestUpdateAndWait();
++    onWifiSelectionComplete(SavedWifiConnect::connect([] { return false; }));
++    return;
++  }
+   state = BrowserState::CHECK_WIFI;
+   requestUpdate();
+   checkAndConnectWifi();
+@@ -1399,6 +1408,9 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+             static_cast<int>(result));
+   }
+ 
++  // C3 + Tailscale: WiFi off and the framebuffer back first; the listing cannot be
++  // fetched again without Tailscale, so the download ends on Home like one from there.
++  if (tailnet_end_parked_network()) downloadFromHome = true;
+   const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
+   if (downloadFailed) {
+     // preservePartial kept the staged file for resuming between attempts; don't
+diff --git a/src/activities/network/WifiSelectionActivity.cpp b/src/activities/network/WifiSelectionActivity.cpp
+index 1824dffb..79eee67f 100644
+--- a/src/activities/network/WifiSelectionActivity.cpp
++++ b/src/activities/network/WifiSelectionActivity.cpp
+@@ -25,6 +25,7 @@
+ #include "components/UIThemeTokens.h"
+ #include "components/UiAppHelpers.h"
+ #include "fontIds.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace fui = freeink::ui;
+ 
+@@ -776,6 +777,7 @@ void WifiSelectionActivity::checkConnectionStatus() {
+     sConnectionAttemptLoggingActive = false;
+ #endif
+     LOG_INF("WIFI", "Connected to ssid=%s ip=%s rssi=%d", selectedSSID.c_str(), connectedIP.c_str(), WiFi.RSSI());
++    tailnet_wifi_joined();
+ 
+ #if defined(ENABLE_SERIAL_LOG) && LOG_LEVEL >= 2
+     uint8_t connectedBssid[6] = {};
+diff --git a/src/main.cpp b/src/main.cpp
+index b44b2471..a02d7493 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -147,6 +147,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+ #include "util/PowerButtonWakeWatcher.h"
+ #include "util/ScreenshotUtil.h"
+ #include "util/SleepWakePolicy.h"
++#include "TailnetNetPhase.h"
+ 
+ GfxRenderer renderer(display);
+ MappedInputManager mappedInputManager(gpio, renderer);
+@@ -448,7 +449,7 @@ static void silentRestartToHome(const uint32_t payload, const char* const descri
+   // Without an overlay, users don't see the reboot and fire input through to
+   // Home. Select on the default selectorIndex=0 then opens the most-recent
+   // book, looking like a trampoline back to the reader they just exited.
+-  GUI.drawPopup(renderer, tr(STR_LOADING));
++  if (tailnet_display_ready(3000)) GUI.drawPopup(renderer, tr(STR_LOADING));
+   delay(50);
+   restartWithSilentToken(restoreUsbSerial);
+ }
+@@ -493,7 +494,7 @@ static void silentRestartToReaderImpl(const bool cleanImageBaseOnEntry) {
+   silentRebootPayload = cleanImageBaseOnEntry ? SILENT_REBOOT_READER_CLEAN_IMAGE_BASE : 0;
+   silentRebootMagic = SILENT_REBOOT_MAGIC;
+   LOG_DBG("MAIN", "Silent restart (target=reader cleanImageBase=%d)", cleanImageBaseOnEntry ? 1 : 0);
+-  GUI.drawPopup(renderer, tr(STR_LOADING));
++  if (tailnet_display_ready(3000)) GUI.drawPopup(renderer, tr(STR_LOADING));
+   delay(50);
+   restartWithSilentToken();
+ }
+@@ -511,14 +512,16 @@ void silentRestartToNetwork(const NetworkBootTarget target, const uint32_t paylo
+   silentRebootMagic = SILENT_REBOOT_MAGIC;
+   LOG_DBG("MAIN", "Silent restart (target=network/%lu payload=%lu)", static_cast<unsigned long>(silentRebootTarget),
+           static_cast<unsigned long>(payload));
+-  if (target == NetworkBootTarget::KOREADER_SYNC) {
+-    RenderLock lock;
+-    // A drawer close can queue a backdrop repaint. Serialize the handoff and
+-    // replace that frame so only one loading notice remains visible.
+-    renderer.clearScreen();
+-    GUI.drawPopup(renderer, tr(STR_LOADING));
+-  } else {
+-    GUI.drawPopup(renderer, tr(STR_LOADING));
++  if (tailnet_display_ready(3000)) {
++    if (target == NetworkBootTarget::KOREADER_SYNC) {
++      RenderLock lock;
++      // A drawer close can queue a backdrop repaint. Serialize the handoff and
++      // replace that frame so only one loading notice remains visible.
++      renderer.clearScreen();
++      GUI.drawPopup(renderer, tr(STR_LOADING));
++    } else {
++      GUI.drawPopup(renderer, tr(STR_LOADING));
++    }
+   }
+   delay(50);
+   restartWithSilentToken();
+@@ -1452,6 +1455,7 @@ void wakeFromSleepSync() {
+ // running.
+ static void redrawSleepScreenAfterSleepSync() {
+   LOG_INF("SLP", "Drawing the sleep screen again after the BookOrbit sleep sync");
++  if (!tailnet_display_ready(5000)) return;
+   if (sleepSyncAfterQuickResumeSleep) {
+     HalFile file;
+     if (!Storage.openFileForRead("SLP", SLEEP_FRAME_FILE, file)) return;
+@@ -1949,6 +1953,7 @@ void setup() {
+     case BootResume::Network:
+       LOG_INF("BOOT", "Minimal network boot ready: target=%lu free=%u maxAlloc=%u",
+               static_cast<unsigned long>(snapshotTarget), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
++      tailnet_network_phase_begin(snapshotTarget);
+       break;
+     case BootResume::SplashlessWake:
+       // Like upstream, clean the first Home paint unless a saved frame restores
+@@ -2055,6 +2060,12 @@ void setup() {
+         }
+         break;
+       }
++      case static_cast<NetworkBootTarget>(TAILNET_LOGIN_TARGET):
++        launched = tailnet_login_boot();
++        break;
++      case static_cast<NetworkBootTarget>(TAILNET_BOOKORBIT_AUTH_TARGET):
++        launched = tailnet_bookorbit_auth_boot();
++        break;
+       case NetworkBootTarget::BOOKORBIT_HOME_SHELVES: {
+         auto shelves = makeUniqueNoThrow<BookOrbitSettingsActivity>(
+             renderer, mappedInputManager, BookOrbitSettingsActivity::Page::Home, /*networkBoot=*/true);
+diff --git a/src/network/SavedWifiConnect.cpp b/src/network/SavedWifiConnect.cpp
+index 178cecc3..cbd6c63d 100644
+--- a/src/network/SavedWifiConnect.cpp
++++ b/src/network/SavedWifiConnect.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "WifiCredentialStore.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace {
+ // WifiSelectionActivity's own figures: its auto-connect timeout, and the heap below
+@@ -52,6 +53,7 @@ bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck sh
+       LOG_INF("WIFI", "Joined %s (rssi=%d)", credential.ssid.c_str(), WiFi.RSSI());
+       // Next time, the network that answered here is the first one tried.
+       WIFI_STORE.setLastConnectedSsid(credential.ssid);
++      tailnet_wifi_joined();
+       return true;
+     }
+     if (isJoinFailure(status)) break;

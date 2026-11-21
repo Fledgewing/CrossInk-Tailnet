@@ -1,0 +1,575 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 954d9541..f333c4d8 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -84,6 +84,13 @@
+ #define CROSSINK_TAILNET_TLS_ARENA_BEST_FIT 0
+ #endif
+ 
++// BookOrbit catalog rows: a row's five strings (title, author, section, series, path) in
++// one heap buffer instead of five std::string members (24 B each, plus a block each for
++// any longer than 15 chars). The 60-row window reserve drops from ~8.6 KB to ~2.4 KB.
++#ifndef CROSSINK_TAILNET_PACKED_ROWS
++#define CROSSINK_TAILNET_PACKED_ROWS 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index 5a3701f4..d5b5b668 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -54,6 +54,125 @@
+ 
+ namespace fui = freeink::ui;
+ 
++// --- Catalog row strings (Entry::text) -------------------------------------------------
++using CatalogRow = BookOrbitCatalogBrowserActivity::Entry;
++using RowText = BookOrbitCatalogBrowserActivity::Text;
++#if CROSSINK_TAILNET_PACKED_ROWS
++using PackedText = BookOrbitCatalogBrowserActivity::PackedText;
++constexpr size_t TEXT_COUNT = BookOrbitCatalogBrowserActivity::TEXT_COUNT;
++
++size_t PackedText::total() const {
++  size_t n = 0;
++  for (const uint16_t len : len_) n += len + 1u;
++  return n;
++}
++
++PackedText::PackedText(const PackedText& other) { *this = other; }
++
++PackedText::PackedText(PackedText&& other) noexcept : buf_(other.buf_), len_(other.len_) {
++  other.buf_ = nullptr;
++  other.len_.fill(0);
++}
++
++PackedText& PackedText::operator=(const PackedText& other) {
++  if (this == &other) return *this;
++  char* copy = nullptr;
++  if (other.buf_ != nullptr) {
++    const size_t n = other.total();
++    copy = static_cast<char*>(malloc(n));
++    if (copy == nullptr) return *this;  // out of memory: this row keeps its own text
++    memcpy(copy, other.buf_, n);
++  }
++  free(buf_);
++  buf_ = copy;
++  len_ = copy ? other.len_ : decltype(len_){};
++  return *this;
++}
++
++PackedText& PackedText::operator=(PackedText&& other) noexcept {
++  if (this == &other) return *this;
++  free(buf_);
++  buf_ = other.buf_;
++  len_ = other.len_;
++  other.buf_ = nullptr;
++  other.len_.fill(0);
++  return *this;
++}
++
++PackedText::~PackedText() { free(buf_); }
++
++std::string_view PackedText::get(const RowText field) const {
++  const size_t index = static_cast<size_t>(field);
++  if (buf_ == nullptr || len_[index] == 0) return std::string_view("", 0);
++  size_t offset = 0;
++  for (size_t i = 0; i < index; i++) offset += len_[i] + 1u;
++  return std::string_view(buf_ + offset, len_[index]);
++}
++
++bool PackedText::setAll(const std::array<std::string_view, TEXT_COUNT>& values) {
++  size_t n = 0;
++  bool any = false;
++  for (const auto& value : values) {
++    if (value.size() > UINT16_MAX) return false;
++    n += value.size() + 1;
++    any = any || !value.empty();
++  }
++  // Built before the old block goes: a value may point into it.
++  char* block = nullptr;
++  if (any) {
++    block = static_cast<char*>(malloc(n));
++    if (block == nullptr) return false;
++    char* out = block;
++    for (const auto& value : values) {
++      memcpy(out, value.data(), value.size());
++      out += value.size();
++      *out++ = '\0';
++    }
++  }
++  free(buf_);
++  buf_ = block;
++  for (size_t i = 0; i < TEXT_COUNT; i++) len_[i] = block ? static_cast<uint16_t>(values[i].size()) : 0;
++  return true;
++}
++
++bool PackedText::set(const RowText field, const std::string_view value) {
++  std::array<std::string_view, TEXT_COUNT> values;
++  for (size_t i = 0; i < TEXT_COUNT; i++) values[i] = get(static_cast<RowText>(i));
++  values[static_cast<size_t>(field)] = value;
++  return setAll(values);
++}
++
++std::string_view CatalogRow::text(const RowText field) const { return text_.get(field); }
++void CatalogRow::setText(const RowText field, const std::string_view value) { text_.set(field, value); }
++void CatalogRow::setTexts(const std::string_view title, const std::string_view subtitle,
++                          const std::string_view sectionId, const std::string_view seriesId,
++                          const std::string_view path) {
++  text_.setAll({title, subtitle, sectionId, seriesId, path});
++}
++size_t CatalogRow::textBytes() const { return text_.bytes(); }
++#else
++std::string_view CatalogRow::text(const RowText field) const {
++  return text_[static_cast<size_t>(field)];
++}
++void CatalogRow::setText(const RowText field, const std::string_view value) {
++  text_[static_cast<size_t>(field)].assign(value.data(), value.size());
++}
++void CatalogRow::setTexts(const std::string_view title, const std::string_view subtitle,
++                          const std::string_view sectionId, const std::string_view seriesId,
++                          const std::string_view path) {
++  setTitle(title);
++  setSubtitle(subtitle);
++  setSectionId(sectionId);
++  setSeriesId(seriesId);
++  setPath(path);
++}
++size_t CatalogRow::textBytes() const {
++  size_t n = 0;
++  for (const auto& text : text_) n += text.capacity() > 15 ? text.capacity() + 1 : 0;  // beyond the SSO buffer
++  return n;
++}
++#endif
++
+ namespace {
+ // BookOrbitCatalogCounts::wantToRead when the shelf was not asked about (CROSSINK_TAILNET_SKIP_ROOT_COUNTS).
+ constexpr int UNCOUNTED_WANT_TO_READ = -2;
+@@ -123,7 +242,7 @@ int readStatusChoiceIndex(const std::string& readStatus) {
+ 
+ // A row's title without the count badge the root and facet listings give it.
+ std::string titleWithoutBadge(const Entry& entry) {
+-  return entry.badgeAt > 0 ? entry.title.substr(0, entry.badgeAt) : entry.title;
++  return std::string(entry.badgeAt > 0 ? entry.title().substr(0, entry.badgeAt) : entry.title());
+ }
+ 
+ // A server book list's header controls on touch devices: the Library's, minus its refresh
+@@ -152,8 +271,8 @@ void addListHeaderControls(Screen& screen, const GfxRenderer& renderer, const bo
+ 
+ // Appends a row's " (count)" badge, remembering where the title itself ends.
+ void addCountBadge(Entry& entry, const int count) {
+-  entry.badgeAt = static_cast<uint16_t>(entry.title.size());
+-  entry.title += " (" + std::to_string(count) + ")";
++  entry.badgeAt = static_cast<uint16_t>(entry.title().size());
++  entry.setTitle(std::string(entry.title()) + " (" + std::to_string(count) + ")");
+ }
+ 
+ // Root sections that list facets (authors, series...) rather than books.
+@@ -533,10 +652,9 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
+   for (auto& section : sections) {
+     Entry entry;
+     entry.type = isFacetSection(section.id) ? EntryType::FACET_SECTION : EntryType::SECTION;
+-    entry.title = section.title;
++    entry.setTexts(section.title, "", section.id, "", "");
+     const int count = sectionCount(section.id);
+     if (count >= 0) addCountBadge(entry, count);
+-    entry.sectionId = section.id;
+     entries.push_back(std::move(entry));
+   }
+   // The want-to-read shelf BookOrbit's own plugin shows, which the server does not list
+@@ -544,26 +662,23 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
+   if (counts.wantToRead >= 0 || counts.wantToRead == UNCOUNTED_WANT_TO_READ) {
+     Entry wantToRead;
+     wantToRead.type = EntryType::SECTION;
+-    wantToRead.title = tr(STR_BOOKORBIT_WANT_TO_READ);
++    wantToRead.setTexts(tr(STR_BOOKORBIT_WANT_TO_READ), "", BookOrbitCatalogClient::WANT_TO_READ_SHELF, "", "");
+     if (counts.wantToRead >= 0) addCountBadge(wantToRead, counts.wantToRead);
+-    wantToRead.sectionId = BookOrbitCatalogClient::WANT_TO_READ_SHELF;
+     entries.push_back(std::move(wantToRead));
+   }
+   Entry onDevice;
+   onDevice.type = EntryType::LOCAL_SECTION;
+-  onDevice.title = tr(STR_BOOKORBIT_ON_DEVICE);
++  onDevice.setTexts(tr(STR_BOOKORBIT_ON_DEVICE), "", "on-device", "", "");
+   addCountBadge(onDevice, static_cast<int>(localOnDeviceCount));
+-  onDevice.sectionId = "on-device";
+   entries.push_back(std::move(onDevice));
+   Entry inProgress;
+   inProgress.type = EntryType::LOCAL_SECTION;
+-  inProgress.title = tr(STR_BOOKORBIT_IN_PROGRESS);
++  inProgress.setTexts(tr(STR_BOOKORBIT_IN_PROGRESS), "", "in-progress", "", "");
+   addCountBadge(inProgress, static_cast<int>(localInProgressCount));
+-  inProgress.sectionId = "in-progress";
+   entries.push_back(std::move(inProgress));
+   Entry search;
+   search.type = EntryType::SEARCH;
+-  search.title = tr(STR_SEARCH);
++  search.setTitle(tr(STR_SEARCH));
+   entries.push_back(std::move(search));
+ 
+   state = entries.empty() ? BrowserState::ERROR : BrowserState::BROWSING;
+@@ -588,9 +703,7 @@ size_t BookOrbitCatalogBrowserActivity::collectLocalBooks(const std::string& kin
+       if (!sink) continue;
+       Entry entry;
+       entry.type = EntryType::LOCAL_BOOK;
+-      entry.title = book.title.empty() ? book.path : book.title;
+-      entry.subtitle = book.author;
+-      entry.path = book.path;
++      entry.setTexts(book.title.empty() ? book.path : book.title, book.author, "", "", book.path);
+       sink->push_back(std::move(entry));
+     }
+     LOG_DBG("BookOrbit", "Local scan: kind=%s count=%u", kind.c_str(), static_cast<unsigned>(count));
+@@ -616,8 +729,7 @@ size_t BookOrbitCatalogBrowserActivity::collectLocalBooks(const std::string& kin
+         if (out->sink == nullptr) return;
+         Entry entry;
+         entry.type = EntryType::LOCAL_BOOK;
+-        entry.title = bookTitleFromPath(path);
+-        entry.path = path;
++        entry.setTexts(bookTitleFromPath(path), "", "", "", path);
+         out->sink->push_back(std::move(entry));
+       },
+       &collector);
+@@ -647,8 +759,7 @@ size_t BookOrbitCatalogBrowserActivity::collectLocalBooks(const std::string& kin
+       if (!sink) continue;
+       Entry entry;
+       entry.type = EntryType::LOCAL_BOOK;
+-      entry.title = std::string(name, nameLen - 5);  // strip ".epub"
+-      entry.path = path;
++      entry.setTexts(std::string_view(name, nameLen - 5), "", "", "", path);  // strip ".epub"
+       sink->push_back(std::move(entry));
+     }
+     dir.close();
+@@ -671,9 +782,10 @@ void BookOrbitCatalogBrowserActivity::loadLocalBooks(const std::string kind) {
+ 
+   collectLocalBooks(kind, &entries);
+   std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+-    if (FsHelpers::naturalLess(a.title, b.title)) return true;
+-    if (FsHelpers::naturalLess(b.title, a.title)) return false;
+-    return FsHelpers::naturalLess(a.subtitle, b.subtitle);
++    const std::string aTitle(a.title()), bTitle(b.title());
++    if (FsHelpers::naturalLess(aTitle, bTitle)) return true;
++    if (FsHelpers::naturalLess(bTitle, aTitle)) return false;
++    return FsHelpers::naturalLess(std::string(a.subtitle()), std::string(b.subtitle()));
+   });
+ 
+   // Local listings behave like a book list one level below the root. Neutralise
+@@ -738,10 +850,11 @@ bool BookOrbitCatalogBrowserActivity::loadFacetEntries(const std::string& sectio
+     auto& facet = result.entries[i];
+     Entry& entry = entries[first + i];
+     entry.type = EntryType::FACET;
+-    entry.title = std::move(facet.title);
+-    if (facet.count > 0) addCountBadge(entry, facet.count);
+-    entry.sectionId = std::move(facet.id);
+-    entry.seriesId = std::move(facet.seriesId);
++    if (facet.count > 0) {
++      entry.badgeAt = static_cast<uint16_t>(facet.title.size());
++      facet.title += " (" + std::to_string(facet.count) + ")";
++    }
++    entry.setTexts(facet.title, "", facet.id, facet.seriesId, "");
+   }
+   logPageLoad(page, cacheHit);
+   state = entries.empty() ? BrowserState::ERROR : BrowserState::BROWSING;
+@@ -797,17 +910,13 @@ bool BookOrbitCatalogBrowserActivity::loadBooks(const BookOrbitBookQuery& query,
+     Entry& entry = entries[first + i];
+     entry.type = EntryType::BOOK;
+     entry.bookId = book.id;
+-    entry.onDevice = bookOnDevice(book.id, book.title, book.author, entry.path);
+-    entry.title = std::move(book.title);
+-    entry.subtitle = std::move(book.author);
+-    // The list section the sort files the book under. The day is formatted once, here:
+-    // short enough to fit the string without a heap block.
+-    if (!book.series.empty()) {
+-      entry.sectionId = std::move(book.series);
+-    } else if (book.addedAt != 0) {
+-      char day[24];
+-      if (formatLocalDateText(day, sizeof(day), book.addedAt)) entry.sectionId = day;
+-    }
++    std::string path;
++    entry.onDevice = bookOnDevice(book.id, book.title, book.author, path);
++    // The list section the sort files the book under. The day is formatted once, here.
++    char day[24] = "";
++    std::string_view section = book.series;
++    if (section.empty() && book.addedAt != 0 && formatLocalDateText(day, sizeof(day), book.addedAt)) section = day;
++    entry.setTexts(book.title, book.author, section, "", path);
+   }
+   // The letters span the whole listing and only come with its first page.
+   if (page == 1) setListLetters(result.letters);
+@@ -874,11 +983,11 @@ const char* BookOrbitCatalogBrowserActivity::sectionHeading(const size_t index)
+     return nullptr;
+   }
+   const Entry& entry = entries[index];
+-  if (entry.type != EntryType::BOOK || entry.sectionId.empty()) return nullptr;
++  if (entry.type != EntryType::BOOK || entry.sectionId().empty()) return nullptr;
+   // The first row in memory may go on with a section that began on a page no longer held:
+   // it is headed again, which names the section the screen opens on.
+-  if (index > 0 && entries[index - 1].sectionId == entry.sectionId) return nullptr;
+-  return entry.sectionId.c_str();
++  if (index > 0 && entries[index - 1].sectionId() == entry.sectionId()) return nullptr;
++  return entry.sectionId().data();  // NUL-terminated (Entry::Text)
+ }
+ 
+ void BookOrbitCatalogBrowserActivity::adoptRenderedViewport() {
+@@ -950,6 +1059,13 @@ void BookOrbitCatalogBrowserActivity::logPageLoad(const int page, const bool cac
+   LOG_INF("BookOrbit", "Listing page %d from %s: %u rows in memory from row %d (free=%u maxAlloc=%u)", page,
+           cacheHit ? "cache" : "server", static_cast<unsigned>(entries.size()), windowStart, ESP.getFreeHeap(),
+           ESP.getMaxAllocHeap());
++  // The list's own heap: the row block (reserved capacity) and the rows' strings.
++  size_t textBytes = 0;
++  for (const auto& entry : entries) textBytes += entry.textBytes();
++  LOG_INF("BookOrbit", "Listing memory: %u rows reserved x %u B = %u B, strings %u B (packed rows %d)",
++          static_cast<unsigned>(entries.capacity()), static_cast<unsigned>(sizeof(Entry)),
++          static_cast<unsigned>(entries.capacity() * sizeof(Entry)), static_cast<unsigned>(textBytes),
++          CROSSINK_TAILNET_PACKED_ROWS);
+ }
+ 
+ // A swipe leaves the selection where it was while the viewport moves on, so a dropped
+@@ -1557,20 +1673,21 @@ void BookOrbitCatalogBrowserActivity::activateSelected() {
+   const auto& entry = *selected;
+   switch (entry.type) {
+     case EntryType::SECTION:
+-      openBookListing(BookOrbitCatalogClient::sectionBookQuery(entry.sectionId), titleWithoutBadge(entry),
+-                      /*fromFacet=*/false);
++      openBookListing(BookOrbitCatalogClient::sectionBookQuery(std::string(entry.sectionId())),
++                      titleWithoutBadge(entry), /*fromFacet=*/false);
+       break;
+     case EntryType::FACET_SECTION:
+-      if (!loadFacetEntries(entry.sectionId, entry.title, 1, PageLoad::Open, /*allowNetwork=*/false)) {
++      if (!loadFacetEntries(std::string(entry.sectionId()), std::string(entry.title()), 1, PageLoad::Open,
++                            /*allowNetwork=*/false)) {
+         showLoadingBeforeFetch();
+-        loadFacetEntries(entry.sectionId, entry.title, 1);
++        loadFacetEntries(std::string(entry.sectionId()), std::string(entry.title()), 1);
+       }
+       break;
+     case EntryType::LOCAL_SECTION:
+-      loadLocalBooks(entry.sectionId);
++      loadLocalBooks(std::string(entry.sectionId()));
+       break;
+     case EntryType::LOCAL_BOOK:
+-      openLocalBook(entry.path);
++      openLocalBook(std::string(entry.path()));
+       break;
+     case EntryType::FACET: {
+       // Mirror BookOrbit's own plugin (paramsForEntry): author filters by the
+@@ -1580,22 +1697,22 @@ void BookOrbitCatalogBrowserActivity::activateSelected() {
+       BookOrbitBookQuery query;
+       if (facetSectionId == "series") {
+         query.sort = "series";
+-        if (!entry.seriesId.empty()) {
+-          query.seriesId = entry.seriesId;
++        if (!entry.seriesId().empty()) {
++          query.seriesId = std::string(entry.seriesId());
+         } else {
+-          query.series = entry.sectionId;
++          query.series = std::string(entry.sectionId());
+         }
+       } else if (facetSectionId == "collections") {
+         query.sort = "title";
+-        query.collectionId = entry.sectionId;
++        query.collectionId = std::string(entry.sectionId());
+       } else if (facetSectionId == "libraries") {
+         query.sort = "title";
+-        query.libraryId = entry.sectionId;
++        query.libraryId = std::string(entry.sectionId());
+       } else if (facetSectionId == "smart-scopes") {
+         query.sort = "title";
+-        query.smartScopeId = entry.sectionId;
++        query.smartScopeId = std::string(entry.sectionId());
+       } else {
+-        query.author = entry.sectionId;
++        query.author = std::string(entry.sectionId());
+       }
+       // Back reopens the facet listing on this row.
+       facetSelectorIndex = selectorIndex;
+@@ -1608,9 +1725,9 @@ void BookOrbitCatalogBrowserActivity::activateSelected() {
+       break;
+     case EntryType::BOOK:
+       if (entry.onDevice) {
+-        openLocalBook(entry.path);
++        openLocalBook(std::string(entry.path()));
+       } else {
+-        downloadBook(entry.bookId, entry.title);
++        downloadBook(entry.bookId, std::string(entry.title()));
+       }
+       break;
+   }
+@@ -1641,7 +1758,7 @@ void BookOrbitCatalogBrowserActivity::showBookActionMenu(const bool ignoreInitia
+ 
+   // Captured by row: the menu is modal, so the listing cannot change under it.
+   const int row = selectorIndex;
+-  startActivityForResult(std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, entry.title,
++  startActivityForResult(std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, std::string(entry.title()),
+                                                                      std::move(items), ignoreInitialConfirmRelease),
+                          [this, row](const ActivityResult& result) {
+                            longPressFired = false;
+@@ -1658,13 +1775,13 @@ void BookOrbitCatalogBrowserActivity::showBookActionMenu(const bool ignoreInitia
+                                    static_cast<long long>(entry.bookId));
+                            switch (static_cast<FileBrowserAction>(actionResult->action)) {
+                              case FileBrowserAction::Open:
+-                               openLocalBook(entry.path);
++                               openLocalBook(std::string(entry.path()));
+                                return;
+                              case FileBrowserAction::Download:
+-                               downloadBook(entry.bookId, entry.title);
++                               downloadBook(entry.bookId, std::string(entry.title()));
+                                return;
+                              case FileBrowserAction::Redownload:
+-                               downloadBook(entry.bookId, entry.title, entry.path);
++                               downloadBook(entry.bookId, std::string(entry.title()), std::string(entry.path()));
+                                return;
+                              case FileBrowserAction::Delete:
+                                promptDeleteBook(row);
+@@ -1679,21 +1796,25 @@ void BookOrbitCatalogBrowserActivity::promptDeleteBook(const int row) {
+   const Entry* book = entryAt(row);
+   if (!book) return;
+   const std::string heading = tr(STR_DELETE) + std::string("? ");
+-  startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, book->title),
++  startActivityForResult(
++      std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, std::string(book->title())),
+                          [this, row](const ActivityResult& result) {
+                            Entry* current = entryAt(row);
+                            if (result.isCancelled || !current) return;
+                            Entry& entry = *current;
+-                           BookActions::clearFileMetadata(entry.path);
+-                           if (!Storage.remove(entry.path.c_str())) {
+-                             LOG_ERR("BookOrbit", "Failed to delete book: %s", entry.path.c_str());
++                           BookActions::clearFileMetadata(std::string(entry.path()));
++                           if (!Storage.remove(entry.path().data())) {
++                             LOG_ERR("BookOrbit", "Failed to delete book: %s", entry.path().data());
+                              return;
+                            }
+-                           RECENT_BOOKS.removeByPath(entry.path);
++                           RECENT_BOOKS.removeByPath(std::string(entry.path()));
+                            library::invalidateLibraryIndex();
+                            // Re-detect rather than just clearing the flag: another copy (the SD root,
+                            // /Read) may still match. The index drops its now-stale entry on lookup.
+-                           entry.onDevice = bookOnDevice(entry.bookId, entry.title, entry.subtitle, entry.path);
++                           std::string path(entry.path());
++                           entry.onDevice = bookOnDevice(entry.bookId, std::string(entry.title()),
++                                                         std::string(entry.subtitle()), path);
++                           entry.setPath(path);
+                            requestUpdate();
+                          });
+ }
+@@ -1956,10 +2077,10 @@ void BookOrbitCatalogBrowserActivity::buildListScreen(UiApp::ScreenType& screen)
+   for (size_t i = 0; i < entries.size(); i++) {
+     const auto& entry = entries[i];
+     fui::ListItem item;
+-    item.label = entry.title.c_str();
++    item.label = entry.title().data();  // NUL-terminated (Entry::Text)
+     // The subtitle carries the author; without it two same-title search results
+     // are indistinguishable.
+-    if (!entry.subtitle.empty()) item.subtitle = entry.subtitle.c_str();
++    if (!entry.subtitle().empty()) item.subtitle = entry.subtitle().data();
+     if (entry.onDevice) item.value = ON_DEVICE_MARKER;
+     if (sections) item.sectionHeading = sectionHeading(i);
+     item.actionValue = static_cast<int16_t>(i);
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.h b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+index 620753f9..84944ca9 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.h
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+@@ -2,10 +2,14 @@
+ #include <FreeInkApp.h>
+ #include <FreeInkUIGfxRenderer.h>
+ 
++#include <CrossInkTailnetCuts.h>
++
+ #include <array>
+ #include <atomic>
++#include <cstdint>
+ #include <memory>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "BookOrbitCatalogLink.h"
+@@ -35,22 +39,81 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
+   // Which listing the BROWSING state currently shows; drives Back navigation.
+   enum class NavLevel { Root, FacetList, Books };
+ 
+-  struct Entry {
+-    EntryType type;
+-    std::string title;
+-    std::string subtitle;  // author, for BOOK/LOCAL_BOOK entries
++  // A row's strings. Every view an Entry returns is NUL-terminated (data() is a C string)
++  // and stays valid until that field, or with CROSSINK_TAILNET_PACKED_ROWS any field of
++  // the row, is set again.
++  enum class Text : uint8_t {
++    Title,
++    Subtitle,  // author, for BOOK/LOCAL_BOOK entries
+     // Section id (SECTION/FACET_SECTION/LOCAL_SECTION), facet entry id (FACET), or for a
+     // BOOK the list section its listing's sort files it under (its series, the day it was
+     // added), empty when that sort has none.
+-    std::string sectionId;
+-    std::string seriesId;  // numeric series id, for FACET entries of the series facet
+-    std::string path;      // SD path: LOCAL_BOOK entries, and BOOK entries already on the device
++    SectionId,
++    SeriesId,  // numeric series id, for FACET entries of the series facet
++    Path,      // SD path: LOCAL_BOOK entries, and BOOK entries already on the device
++    Count
++  };
++  static constexpr size_t TEXT_COUNT = static_cast<size_t>(Text::Count);
++
++#if CROSSINK_TAILNET_PACKED_ROWS
++  // The strings of one row in one heap block: "title\0subtitle\0sectionId\0seriesId\0path\0",
++  // none when all are empty. Setting a field rebuilds the block.
++  class PackedText {
++   public:
++    PackedText() = default;
++    PackedText(const PackedText& other);
++    PackedText(PackedText&& other) noexcept;
++    PackedText& operator=(const PackedText& other);
++    PackedText& operator=(PackedText&& other) noexcept;
++    ~PackedText();
++
++    std::string_view get(Text field) const;
++    // False (and the row unchanged) when the new block cannot be allocated.
++    bool set(Text field, std::string_view value);
++    // All five at once: one allocation for a whole row.
++    bool setAll(const std::array<std::string_view, TEXT_COUNT>& values);
++    // Heap bytes held (the block), for the page-load log.
++    size_t bytes() const { return buf_ ? total() : 0; }
++
++   private:
++    size_t total() const;  // block size, NULs included
++    char* buf_ = nullptr;
++    std::array<uint16_t, TEXT_COUNT> len_{};
++  };
++#endif
++
++  struct Entry {
++    EntryType type;
++    std::string_view title() const { return text(Text::Title); }
++    std::string_view subtitle() const { return text(Text::Subtitle); }
++    std::string_view sectionId() const { return text(Text::SectionId); }
++    std::string_view seriesId() const { return text(Text::SeriesId); }
++    std::string_view path() const { return text(Text::Path); }
++    void setTitle(std::string_view value) { setText(Text::Title, value); }
++    void setSubtitle(std::string_view value) { setText(Text::Subtitle, value); }
++    void setSectionId(std::string_view value) { setText(Text::SectionId, value); }
++    void setSeriesId(std::string_view value) { setText(Text::SeriesId, value); }
++    void setPath(std::string_view value) { setText(Text::Path, value); }
++    // Every field at once (one allocation with CROSSINK_TAILNET_PACKED_ROWS).
++    void setTexts(std::string_view title, std::string_view subtitle, std::string_view sectionId,
++                  std::string_view seriesId, std::string_view path);
++    std::string_view text(Text field) const;
++    void setText(Text field, std::string_view value);
++    // Heap bytes the row's strings hold beyond the Entry itself (page-load log).
++    size_t textBytes() const;
+     int64_t bookId = 0;
+     bool onDevice = false;  // BOOK entries: a matching file already exists on the device (at `path`)
+     uint16_t page = 0;      // server page the row came from; 0 for the root and the on-device lists
+     // Length of `title` before its " (count)" badge, 0 when it has none. A listing opened
+     // from the row is titled without it: its header counts what the listing holds.
+     uint16_t badgeAt = 0;
++
++   private:
++#if CROSSINK_TAILNET_PACKED_ROWS
++    PackedText text_;
++#else
++    std::array<std::string, TEXT_COUNT> text_;
++#endif
+   };
+ 
+   // networkBoot: launched by a minimal network boot (BOOKORBIT_CATALOG or

@@ -1,0 +1,58 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index f804064b..567bf7d5 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -712,6 +712,7 @@ STR_SERVER_NAME: "Server Name"
+ STR_NO_SERVERS: "No OPDS servers configured"
+ STR_DELETE_SERVER: "Delete Server"
+ STR_OPDS_SERVERS: "OPDS Servers"
++STR_TAILSCALE: "Tailscale"
+ STR_OPDS_DOWNLOAD_FOLDER: "Download Folder"
+ STR_OPDS_SD_ROOT: "SD Root"
+ STR_OPDS_DEFAULT_FOLDER: "Default Folder"
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 8e00b54f..f19b021a 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1173,6 +1173,7 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+ #if CROSSINK_APP_CAP_OPDS
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
+ #endif
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_TAILSCALE, SettingAction::Tailscale));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_PLUGINS, SettingAction::Plugins));
+ #if !FREEINK_DEVICE_PICCO
+   // Picco retains the vendor recovery slot and has no spare application slot.
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 2d8fbbbf..18067984 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -24,6 +24,7 @@
+ #include "ClearCacheActivity.h"
+ #include "ClockOffsetActivity.h"
+ #include "ClockSyncActivity.h"
++#include "tailnet/TailnetSettingsActivity.h"
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+ #include "DeviceCapabilities.h"
+@@ -1722,6 +1723,9 @@ void SettingsActivity::toggleCurrentSetting() {
+       case SettingAction::ClockSync:
+         startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput), resultHandler);
+         break;
++      case SettingAction::Tailscale:
++        startActivityForResult(std::make_unique<TailnetSettingsActivity>(renderer, mappedInput), resultHandler);
++        break;
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
+         break;
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index aaef1291..32d4eace 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -64,6 +64,7 @@ enum class SettingAction {
+   DownloadFonts,
+   TtfRendering,
+   ClockSync,
++  Tailscale,
+ };
+ 
+ struct SettingInfo {

@@ -1,0 +1,137 @@
+diff --git a/lib/BookOrbitSync/BookOrbitSyncClient.cpp b/lib/BookOrbitSync/BookOrbitSyncClient.cpp
+index 84cdee3b..c5c18ec5 100644
+--- a/lib/BookOrbitSync/BookOrbitSyncClient.cpp
++++ b/lib/BookOrbitSync/BookOrbitSyncClient.cpp
+@@ -207,7 +207,27 @@ constexpr uint32_t MIN_HEAP_FOR_KEPT_SESSION = 20000;
+ // and a retry on the next sync rather than a crash.
+ bool s_sessionHandshakePaid = false;
+ 
++#if TAILNET_PROBE_CATALOG_LIVE
++// Catalog probe: KOReaderSyncClient's wolfSSL gate (35000 free and a 20000 block) for a
++// new handshake; the kept-session floor stays. Logs which floor applies.
++extern "C" void tailnet_probe_window_begin(const char* what);
++extern "C" void tailnet_probe_window_mark(const char* what, const char* phase);
++extern "C" void tailnet_probe_window_end(const char* what, const char* phase);
++constexpr uint32_t PROBE_MIN_FREE_HEAP_FOR_TLS = 35000;
++constexpr uint32_t PROBE_MIN_MAX_ALLOC_FOR_TLS = 20000;
++uint32_t requiredHeapFloor() {
++  if (s_sessionHandshakePaid) {
++    LOG_INF("BookOrbit", "probe floor: kept session, %u free", (unsigned)MIN_HEAP_FOR_KEPT_SESSION);
++    return MIN_HEAP_FOR_KEPT_SESSION;
++  }
++  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
++  LOG_INF("BookOrbit", "probe floor: new TLS session, %u free and a %u block (largest now %u)",
++          (unsigned)PROBE_MIN_FREE_HEAP_FOR_TLS, (unsigned)PROBE_MIN_MAX_ALLOC_FOR_TLS, (unsigned)maxAlloc);
++  return maxAlloc < PROBE_MIN_MAX_ALLOC_FOR_TLS ? UINT32_MAX : PROBE_MIN_FREE_HEAP_FOR_TLS;
++}
++#else
+ uint32_t requiredHeapFloor() { return s_sessionHandshakePaid ? MIN_HEAP_FOR_KEPT_SESSION : MIN_HEAP_FOR_TLS; }
++#endif
+ 
+ /**
+  * One exactly-sized request body, allocated without throwing.
+@@ -391,6 +411,11 @@ int sendBookOrbitRequest(const char* method, const std::string& url, const JsonB
+     configureClient(http, false);
+   }
+   logHeapStats("Before request", url.c_str());
++#if TAILNET_PROBE_CATALOG_LIVE
++  tailnet_probe_window_begin(pooled && s_sessionHandshakePaid ? "BookOrbit request (kept session)"
++                                                              : "BookOrbit request (new TLS session)");
++  bool probeFirstBytes = true;
++#endif
+   if (!http.begin(url)) {
+     LOG_ERR("BookOrbit", "Failed to open connection: %s", url.c_str());
+     return -1;
+@@ -410,6 +435,12 @@ int sendBookOrbitRequest(const char* method, const std::string& url, const JsonB
+   size_t received = 0;
+   int code = http.sendRequest(method, payload != nullptr ? payload->bytes() : nullptr,
+                               payload != nullptr ? payload->length() : 0, [&](const uint8_t* data, const size_t len) {
++#if TAILNET_PROBE_CATALOG_LIVE
++                                if (probeFirstBytes) {
++                                  probeFirstBytes = false;
++                                  tailnet_probe_window_mark("BookOrbit request", "TLS handshake + headers");
++                                }
++#endif
+                                 received += len;
+                                 return onBody(data, len, http.getContentLength());
+                               });
+@@ -432,6 +463,9 @@ int sendBookOrbitRequest(const char* method, const std::string& url, const JsonB
+     http.end();
+   }
+   logHeapStats("After request");
++#if TAILNET_PROBE_CATALOG_LIVE
++  tailnet_probe_window_end("BookOrbit request", probeFirstBytes ? "whole request (no body)" : "body");
++#endif
+   return code;
+ }
+ 
+diff --git a/src/network/BookOrbitCatalogClient.cpp b/src/network/BookOrbitCatalogClient.cpp
+index b100d244..71d91cc9 100644
+--- a/src/network/BookOrbitCatalogClient.cpp
++++ b/src/network/BookOrbitCatalogClient.cpp
+@@ -18,6 +18,7 @@
+ #include "BookOrbitSyncClient.h"
+ #include "DaysFromCivil.h"
+ #include "activities/reader/ReadingStatsUtils.h"
++#include "Tailnet.h"
+ 
+ bool BookOrbitCatalogClient::lastFetchBadResponse = false;
+ 
+@@ -94,6 +95,11 @@ bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument&
+   const auto headers = authHeaders();
+   options.headers = &headers;
+   HttpDownloader::DownloadError err = HttpDownloader::HTTP_ERROR;
++#if TAILNET_PROBE_CATALOG_LIVE
++  // Catalog requests go through HttpDownloader: a fresh wolfSSL session each, no heap
++  // floor. BookOrbitSyncClient's kept session (floors 55000/20000) is not used here.
++  tailnet_probe_window_begin("catalog request (HttpDownloader: fresh wolfSSL TLS, no heap floor)");
++#endif
+   for (int attempt = 0; attempt < 2; attempt++) {
+     err = HttpDownloader::downloadToFile(url, TMP_PATH, nullptr, nullptr, "", "", options);
+     if (err == HttpDownloader::OK) break;
+@@ -127,6 +133,9 @@ bool fetchJson(const std::string& url, const JsonDocument& filter, JsonDocument&
+   // so a parse "success" alone doesn't prove we got the catalog API: every catalog
+   // endpoint returns a JSON object, and anything else is a bad response.
+   const bool wrongShape = !error && !outDoc.is<JsonObject>();
++#if TAILNET_PROBE_CATALOG_LIVE
++  tailnet_probe_window_end("catalog request", "body to SD + JSON parse");
++#endif
+ 
+   if (error || wrongShape) {
+     // The server answered, but not with the catalog API's JSON. Log what it actually
+diff --git a/src/network/HttpDownloader.cpp b/src/network/HttpDownloader.cpp
+index 9032f692..b102f0e1 100644
+--- a/src/network/HttpDownloader.cpp
++++ b/src/network/HttpDownloader.cpp
+@@ -25,6 +25,7 @@
+ #include "network/WifiPowerSaveGuard.h"
+ #include "util/CardSpace.h"
+ #include "util/UrlUtils.h"
++#include "Tailnet.h"
+ 
+ namespace {
+ constexpr size_t PROGRESS_UPDATE_BYTES = 64 * 1024;
+@@ -297,8 +298,22 @@ HttpDownloader::DownloadError runGetWolfSsl(const std::string& url, const std::s
+       sink.diagnostics->attempted = true;
+       sink.diagnostics->authorizationWithheld = hasCredentials && !sendAuthorization;
+     }
++#if TAILNET_PROBE_CATALOG_LIVE
++    bool probeFirstBytes = true;
++#endif
+     const int status = http.GET(
+-        [&http, &sink, &progressNotifier, &prepared](const uint8_t* data, const size_t len) {
++        [&http, &sink, &progressNotifier, &prepared
++#if TAILNET_PROBE_CATALOG_LIVE
++         ,
++         &probeFirstBytes
++#endif
++    ](const uint8_t* data, const size_t len) {
++#if TAILNET_PROBE_CATALOG_LIVE
++          if (probeFirstBytes) {
++            probeFirstBytes = false;
++            tailnet_probe_window_mark("request", "TLS handshake + headers");
++          }
++#endif
+           const int responseStatus = http.getStatus();
+           if (responseStatus != 200 && responseStatus != 206) return true;
+           if (!prepared) {

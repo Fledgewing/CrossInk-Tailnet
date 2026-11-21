@@ -37,6 +37,16 @@ bool tailnet_login_boot(void);
 bool tailnet_redirect_bookorbit_auth(void);
 bool tailnet_bookorbit_auth_boot(void);
 
+// KOReader-server uploads (CrossInk v2: progress, reading stats and clippings for an
+// existing KOReader account, StatsUploadActivity) on the C3: the server may be on the
+// tailnet, which the normal UI cannot reach. CrossInk's patch restarts the upload into
+// this boot, where Tailscale starts on demand (only when the server's name or address
+// is a tailnet one) and the framebuffer is parked while it runs.
+#define TAILNET_KOREADER_UPLOAD_TARGET 66u
+// True when the upload must restart into that boot (lite build, Tailscale on and
+// logged in, not already in it); false runs it where it is, as upstream does.
+bool tailnet_koreader_upload_redirect(void);
+
 // CrossInk, right after WiFi joins (SavedWifiConnect and WifiSelectionActivity):
 // waits for Tailscale in the boots that run it (tailnet_wait_ready()), so the
 // first request's heap check and connect see it ready. No-op elsewhere.
@@ -56,6 +66,13 @@ void tailnet_network_phase_begin(uint32_t target);
 // This boot's network boot target as given to tailnet_network_phase_begin(); 0 in
 // any other boot. TailnetWifiMem.c picks the WiFi buffer tier from it.
 uint32_t tailnet_network_boot_target(void);
+// True when `target` takes the parked WiFi buffer tier (TailnetWifiMem.c). The
+// NetworkBootTarget numbers differ between CrossInk versions, so only the UI side,
+// which compiles against SilentRestart.h, knows them.
+bool tailnet_wifi_parked_boot(uint32_t target);
+// True in a boot that runs Tailscale on the C3 (a parking boot or the live catalog,
+// lite build, Tailscale on). CrossInk skips plugin event delivery there.
+bool tailnet_boot_runs_tailscale(void);
 // True once a screen that waited for input made this boot turn WiFi off to get the
 // framebuffer back (CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK found no room for it beside
 // Tailscale): a choice that needs the network must restart instead of failing offline.

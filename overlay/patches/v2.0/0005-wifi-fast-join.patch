@@ -1,0 +1,141 @@
+diff --git a/src/network/SavedWifiConnect.cpp b/src/network/SavedWifiConnect.cpp
+index 145bf57f..8aed5099 100644
+--- a/src/network/SavedWifiConnect.cpp
++++ b/src/network/SavedWifiConnect.cpp
+@@ -13,6 +13,12 @@
+ 
+ #include "WifiCredentialStore.h"
+ #include "TailnetNetPhase.h"
++#include "TailnetSysSwitches.h"
++
++#if CROSSINK_TAILNET_WIFI_FAST_JOIN
++#include <esp_wifi.h>
++#include <nvs.h>
++#endif
+ 
+ namespace {
+ // WifiSelectionActivity's own figures: its auto-connect timeout, and the heap below
+@@ -32,28 +38,75 @@ bool isJoinFailure(const wl_status_t status) {
+ #endif
+ }
+ 
+-bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck shouldStop) {
+-  LOG_INF("WIFI", "Joining saved network %s in the background", credential.ssid.c_str());
+-  if (!WiFi.disconnect(false, false, 1000)) {
+-    LOG_DBG("WIFI", "Disconnect before begin timed out; continuing with begin");
+-  }
+-  delay(100);
+-  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+-  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
++#if CROSSINK_TAILNET_WIFI_FAST_JOIN
++// The channel and access point each saved network was last joined on (NVS,
++// keyed by a hash of the SSID). A join that starts there skips the scan of
++// every channel; if it fails, the full scan runs as before.
++struct FastJoin {
++  uint8_t channel;
++  uint8_t bssid[6];
++};
++constexpr const char* FAST_JOIN_NS = "wifi_fast";
++
++void fastJoinKey(const std::string& ssid, char (&key)[16]) {
++  uint32_t h = 2166136261u;  // FNV-1a
++  for (const unsigned char c : ssid) h = (h ^ c) * 16777619u;
++  snprintf(key, sizeof(key), "j%08lx", static_cast<unsigned long>(h));
++}
++
++bool loadFastJoin(const std::string& ssid, FastJoin& out) {
++  char key[16];
++  fastJoinKey(ssid, key);
++  nvs_handle_t h;
++  if (nvs_open(FAST_JOIN_NS, NVS_READONLY, &h) != ESP_OK) return false;
++  size_t len = sizeof(out);
++  const bool ok = nvs_get_blob(h, key, &out, &len) == ESP_OK && len == sizeof(out);
++  nvs_close(h);
++  return ok && out.channel >= 1 && out.channel <= 14;
++}
++
++void saveFastJoin(const std::string& ssid) {
++  FastJoin now = {};
++  const uint8_t* bssid = WiFi.BSSID();
++  const int32_t channel = WiFi.channel();
++  if (!bssid || channel < 1 || channel > 14) return;
++  now.channel = static_cast<uint8_t>(channel);
++  memcpy(now.bssid, bssid, sizeof(now.bssid));
++  FastJoin saved;
++  if (loadFastJoin(ssid, saved) && memcmp(&saved, &now, sizeof(now)) == 0) return;  // no flash write
++  char key[16];
++  fastJoinKey(ssid, key);
++  nvs_handle_t h;
++  if (nvs_open(FAST_JOIN_NS, NVS_READWRITE, &h) != ESP_OK) return;
++  nvs_set_blob(h, key, &now, sizeof(now));
++  nvs_commit(h);
++  nvs_close(h);
++}
++#endif
++
++void begin(const WifiCredential& credential, const int32_t channel = 0, const uint8_t* bssid = nullptr) {
+   if (credential.password.empty()) {
+-    WiFi.begin(credential.ssid.c_str());
++    WiFi.begin(credential.ssid.c_str(), nullptr, channel, bssid);
+   } else {
+-    WiFi.begin(credential.ssid.c_str(), credential.password.c_str());
++    WiFi.begin(credential.ssid.c_str(), credential.password.c_str(), channel, bssid);
+   }
++}
+ 
++// Waits for the join begun just before.
++bool joined(const WifiCredential& credential, const SavedWifiConnect::StopCheck shouldStop) {
+   const unsigned long start = millis();
+   wl_status_t status = WiFi.status();
+   while (millis() - start < JOIN_TIMEOUT_MS && !shouldStop()) {
+     status = WiFi.status();
+     if (status == WL_CONNECTED) {
+-      LOG_INF("WIFI", "Joined %s (rssi=%d)", credential.ssid.c_str(), WiFi.RSSI());
++      LOG_INF("WIFI", "Joined %s (rssi=%d, channel %d, %lums)", credential.ssid.c_str(), WiFi.RSSI(),
++              static_cast<int>(WiFi.channel()), millis() - start);
+       // Next time, the network that answered here is the first one tried.
+       WIFI_STORE.setLastConnectedSsid(credential.ssid);
++#if CROSSINK_TAILNET_WIFI_FAST_JOIN
++      saveFastJoin(credential.ssid);
++      esp_wifi_clear_ap_list();  // the connect scan's results: not needed once joined
++#endif
+ #if CROSSINK_TAILNET_TLS_ARENA
+       tlsArenaReserve();  // before Tailscale takes its share of the heap
+ #endif
+@@ -69,6 +122,36 @@ bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck sh
+     LOG_INF("WIFI", "Could not join %s (status=%d, %lums)", credential.ssid.c_str(), static_cast<int>(status),
+             millis() - start);
+   }
++  return false;
++}
++
++bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck shouldStop) {
++  LOG_INF("WIFI", "Joining saved network %s in the background", credential.ssid.c_str());
++  if (!WiFi.disconnect(false, false, 1000)) {
++    LOG_DBG("WIFI", "Disconnect before begin timed out; continuing with begin");
++  }
++  delay(100);
++  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
++#if CROSSINK_TAILNET_WIFI_FAST_JOIN
++  FastJoin last;
++  if (loadFastJoin(credential.ssid, last)) {
++    LOG_INF("WIFI", "Fast join: channel %u, %02x:%02x:%02x:%02x:%02x:%02x", last.channel, last.bssid[0], last.bssid[1],
++            last.bssid[2], last.bssid[3], last.bssid[4], last.bssid[5]);
++    WiFi.setScanMethod(WIFI_FAST_SCAN);
++    begin(credential, last.channel, last.bssid);
++    if (joined(credential, shouldStop)) return true;
++    if (shouldStop()) {
++      WiFi.disconnect();
++      return false;
++    }
++    LOG_INF("WIFI", "Fast join failed; scanning all channels");
++    WiFi.disconnect(false, false, 1000);
++    delay(100);
++  }
++#endif
++  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
++  begin(credential);
++  if (joined(credential, shouldStop)) return true;
+   WiFi.disconnect();
+   return false;
+ }

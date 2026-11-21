@@ -43,18 +43,41 @@ namespace {
 // WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_DOWNLOAD (a
 // static "Downloading" screen, see tailnet_boot_parks()), BOOKORBIT_HOME_REFRESH,
 // BOOKORBIT_HOME_SHELVES (it fetches, turns WiFi off, then shows the pickers),
-// KOREADER_SYNC and KOREADER_AUTH (on demand, below), and the overlay's own
-// login and BookOrbit authentication boots. (A sync that asks which position to
-// keep is covered by the tick's fallback.) Only these boots run Tailscale on
-// the C3.
-bool parksFor(uint32_t target) {
-  return target == 4 || target == 5 || target == 8 || target == 9 || target == 10 || target == 12 || target == 13 ||
-         target == TAILNET_LOGIN_TARGET || target == TAILNET_BOOKORBIT_AUTH_TARGET;
-}
+// KOREADER_SYNC and KOREADER_AUTH (on demand, below; only in a build with KOReader
+// Sync), and the overlay's own login and BookOrbit authentication boots. (A sync that
+// asks which position to keep is covered by the tick's fallback.) Only these boots run
+// Tailscale on the C3. By name, never by number: CrossInk v2 renumbered them (the
+// BookOrbit ones 8-13 -> 32-37) and gave 8 and 9 to asset downloads and plugins, which
+// never park nor start Tailscale.
+constexpr uint32_t targetValue(NetworkBootTarget target) { return static_cast<uint32_t>(target); }
+constexpr uint32_t CATALOG_TARGET = targetValue(NetworkBootTarget::BOOKORBIT_CATALOG);
 
 // KOReader's server is usually on the internet; Tailscale starts only when the
 // sync resolves a tailnet name or connects to a tailnet address.
-bool onDemand(uint32_t target) { return target == 4 || target == 5; }
+// CrossInk v2 builds without KOReader Sync (CROSSINK_APP_CAP_KOREADER_SYNC=0) still
+// upload to an existing KOReader account: those uploads run in the overlay's own boot.
+bool onDemand(uint32_t target) {
+  if (target == TAILNET_KOREADER_UPLOAD_TARGET) return true;
+#if CROSSINK_APP_CAP_KOREADER_SYNC
+  return target == targetValue(NetworkBootTarget::KOREADER_SYNC) ||
+         target == targetValue(NetworkBootTarget::KOREADER_AUTH);
+#else
+  return false;
+#endif
+}
+
+// The boots that take the parked WiFi buffer tier (TailnetWifiMem.c): every parking
+// boot but the on-demand ones.
+bool parkedTier(uint32_t target) {
+  return target == targetValue(NetworkBootTarget::BOOKORBIT_SYNC) ||
+         target == targetValue(NetworkBootTarget::BOOKORBIT_SLEEP_SYNC) ||
+         target == targetValue(NetworkBootTarget::BOOKORBIT_DOWNLOAD) ||
+         target == targetValue(NetworkBootTarget::BOOKORBIT_HOME_REFRESH) ||
+         target == targetValue(NetworkBootTarget::BOOKORBIT_HOME_SHELVES) || target == TAILNET_LOGIN_TARGET ||
+         target == TAILNET_BOOKORBIT_AUTH_TARGET;
+}
+
+bool parksFor(uint32_t target) { return parkedTier(target) || onDemand(target); }
 
 std::atomic<bool> s_armed{false};
 std::atomic<bool> s_parked{false};
@@ -135,7 +158,7 @@ void restartCatalog(uint32_t flags, const char* why) {
 // error screen shows (Back goes Home). Elsewhere: Home.
 void giveUpOnFramebuffer() {
 #if TAILNET_PARK_DURING_CONNECT
-  if (s_target == 11 && tailnet_lite()) {
+  if (s_target == CATALOG_TARGET && tailnet_lite()) {
     if (!(s_catalog_flags & CATALOG_RECOVERED)) restartCatalog(s_catalog_flags | CATALOG_RECOVERED, "framebuffer lost");
     restartCatalog(s_catalog_flags | CATALOG_RECOVERED | CATALOG_NO_TAILSCALE, "framebuffer lost twice");
   }
@@ -152,7 +175,7 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
 #if TAILNET_PARK_DURING_CONNECT
   const uint32_t flags = s_rtc_magic == CATALOG_RTC_MAGIC ? s_rtc_flags : 0;
   s_rtc_magic = 0;  // consumed: a fresh catalog open starts with none
-  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG: see catalogConnect()
+  if (tailnet_lite() && target == CATALOG_TARGET) {  // see catalogConnect()
     s_catalog_flags = flags;
     s_connect_park = true;
     // Keep a copy of the Home's link (the catalog takes it off the card).
@@ -175,7 +198,7 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
   }
 #endif
 #if TAILNET_PROBE_CATALOG_LIVE
-  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG, screen kept
+  if (tailnet_lite() && target == CATALOG_TARGET) {  // screen kept
     tailnet_probe_permit_unparked();
     return;
   }
@@ -191,6 +214,17 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
 }
 
 extern "C" uint32_t tailnet_network_boot_target(void) { return s_target; }
+
+extern "C" bool tailnet_wifi_parked_boot(uint32_t target) { return parkedTier(target); }
+
+extern "C" bool tailnet_koreader_upload_redirect(void) {
+  if (!tailnet_lite() || !tailnet_enabled() || !tailnet_joined()) return false;
+  return s_target != TAILNET_KOREADER_UPLOAD_TARGET;
+}
+
+extern "C" bool tailnet_boot_runs_tailscale(void) {
+  return tailnet_lite() && tailnet_enabled() && (parksFor(s_target) || s_target == CATALOG_TARGET);
+}
 
 extern "C" bool tailnet_prompt_dropped_network(void) { return s_prompt_dropped.load(); }
 

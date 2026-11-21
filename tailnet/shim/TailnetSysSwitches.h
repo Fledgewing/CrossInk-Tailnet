@@ -75,7 +75,7 @@
 #define CROSSINK_TAILNET_WIFI_FAST_JOIN 0
 #endif
 
-// Live catalog boot (target 11, the C3; ui/TailnetNetPhase.cpp): with usable
+// Live catalog boot (BOOKORBIT_CATALOG, the C3; ui/TailnetNetPhase.cpp): with usable
 // cached control state, connect with the framebuffer kept (no control
 // session, no park); without, park it for the control session and restart
 // into the catalog once the state is cached. Failures end in bounded restarts.

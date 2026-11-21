@@ -1,0 +1,122 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 007b1e7d..954d9541 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -78,6 +78,12 @@
+ #define CROSSINK_TAILNET_CATALOG_BOOT_SESSION 0
+ #endif
+ 
++// TLS arena placement: 1 = best fit (the smallest free block that holds the request),
++// 0 = first fit. Best fit keeps the large free run whole for wolfSSL's record buffers.
++#ifndef CROSSINK_TAILNET_TLS_ARENA_BEST_FIT
++#define CROSSINK_TAILNET_TLS_ARENA_BEST_FIT 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/network/TlsArena.cpp b/src/network/TlsArena.cpp
+index 1290547a..6a61cab3 100644
+--- a/src/network/TlsArena.cpp
++++ b/src/network/TlsArena.cpp
+@@ -45,6 +45,15 @@ size_t s_inUse = 0;
+ size_t s_peak = 0;
+ uint32_t s_liveBlocks = 0;
+ uint32_t s_heapFallbacks = 0;
++// The first spills since the last report: requested bytes, and the arena's free total and
++// largest free block at that moment (full vs fragmented). Logged by tlsArenaLogRequestPeak().
++constexpr int SPILLS_KEPT = 6;
++struct Spill {
++  uint32_t size;
++  uint32_t arenaFree;
++  uint32_t arenaLargest;
++};
++Spill s_spills[SPILLS_KEPT];
+ 
+ bool s_hooksInstalled = false;
+ wolfSSL_Malloc_cb s_prevMalloc = nullptr;
+@@ -58,13 +67,32 @@ bool inArena(const void* ptr) {
+   return s_arena != nullptr && p >= s_arena + HEADER && p < s_arena + ARENA_BYTES;
+ }
+ 
+-// First fit. Under s_lock.
++// The largest free block. Under s_lock.
++size_t largestFree() {
++  size_t largest = 0;
++  for (size_t offset = 0; offset < ARENA_BYTES; offset += blockAt(offset)->size) {
++    const Block* block = blockAt(offset);
++    if (!block->used && block->size > largest) largest = block->size;
++  }
++  return largest > HEADER ? largest - HEADER : 0;
++}
++
++// First fit, or best fit (CROSSINK_TAILNET_TLS_ARENA_BEST_FIT). Under s_lock.
+ void* arenaAlloc(const size_t size) {
+   if (s_arena == nullptr) return nullptr;
+   const size_t need = HEADER + ((size + 7) & ~static_cast<size_t>(7));
+-  for (size_t offset = 0; offset < ARENA_BYTES; offset += blockAt(offset)->size) {
+-    Block* block = blockAt(offset);
+-    if (block->used || block->size < need) continue;
++  Block* block = nullptr;
++  size_t offset = 0;
++  for (size_t at = 0; at < ARENA_BYTES; at += blockAt(at)->size) {
++    Block* candidate = blockAt(at);
++    if (candidate->used || candidate->size < need) continue;
++    if (block == nullptr || candidate->size < block->size) {
++      block = candidate;
++      offset = at;
++    }
++    if (!CROSSINK_TAILNET_TLS_ARENA_BEST_FIT || candidate->size == need) break;
++  }
++  if (block != nullptr) {
+     if (block->size - need >= MIN_SPLIT) {
+       Block* rest = blockAt(offset + need);
+       rest->size = block->size - need;
+@@ -80,6 +108,15 @@ void* arenaAlloc(const size_t size) {
+   return nullptr;
+ }
+ 
++// Records a spill. Under s_lock: no logging here.
++void noteSpill(const size_t size) {
++  if (s_heapFallbacks < SPILLS_KEPT) {
++    s_spills[s_heapFallbacks] = {static_cast<uint32_t>(size), static_cast<uint32_t>(ARENA_BYTES - s_inUse),
++                                 static_cast<uint32_t>(largestFree())};
++  }
++  s_heapFallbacks++;
++}
++
+ // Frees and merges every run of free neighbours. Under s_lock. Returns the arena to hand
+ // back to the heap when a pending release can now complete, else nullptr.
+ uint8_t* arenaFree(void* ptr) {
+@@ -109,7 +146,7 @@ void* hookMalloc(size_t size) {
+   if (size != 0 && s_arena != nullptr && xTaskGetCurrentTaskHandle() == s_requestTask) {
+     portENTER_CRITICAL(&s_lock);
+     void* ptr = arenaAlloc(size);
+-    if (ptr == nullptr && s_arena != nullptr) s_heapFallbacks++;
++    if (ptr == nullptr && s_arena != nullptr) noteSpill(size);
+     portEXIT_CRITICAL(&s_lock);
+     if (ptr != nullptr) return ptr;
+   }
+@@ -229,12 +266,20 @@ void tlsArenaLogRequestPeak(const char* what) {
+   const size_t peak = s_peak;
+   const size_t inUse = s_inUse;
+   const uint32_t fallbacks = s_heapFallbacks;
++  Spill spills[SPILLS_KEPT];
++  memcpy(spills, s_spills, sizeof(spills));
+   s_peak = s_inUse;
+   s_heapFallbacks = 0;
+   portEXIT_CRITICAL(&s_lock);
+   if (!active) return;
+-  LOG_INF("TLS", "TLS arena: peak %u of %u (%s; %u still in use, %u allocations went to the heap)", (unsigned)peak,
+-          (unsigned)ARENA_BYTES, what, (unsigned)inUse, (unsigned)fallbacks);
++  LOG_INF("TLS", "TLS arena: peak %u of %u (%s; %u still in use, %u allocations went to the heap, %s fit)",
++          (unsigned)peak, (unsigned)ARENA_BYTES, what, (unsigned)inUse, (unsigned)fallbacks,
++          CROSSINK_TAILNET_TLS_ARENA_BEST_FIT ? "best" : "first");
++  for (uint32_t i = 0; i < fallbacks && i < static_cast<uint32_t>(SPILLS_KEPT); i++) {
++    LOG_INF("TLS", "TLS arena: spill %u: %u bytes to the heap (arena free %u, largest free block %u)",
++            (unsigned)(i + 1), (unsigned)spills[i].size, (unsigned)spills[i].arenaFree,
++            (unsigned)spills[i].arenaLargest);
++  }
+ }
+ 
+ #elif CROSSINK_TAILNET_TLS_ARENA

@@ -100,7 +100,7 @@ SWITCHES = {
     "TAILNET_WIFI_DYNAMIC_TX":            (4,      0,      0),
     "TAILNET_WIFI_RX_MGMT":               (3,      0,      0),      # RX mgmt buffers 5 -> 3 (0 = keep)
     # Parked tier: boots that park the framebuffer or draw nothing while WiFi is up
-    # (syncs 8/9, download 10, Home refresh/shelves 12/13, login/auth 64/65), ~80-118 KB free.
+    # (BookOrbit syncs, download, Home refresh/shelves, login/auth; by name in TailnetNetPhase.cpp), ~80-118 KB free.
     # All three counts set = the tier is on; AMPDU TX stays off.
     "TAILNET_WIFI_PARKED_STATIC_RX":      (3,      0,      0),
     "TAILNET_WIFI_PARKED_DYNAMIC_RX":     (8,      0,      0),
@@ -181,6 +181,13 @@ def switch_value(name):
 
 
 SWITCH_VALUES = {name: switch_value(name) for name in SWITCHES}
+
+# CrossInk v2 (lib/hal/IpcTaskStack.cpp) links its own __wrap_xTaskCreatePinnedToCore;
+# CrossInk 1.6 does not. Only one wrapper can exist (see TailnetStacks.c).
+upstream_wraps_task_create = any(
+    "--wrap=xTaskCreatePinnedToCore" in str(f)
+    for f in list(env.get("BUILD_FLAGS", [])) + list(env.get("LINKFLAGS", []))  # noqa: F821
+)
 print(f"Tailnet switches for {pioenv} (column {SWITCH_COLUMN}):")
 for _name, _value in SWITCH_VALUES.items():
     _src = " (env override)" if _name in os.environ else ""
@@ -233,6 +240,13 @@ _orig_process_project_deps = env.ProcessProjectDeps  # noqa: F821
 
 def _process_project_deps_with_tailnet(env):
     _orig_process_project_deps()
+    if os.path.basename(env.subst("$PROJECT_SRC_DIR")) == ".dummy":
+        # The framework's lib-builder pass (custom_sdkconfig) links a dummy sketch to
+        # rebuild the ESP-IDF libraries. It has none of CrossInk's libraries (CrossInk v2:
+        # not even Arduino-wolfSSL, which MicroLink's DERP TLS needs), and nothing of
+        # ours belongs in it: no MicroLink, no shim, no link wraps.
+        print("Tailnet overlay: framework lib-builder pass, MicroLink and the shim left out")
+        return
     ml_env = env.Clone()
     ml_env.Append(
         CPPPATH=[os.path.join(ml_dir, "include"), os.path.join(ml_dir, "src"), wg_dir,
@@ -246,6 +260,8 @@ def _process_project_deps_with_tailnet(env):
     # (ml_config.h: 16; 8 on the C3): the reader only needs its servers, and
     # tailnet_ensure_peer() pins one that a large tailnet would otherwise leave out.
     ml_env.Append(CPPDEFINES=ML_DEFINES)
+    if upstream_wraps_task_create:
+        ml_env.Append(CPPDEFINES=[("TAILNET_TASK_STACK_HOOK", 1)])
 
     if derp_wolfssl:
         # ml_derp.c includes wolfSSL; the defines (WOLFSSL_USER_SETTINGS, ...)
@@ -295,9 +311,12 @@ def _process_project_deps_with_tailnet(env):
                           # TailnetWifiMem.c: the WiFi init switches
                           "-Wl,--wrap=esp_wifi_init"])
     if SWITCH_VALUES.get("TAILNET_TASK_STACK_WRAP"):
-        # TailnetStacks.c: task stack sizes by name, and the timer task's
-        env.Append(LINKFLAGS=["-Wl,--wrap=xTaskCreatePinnedToCore",
-                              "-Wl,--wrap=vApplicationGetTimerTaskMemory"])
+        # TailnetStacks.c: task stack sizes by name, and the timer task's. CrossInk v2
+        # wraps xTaskCreatePinnedToCore itself; its wrapper then calls the shim's hooks
+        # (TAILNET_TASK_STACK_HOOK, CrossInk patch 0020) instead of a second wrapper.
+        if not upstream_wraps_task_create:
+            env.Append(LINKFLAGS=["-Wl,--wrap=xTaskCreatePinnedToCore"])
+        env.Append(LINKFLAGS=["-Wl,--wrap=vApplicationGetTimerTaskMemory"])
     if SWITCH_VALUES.get("TAILNET_STACK_LOG"):
         # TailnetStacks.c: the stack report before WiFi goes off
         env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_stop"])

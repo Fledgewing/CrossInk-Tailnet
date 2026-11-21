@@ -209,7 +209,7 @@ void TailnetSettingsActivity::renderMenu(const int top) {
       },
       nullptr, nullptr,
       [this](int i) -> std::string {
-        if (i == ROW_ENABLED) return tailnet_enabled() ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
+        if (i == ROW_ENABLED) return tailnet_enabled() ? tr(STR_ON) : tr(STR_OFF);
         if (i == ROW_RELAY) return relayValue();
         return "";
       });

@@ -1,0 +1,159 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 6eabb941..007b1e7d 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -69,6 +69,15 @@
+ #define CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG 0
+ #endif
+ 
++// BookOrbit catalog boot (BOOKORBIT_CATALOG): one keep-alive connection for the whole
++// boot instead of one per burst. Its wolfSSL session lives in the TLS arena, which is
++// reserved anyway, so every screen after the first reuses it (no handshake with the
++// catalog's UI resident). A connection the server closed is reopened on the next request.
++// Needs CROSSINK_TAILNET_CATALOG_KEEPALIVE.
++#ifndef CROSSINK_TAILNET_CATALOG_BOOT_SESSION
++#define CROSSINK_TAILNET_CATALOG_BOOT_SESSION 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index 1bb1e34a..5a3701f4 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -380,6 +380,7 @@ void BookOrbitCatalogBrowserActivity::onEnter() {
+ 
+ void BookOrbitCatalogBrowserActivity::onExit() {
+   Activity::onExit();
++  BookOrbitCatalogClient::closeBootSession("leaving the catalog");
+   listOptions.reset();
+   entries.clear();
+   BookOrbitDownloadIndex::unload();
+@@ -417,6 +418,8 @@ void BookOrbitCatalogBrowserActivity::onWifiSelectionComplete(const bool connect
+     return;
+   }
+   sdFontSystem.releaseForNetwork(renderer);
++  // The catalog boot (not the download boot): one connection for all its requests.
++  if (networkBoot && !resumeDownload) BookOrbitCatalogClient::openBootSession();
+ #if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
+   if (returnToListing) {
+     returnToListing = false;
+@@ -1379,6 +1382,8 @@ void BookOrbitCatalogBrowserActivity::runPendingDownload(const bool wifiConnecte
+ 
+ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const int64_t fileId,
+                                                    const std::string& finalPath) {
++  // The download runs on its own connection: the kept catalog one would hold the arena.
++  BookOrbitCatalogClient::closeBootSession("book download");
+   // The heap the TLS session starts from: what tells a fragmented session from a
+   // clean download boot in a field log. The version says which build wrote that log.
+   LOG_INF("BookOrbit", "Downloading file %lld -> %s (free=%u maxAlloc=%u, firmware %s)", static_cast<long long>(fileId),
+diff --git a/src/network/BookOrbitCatalogClient.cpp b/src/network/BookOrbitCatalogClient.cpp
+index f3241df8..ff91de1a 100644
+--- a/src/network/BookOrbitCatalogClient.cpp
++++ b/src/network/BookOrbitCatalogClient.cpp
+@@ -88,6 +88,14 @@ struct FileJsonReader {
+ // (SecureHttpClient retries a dead kept socket once, on a fresh connection).
+ std::unique_ptr<freeink::SecureHttpClient> s_catalogConnection;
+ #endif
++#if CROSSINK_TAILNET_CATALOG_BOOT_SESSION && CROSSINK_TAILNET_CATALOG_KEEPALIVE && defined(FREEINK_NET_WOLFSSL)
++#define CATALOG_BOOT_SESSION 1
++// The connection is the boot's (openBootSession()), and the requests it has served.
++bool s_bootSession = false;
++uint32_t s_bootSessionRequests = 0;
++#else
++#define CATALOG_BOOT_SESSION 0
++#endif
+ 
+ // The connection a catalog request runs on: the Session's, or nullptr for a fresh one.
+ freeink::SecureHttpClient* catalogConnection() {
+@@ -129,6 +137,10 @@ bool fetchJson(const std::string& url, const FilterBuilder& buildFilter, JsonDoc
+   // Catalog requests go through HttpDownloader: a fresh wolfSSL session each, no heap
+   // floor. BookOrbitSyncClient's kept session (floors 55000/20000) is not used here.
+   tailnet_probe_window_begin("catalog request (HttpDownloader: fresh wolfSSL TLS, no heap floor)");
++#endif
++#if CATALOG_BOOT_SESSION
++  // A request that made no TCP connect ran on the kept connection.
++  const uint32_t connectsBefore = tailnet_connect_count();
+ #endif
+   for (int attempt = 0; attempt < 2; attempt++) {
+     err = HttpDownloader::downloadToFile(url, TMP_PATH, nullptr, nullptr, "", "", options);
+@@ -138,6 +150,21 @@ bool fetchJson(const std::string& url, const FilterBuilder& buildFilter, JsonDoc
+   }
+   CROSSINK_TAILNET_LOG_STACK("after a catalog fetch");
+   CROSSINK_TAILNET_TLS_ARENA_LOG("catalog request");
++#if CATALOG_BOOT_SESSION
++  if (s_bootSession && err == HttpDownloader::OK) {
++    const uint32_t connects = tailnet_connect_count() - connectsBefore;
++    if (connects == 0) {
++      s_bootSessionRequests++;
++      LOG_INF("BookOrbit", "Catalog connection reused (%u requests)", static_cast<unsigned>(s_bootSessionRequests));
++    } else {
++      LOG_INF("BookOrbit", "Catalog connection reconnected (%s; %u connects)",
++              s_bootSessionRequests == 0 ? "first request of the boot"
++                                         : "the kept one was closed: server idle timeout or a failed request",
++              static_cast<unsigned>(connects));
++      s_bootSessionRequests = 1;
++    }
++  }
++#endif
+   if (err != HttpDownloader::OK) {
+     // The server was reachable but didn't serve this path: 404/405 = endpoint missing
+     // (BookOrbit version without the KOReader catalog API, or wrong server URL); a
+@@ -239,6 +266,37 @@ BookOrbitCatalogClient::Session::Session() {}
+ BookOrbitCatalogClient::Session::~Session() {}
+ #endif
+ 
++#if CATALOG_BOOT_SESSION
++void BookOrbitCatalogClient::openBootSession() {
++  if (s_bootSession) return;
++  if (!s_catalogConnection) {
++    s_catalogConnection = makeUniqueNoThrow<freeink::SecureHttpClient>();
++    if (!s_catalogConnection) {
++      LOG_ERR("BookOrbit", "Catalog boot connection allocation failed; requests open their own");
++      return;
++    }
++    s_catalogConnection->setReuse(true);
++  }
++  s_bootSession = true;
++  s_bootSessionRequests = 0;
++  LOG_INF("BookOrbit", "Catalog boot session open: every request of this boot shares one TLS connection");
++}
++
++void BookOrbitCatalogClient::closeBootSession(const char* why) {
++  if (!s_bootSession) return;
++  s_bootSession = false;
++  if (s_catalogConnection) {
++    s_catalogConnection->end();
++    s_catalogConnection.reset();
++  }
++  LOG_INF("BookOrbit", "Catalog boot session closed (%s) after %u requests on its last connection", why,
++          static_cast<unsigned>(s_bootSessionRequests));
++}
++#else
++void BookOrbitCatalogClient::openBootSession() {}
++void BookOrbitCatalogClient::closeBootSession(const char*) {}
++#endif
++
+ bool BookOrbitCatalogClient::fetchRootSections(std::vector<BookOrbitCatalogSection>& outSections) {
+   outSections.clear();
+   if (!BOOKORBIT_STORE.hasCredentials()) return false;
+diff --git a/src/network/BookOrbitCatalogClient.h b/src/network/BookOrbitCatalogClient.h
+index 81a5969e..a8e9d68e 100644
+--- a/src/network/BookOrbitCatalogClient.h
++++ b/src/network/BookOrbitCatalogClient.h
+@@ -162,6 +162,14 @@ class BookOrbitCatalogClient {
+     bool owner_ = false;
+   };
+ 
++  /**
++   * CROSSINK_TAILNET_CATALOG_BOOT_SESSION: the catalog boot's own connection, kept from
++   * Wi-Fi up until it closes (leaving the catalog, or before a book download, which runs
++   * on its own connection). Sessions opened meanwhile share it. No-op without the switch.
++   */
++  static void openBootSession();
++  static void closeBootSession(const char* why);
++
+   /** Fetch the catalog root sections list. Returns false on any failure. */
+   static bool fetchRootSections(std::vector<BookOrbitCatalogSection>& outSections);
+ 

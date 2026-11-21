@@ -5,7 +5,8 @@
 #   platformio.local.ini  (copied from overlay/)
 #   tailnet               (symlink to this repo's tailnet/, excluded via .git/info/exclude)
 #   src/tailnet           (symlink to tailnet/ui, built with CrossInk's own sources)
-# and applies overlay/patches/*.patch (the Settings row; on the C3, the
+# and applies the patch series for its CrossInk version (overlay/patches/v2.0 or
+# v1.6; the Settings row; on the C3, the
 # framebuffer freed while Tailscale runs: TailnetNetPhase.h). MicroLink's changes
 # live on the crossink branch of the Fledgewing/microlink fork (the submodule).
 # A patch that no longer applies stops here with an error: that is the one
@@ -48,7 +49,29 @@ for p in /tailnet /src/tailnet; do
   grep -qx "$p" "$exclude" 2>/dev/null || echo "$p" >> "$exclude"
 done
 
-for patch in "$overlay"/overlay/patches/*.patch; do
+# One patch series per upstream line: overlay/patches/v2.0/ for CrossInk 2.x,
+# overlay/patches/v1.6/ for everything older (until it exists, the 1.6 series is
+# the top-level overlay/patches/*.patch). The version comes from the checkout's
+# [crossink] version (what its build reports), else its tag.
+version="$(awk '/^\[crossink\]/{f=1;next} /^\[/{f=0} f&&/^version *=/{sub(/^version *= */,"");print;exit}' \
+  "$target/platformio.ini")"
+[ -n "$version" ] || version="$(git -C "$target" describe --tags --abbrev=0 2>/dev/null || true)"
+version="${version#v}"
+major="${version%%.*}"
+case "$major" in
+  ''|*[!0-9]*) echo "cannot tell the CrossInk version of $target (got '$version')" >&2; exit 1 ;;
+esac
+if [ "$major" -ge 2 ]; then
+  series="$overlay/overlay/patches/v2.0"
+elif ls "$overlay"/overlay/patches/v1.6/*.patch >/dev/null 2>&1; then
+  series="$overlay/overlay/patches/v1.6"
+else
+  series="$overlay/overlay/patches"
+fi
+ls "$series"/*.patch >/dev/null 2>&1 || { echo "no patches for CrossInk $version in $series" >&2; exit 1; }
+echo "CrossInk $version: patches from ${series#"$overlay"/}"
+
+for patch in "$series"/*.patch; do
   [ -e "$patch" ] || continue
   if git -C "$target" apply --reverse --check "$patch" 2>/dev/null; then
     continue  # already applied

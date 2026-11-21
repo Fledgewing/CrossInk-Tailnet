@@ -75,7 +75,7 @@ void TailnetBookOrbitAuthActivity::run() {
   }
   if (!wifi) {
     state = State::Failed;
-    errorMessage = tr(STR_WIFI_CONN_FAILED);
+    errorMessage = tr(STR_CONNECTION_FAILED);
   } else if (result == BookOrbitSyncClient::OK) {
     state = State::Success;
   } else {
