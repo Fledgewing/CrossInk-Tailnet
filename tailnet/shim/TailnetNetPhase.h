@@ -73,6 +73,24 @@ bool tailnet_display_ready(uint32_t timeout_ms);
 bool tailnet_display_park(void) __attribute__((weak));
 void tailnet_display_unpark(void) __attribute__((weak));
 
+// Live catalog connect (TAILNET_PARK_DURING_CONNECT, ui/TailnetNetPhase.cpp):
+// starts Tailscale, and the worker decides how. Usable cached control state:
+// no control session, the framebuffer kept (TAILNET_CATALOG_CACHED). Otherwise,
+// if allow_control, the framebuffer is parked for a full control session
+// (TAILNET_CATALOG_CONTROL; the caller then restarts the boot rather than
+// taking the framebuffer back on a fragmented heap); else nothing starts
+// (TAILNET_CATALOG_REFUSED).
+enum { TAILNET_CATALOG_NONE = 0, TAILNET_CATALOG_ALLOW_CONTROL = 1, TAILNET_CATALOG_CACHED_ONLY = 2 };
+enum {
+  TAILNET_CATALOG_PENDING = 0,
+  TAILNET_CATALOG_CACHED = 1,
+  TAILNET_CATALOG_CONTROL = 2,
+  TAILNET_CATALOG_REFUSED = 3,
+  TAILNET_CATALOG_FAILED = 4,
+};
+void tailnet_catalog_connect(bool allow_control);
+int tailnet_catalog_result(void);
+
 #ifdef __cplusplus
 }
 #endif

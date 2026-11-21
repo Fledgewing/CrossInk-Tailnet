@@ -21,6 +21,7 @@
 #include <Logging.h>
 
 #include <atomic>
+#include <new>
 
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
@@ -28,6 +29,9 @@
 #include "components/UITheme.h"
 #include "Tailnet.h"
 #include "TailnetSysSwitches.h"
+#include "SilentRestart.h"
+#include "activities/browser/BookOrbitCatalogLink.h"
+#include "activities/browser/BookOrbitCatalogListCache.h"
 #include "network/SavedWifiConnect.h"
 
 extern GfxRenderer renderer;  // main.cpp
@@ -58,18 +62,34 @@ std::atomic<bool> s_pending{false};   // a render was skipped
 uint32_t s_last_tick = 0;             // main task only
 uint32_t s_idle_since = 0;
 bool s_escalated = false;
-// TAILNET_PARK_DURING_CONNECT: the live catalog boot parks only while
-// Tailscale connects (tailnet_wifi_joined()).
+// TAILNET_PARK_DURING_CONNECT: the live catalog boot may park while a control
+// session runs (tailnet_wifi_joined(), catalogConnect()).
 std::atomic<bool> s_connect_park{false};
+uint32_t s_target = 0;                   // this boot's NetworkBootTarget value
+std::atomic<uint32_t> s_down_since{0};   // millis() when WiFi went down while parked
+std::atomic<bool> s_restarting{false};   // a restart is under way: draw nothing
+// No screen can come back within this long after the network went down while
+// the framebuffer is parked: restart instead of waiting forever.
+constexpr uint32_t UNPARK_GIVE_UP_MS = 15000;
+
+// The live catalog's restarts (TAILNET_PARK_DURING_CONNECT), carried across a
+// silent restart into BOOKORBIT_CATALOG and consumed by the next
+// tailnet_network_phase_begin(). Each restart kind happens at most once per
+// catalog open, so the sequence is bounded.
+RTC_NOINIT_ATTR uint32_t s_rtc_magic;
+RTC_NOINIT_ATTR uint32_t s_rtc_flags;
+constexpr uint32_t CATALOG_RTC_MAGIC = 0x7A1C0A11u;
+constexpr uint32_t CATALOG_AFTER_CONTROL = 1u << 0;  // the last boot ran the control session and cached its state
+constexpr uint32_t CATALOG_RECOVERED = 1u << 1;      // the last boot failed and restarted once
+constexpr uint32_t CATALOG_NO_TAILSCALE = 1u << 2;   // two failures: no Tailscale; the catalog shows its error
+uint32_t s_catalog_flags = 0;                        // this boot's
+// The link the BookOrbit Home opened the catalog with: the catalog takes it off
+// the SD card, so a restart puts it back.
+BookOrbitCatalogLink* s_entry_link = nullptr;
 
 // Caller holds the RenderLock.
 bool unparkLocked() {
   if (!s_parked.load()) return true;
-#if TAILNET_PARK_DURING_CONNECT
-  // The hole's placeholder (tailnet_display_park) must go first, whichever
-  // path brings the framebuffer back (no-op when nothing is held).
-  tailnet_hold_release();
-#endif
   if (!display.reallocFrameBuffer()) {
     LOG_ERR("TNET", "Framebuffer not back yet: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     return false;
@@ -80,12 +100,56 @@ bool unparkLocked() {
   return true;
 }
 
+void dropEntryLink() {
+  delete s_entry_link;
+  s_entry_link = nullptr;
+}
+
+// Restarts into the live catalog with `flags` for the next boot. Does not return.
+void restartCatalog(uint32_t flags, const char* why) {
+  LOG_INF("TNET", "Live catalog: restarting into the catalog (%s; flags %lu)", why, static_cast<unsigned long>(flags));
+  if (s_entry_link) BookOrbitCatalogListCache::saveEntryLink(*s_entry_link);
+  s_rtc_flags = flags;
+  s_rtc_magic = CATALOG_RTC_MAGIC;
+  s_restarting = true;
+  silentRestartToNetwork(NetworkBootTarget::BOOKORBIT_CATALOG);
+  ESP.restart();  // not reached (silentRestartToNetwork returns only while entering deep sleep)
+}
+
+// The framebuffer cannot come back. In the live catalog: one restart into it
+// (a fresh heap), then one more without Tailscale, where the catalog's own
+// error screen shows (Back goes Home). Elsewhere: Home.
+void giveUpOnFramebuffer() {
+#if TAILNET_PARK_DURING_CONNECT
+  if (s_target == 11 && tailnet_lite()) {
+    if (!(s_catalog_flags & CATALOG_RECOVERED)) restartCatalog(s_catalog_flags | CATALOG_RECOVERED, "framebuffer lost");
+    restartCatalog(s_catalog_flags | CATALOG_RECOVERED | CATALOG_NO_TAILSCALE, "framebuffer lost twice");
+  }
+#endif
+  s_restarting = true;
+  silentRestart();
+  ESP.restart();
+}
+
 }  // namespace
 
 extern "C" void tailnet_network_phase_begin(uint32_t target) {
+  s_target = target;
 #if TAILNET_PARK_DURING_CONNECT
-  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG: see connectParked()
+  const uint32_t flags = s_rtc_magic == CATALOG_RTC_MAGIC ? s_rtc_flags : 0;
+  s_rtc_magic = 0;  // consumed: a fresh catalog open starts with none
+  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG: see catalogConnect()
+    s_catalog_flags = flags;
     s_connect_park = true;
+    // Keep a copy of the Home's link (the catalog takes it off the card).
+    BookOrbitCatalogLink link;
+    if (BookOrbitCatalogListCache::takeEntryLink(link)) {
+      BookOrbitCatalogListCache::saveEntryLink(link);
+      s_entry_link = new (std::nothrow) BookOrbitCatalogLink(std::move(link));
+    }
+    LOG_INF("TNET", "Live catalog boot: flags %lu (after control %d, recovered %d, no Tailscale %d)",
+            static_cast<unsigned long>(flags), (flags & CATALOG_AFTER_CONTROL) != 0, (flags & CATALOG_RECOVERED) != 0,
+            (flags & CATALOG_NO_TAILSCALE) != 0);
     return;
   }
 #endif
@@ -128,35 +192,17 @@ extern "C" bool tailnet_display_park(void) {
   display.releaseFrameBuffer();
   renderer.releaseFrameBufferForBuild();  // nothing left to lend: just clears the renderer's pointer
   s_net_down = false;
+  s_down_since = 0;
   s_escalated = false;
   s_parked = true;
   LOG_INF("TNET", "Framebuffer parked for Tailscale: free %u -> %u maxAlloc=%u", before, ESP.getFreeHeap(),
           ESP.getMaxAllocHeap());
-#if TAILNET_PARK_DURING_CONNECT
-  if (s_connect_park.load()) {
-    // The framebuffer must come back in one block while Tailscale stays up, so
-    // nothing long-lived may settle in its hole. Fill the hole again while
-    // MicroLink allocates its context and tunnel task; the hold is freed just
-    // before the control session's task (ml_coord) is created, so only the
-    // control session's transient buffers use it (TailnetStacks.c). A cached
-    // start (ML_LITE_CACHED_START) creates no ml_coord: connectParked() frees
-    // the hold once Tailscale is ready, before the framebuffer comes back. The
-    // TLS arena (CROSSINK_TAILNET_TLS_ARENA) was reserved at WiFi join, before
-    // this park, so it never sits in the hole.
-    const uint32_t freed = ESP.getFreeHeap() - before;
-    void* hold = freed > 64 ? heap_caps_malloc(freed - 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : nullptr;
-    LOG_INF("TNET", "Framebuffer hole %s (%u bytes) until the control session starts: free=%u maxAlloc=%u",
-            hold ? "held" : "NOT held", static_cast<unsigned>(freed > 64 ? freed - 64 : 0), ESP.getFreeHeap(),
-            ESP.getMaxAllocHeap());
-    if (hold) tailnet_hold_until_task(hold, "ml_coord");
-  }
-#endif
   return true;
 }
 
 extern "C" void tailnet_display_unpark(void) {
   if (!s_parked.load()) return;
-  s_net_down = true;
+  if (!s_net_down.exchange(true)) s_down_since = millis() | 1u;
   bool back;
   {
     RenderLock lock;
@@ -177,6 +223,16 @@ extern "C" void tailnet_display_tick(void) {
   const uint32_t now = millis();
   if (now - s_last_tick > 250) s_idle_since = now;  // the main task was busy in between
   s_last_tick = now;
+  if (s_net_down.load()) {
+    const uint32_t since = s_down_since.load();
+    if (since && now - since >= UNPARK_GIVE_UP_MS) {
+      // Never hang on a parked framebuffer: the heap cannot give it back.
+      LOG_ERR("TNET", "Framebuffer not back %lu ms after the network went down (free=%u maxAlloc=%u); restarting",
+              static_cast<unsigned long>(now - since), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      giveUpOnFramebuffer();
+      return;
+    }
+  }
   if (!s_pending.load()) return;
   if (s_net_down.load()) {
     if (now - s_idle_since >= 250) {
@@ -193,6 +249,7 @@ extern "C" void tailnet_display_tick(void) {
 }
 
 extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
+  if (s_restarting.load()) return !s_parked.load();  // a restart's popup: never wait for it
   const uint32_t start = millis();
   while (s_parked.load()) {
     if (s_net_down.load()) {
@@ -210,44 +267,68 @@ extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
 
 #if TAILNET_PARK_DURING_CONNECT
 namespace {
-// The live catalog boot on the C3: with the framebuffer kept, the control
-// session takes the heap down to ~4 KB and leaves it fragmented. The panel
-// keeps its image unpowered, so: draw a notice, park the framebuffer while
-// Tailscale connects, then take it back before the catalog draws.
-void connectParked() {
+// The live catalog boot on the C3. A control session with the framebuffer kept
+// takes the heap down to ~4 KB, and one run parked leaves long-lived blocks in
+// the framebuffer's hole, so the framebuffer never comes back in one piece. So:
+//  - usable cached control state: no control session at all and no park; the
+//    catalog runs on the same heap the probe measured (the shim's decision);
+//  - otherwise: park, run the full control session, and restart into the
+//    catalog once its state is cached: the next boot takes the cached path on
+//    a clean heap. Never a second control session in a row.
+// Every failure ends in a bounded restart (giveUpOnFramebuffer()) or, with the
+// framebuffer kept, in the catalog's own error screen with the network off, so
+// its requests fail at once.
+void catalogConnect() {
+  const uint32_t flags = s_catalog_flags;
   if (!tailnet_enabled() || !tailnet_joined()) {
     s_connect_park = false;  // no Tailscale in this boot
+    dropEntryLink();
+    return;
+  }
+  if (flags & CATALOG_NO_TAILSCALE) {
+    LOG_ERR("TNET", "Live catalog: Tailscale failed twice; not starting it (the catalog shows its error)");
+    s_connect_park = false;
+    dropEntryLink();
+    SavedWifiConnect::disconnect();  // requests fail at once
     return;
   }
   {
     RenderLock lock;
     if (renderer.hasFrameBuffer()) GUI.drawPopup(renderer, "Connecting to Tailscale...");
   }
-  LOG_INF("TNET", "Live catalog: before park: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  tailnet_permit_start(false);  // the worker parks the framebuffer, then starts MicroLink
+  LOG_INF("TNET", "Live catalog: connecting: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  // A control session right after one would only repeat what failed.
+  tailnet_catalog_connect(!(flags & CATALOG_AFTER_CONTROL));
   const bool ready = tailnet_wait_ready(20000);
-  tailnet_hold_release();  // if the control session never started
+  const int result = tailnet_catalog_result();
   if (tailnet_status() == TAILNET_CONNECTED) tailnet_stack_report("Tailscale ready");
-  LOG_INF("TNET", "Live catalog: after connect (%s): free=%u maxAlloc=%u", ready ? "ready" : "not ready",
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  bool back;
-  {
-    RenderLock lock;
-    back = unparkLocked();  // logs "Framebuffer back: free maxAlloc"
+  LOG_INF("TNET", "Live catalog: %s (result %d, %s): free=%u maxAlloc=%u",
+          result == TAILNET_CATALOG_CACHED    ? "cached start"
+          : result == TAILNET_CATALOG_CONTROL ? "control session, parked"
+          : result == TAILNET_CATALOG_REFUSED ? "refused (no usable cached state)"
+                                              : "not started",
+          result, ready && tailnet_status() == TAILNET_CONNECTED ? "ready" : "not ready", ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
+  if (result == TAILNET_CATALOG_CONTROL || s_parked.load()) {
+    // Never take the framebuffer back on the heap a control session left.
+    tailnet_wait_idle(10000);  // the session's NVS writes finish first
+    restartCatalog(flags | CATALOG_AFTER_CONTROL,
+                   tailnet_status() == TAILNET_CONNECTED ? "control state cached" : "control session did not finish");
   }
-  if (back) {
-    s_connect_park = false;
-    tailnet_probe_permit_unparked();  // a MicroLink restart from here on keeps the framebuffer
-    if (s_pending.exchange(false)) activityManager.requestUpdate(true);
+  s_connect_park = false;
+  if (result == TAILNET_CATALOG_CACHED && ready && tailnet_status() == TAILNET_CONNECTED) {
+    dropEntryLink();
     return;
   }
-  // No 52 KB block with Tailscale up: WiFi off, the worker stops MicroLink and
-  // the framebuffer comes back; the catalog's fetch then fails and shows its
-  // error screen (Back goes Home).
-  LOG_ERR("TNET", "Live catalog: no room for the framebuffer with Tailscale up; turning WiFi off");
+  // The cached state did not work (MicroLink erased it) or nothing started. A
+  // restart can run the control session parked, once; otherwise the catalog
+  // shows its error with the network off.
+  if (!(flags & (CATALOG_AFTER_CONTROL | CATALOG_RECOVERED))) {
+    restartCatalog(flags | CATALOG_RECOVERED, "cached start failed");
+  }
+  LOG_ERR("TNET", "Live catalog: no Tailscale this boot; turning WiFi off so requests fail at once");
+  dropEntryLink();
   SavedWifiConnect::disconnect();
-  if (!tailnet_display_ready(10000)) LOG_ERR("TNET", "Framebuffer still parked after the network was turned off");
-  s_connect_park = false;
 }
 }  // namespace
 #endif
@@ -256,7 +337,7 @@ extern "C" void tailnet_wifi_joined(void) {
   tailnet_stack_report("WiFi joined");  // TailnetStacks.c (TAILNET_STACK_LOG)
 #if TAILNET_PARK_DURING_CONNECT
   if (s_connect_park.load()) {
-    connectParked();
+    catalogConnect();
     return;
   }
 #endif

@@ -96,6 +96,9 @@ std::atomic<bool> s_permit{false};
 std::atomic<bool> s_register_only{false};  // the login boot: register, nothing more
 std::atomic<bool> s_on_demand{false};      // start at the first tailnet name or address, not at GOT_IP
 std::atomic<bool> s_unparked{false};       // catalog probe: run with the framebuffer kept
+// Live catalog connect (tailnet_catalog_connect()): the worker's decision at start.
+std::atomic<int> s_catalog_mode{TAILNET_CATALOG_NONE};
+std::atomic<int> s_catalog_result{TAILNET_CATALOG_PENDING};
 std::atomic<bool> s_low_memory{false};     // stopped for memory this WiFi session (written by the worker)
 // Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
 // stop working well before 0, and a session would only spin retries.
@@ -354,44 +357,96 @@ void storePin(uint32_t ip) {
   s_pin_loaded = true;
 }
 
-void startMl() {
-  if (s_running) return;
-#if CONFIG_ML_LITE
-  // TailnetNetPhase.h: hand the display's framebuffer to the heap first. The
-  // C3 cannot hold both, so no framebuffer parked, no MicroLink.
-  if (s_unparked.load()) {
-    TLOGI("Catalog probe: starting with the framebuffer kept");
-  } else if (!tailnet_display_park || !tailnet_display_park()) {
-    TLOGW("Not starting: the display framebuffer could not be parked");
-    return;
-  }
-  microlink_control_register_only(s_register_only.load());
-  TLOGI("Starting%s (internal heap free %u, largest %u)", s_register_only.load() ? " for login" : "",
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-#endif
+bool initMl() {
+  if (s_ml) return true;
+  microlink_config_t cfg = {};
+  cfg.auth_key = nullptr;     // interactive login; nothing secret in the image
+  cfg.device_name = nullptr;  // esp32-<mac>; rename it in the admin console
+  s_ml = microlink_init(&cfg);
   if (!s_ml) {
-    microlink_config_t cfg = {};
-    cfg.auth_key = nullptr;     // interactive login; nothing secret in the image
-    cfg.device_name = nullptr;  // esp32-<mac>; rename it in the admin console
-    s_ml = microlink_init(&cfg);
-    if (!s_ml) {
-      TLOGE("microlink_init failed (free heap %u)", (unsigned)esp_get_free_heap_size());
-      setStatus(TAILNET_FAILED);
-      return;
-    }
-    microlink_set_state_callback(s_ml, onState, nullptr);
+    TLOGE("microlink_init failed (free heap %u)", (unsigned)esp_get_free_heap_size());
+    setStatus(TAILNET_FAILED);
+    return false;
   }
-  // The control plane only resends a dropped peer on a fresh map, so the pin
-  // is (re)applied on every start.
+  microlink_set_state_callback(s_ml, onState, nullptr);
+  return true;
+}
+
+// Settings applied before every start. The control plane only resends a
+// dropped peer on a fresh map, so the pin is (re)applied each time.
+void prepareMl(bool control_fallback) {
   tailnet_ml_set_priority_peer(s_ml, loadPin());
   tailnet_ml_set_forced_region(s_ml, forcedRegion());
 #if CONFIG_ML_LITE
+  microlink_control_register_only(s_register_only.load());
   // Skip the control session when the state the last one left is still good
   // (MicroLink's ML_LITE_CACHED_START): it needs the server this reader talks
   // to in the peer cache. A control session as fallback may start by itself
   // only with the framebuffer parked: with it kept (catalog) there is no room.
-  microlink_cached_start_peer(s_ml, serverIp(), !s_unparked.load());
+  microlink_cached_start_peer(s_ml, serverIp(), control_fallback);
+#else
+  (void)control_fallback;
+#endif
+}
+
+#if CONFIG_ML_LITE
+// A start with the framebuffer kept (the live catalog, the catalog probe), or
+// a live catalog connect that may park it. Never a control session with the
+// framebuffer kept: without usable cached state, the catalog connect parks
+// (TAILNET_CATALOG_ALLOW_CONTROL) and anything else does not start.
+bool startKeptOrCatalog(int catalog) {
+  if (!initMl()) {
+    if (catalog) s_catalog_result = TAILNET_CATALOG_FAILED;
+    s_permit = false;
+    return false;
+  }
+  prepareMl(false);
+  if (microlink_control_cache_usable(s_ml)) {
+    s_unparked = true;
+    if (catalog) s_catalog_result = TAILNET_CATALOG_CACHED;
+    TLOGI("Starting on cached state with the framebuffer kept (internal heap free %u, largest %u)",
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return true;
+  }
+  if (catalog == TAILNET_CATALOG_ALLOW_CONTROL && !s_unparked.load() && tailnet_display_park &&
+      tailnet_display_park()) {
+    s_catalog_result = TAILNET_CATALOG_CONTROL;
+    TLOGI("No usable cached state: control session with the framebuffer parked (internal heap free %u, largest %u)",
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return true;
+  }
+  TLOGW("Not starting: no usable cached state, and no control session with the framebuffer kept");
+  if (catalog) s_catalog_result = TAILNET_CATALOG_REFUSED;
+  s_permit = false;  // no retry this boot: reconcile() would ask again every second
+  setStatus(TAILNET_FAILED);
+  return false;
+}
+#endif
+
+void startMl() {
+  if (s_running) return;
+#if CONFIG_ML_LITE
+  const int catalog = s_catalog_mode.exchange(TAILNET_CATALOG_NONE);
+  if (catalog != TAILNET_CATALOG_NONE || s_unparked.load()) {
+    if (!startKeptOrCatalog(catalog)) return;
+  } else {
+    // TailnetNetPhase.h: hand the display's framebuffer to the heap first. The
+    // C3 cannot hold both, so no framebuffer parked, no MicroLink.
+    if (!tailnet_display_park || !tailnet_display_park()) {
+      TLOGW("Not starting: the display framebuffer could not be parked");
+      return;
+    }
+    TLOGI("Starting%s (internal heap free %u, largest %u)", s_register_only.load() ? " for login" : "",
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (!initMl()) return;
+    prepareMl(true);
+  }
+#else
+  if (!initMl()) return;
+  prepareMl(true);
 #endif
   setStatus(TAILNET_STARTING);
   const esp_err_t err = microlink_start(s_ml);
@@ -893,6 +948,24 @@ extern "C" void tailnet_probe_permit_unparked(void) {
 #if CONFIG_ML_LITE
   s_unparked = true;
   tailnet_permit_start(false);
+#endif
+}
+
+extern "C" void tailnet_catalog_connect(bool allow_control) {
+#if CONFIG_ML_LITE
+  s_catalog_result = TAILNET_CATALOG_PENDING;
+  s_catalog_mode = allow_control ? TAILNET_CATALOG_ALLOW_CONTROL : TAILNET_CATALOG_CACHED_ONLY;
+  tailnet_permit_start(false);
+#else
+  (void)allow_control;
+#endif
+}
+
+extern "C" int tailnet_catalog_result(void) {
+#if CONFIG_ML_LITE
+  return s_catalog_result.load();
+#else
+  return TAILNET_CATALOG_FAILED;
 #endif
 }
 

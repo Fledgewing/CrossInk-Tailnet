@@ -74,6 +74,15 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
 }
 
 extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t namelen) {
+  if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in) &&
+      reinterpret_cast<const struct sockaddr_in*>(name)->sin_addr.s_addr == 0) {
+    // 0.0.0.0: the name did not resolve (e.g. the network was turned off).
+    // lwIP would wait out the whole connect timeout (~14 s) for nothing.
+    tailnet_log_emit("W (%lu) tailnet: connect 0.0.0.0 refused at once (name not resolved)\n",
+                     (unsigned long)esp_log_timestamp());
+    errno = EHOSTUNREACH;
+    return -1;
+  }
   if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in) && tailnet_enabled()) {
     const auto* sin = reinterpret_cast<const struct sockaddr_in*>(name);
     const uint32_t ip = lwip_ntohl(sin->sin_addr.s_addr);
@@ -84,9 +93,10 @@ extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t
     tailnet_log_emit("W (%lu) tailnet: connect %u.%u.%u.%u:%u%s\n",
                   (unsigned long)esp_log_timestamp(), (unsigned)(ip >> 24) & 0xff, (unsigned)(ip >> 16) & 0xff,
                   (unsigned)(ip >> 8) & 0xff, (unsigned)ip & 0xff, port, isTailnetAddr(ip) ? " (tailnet)" : "");
-    if (isTailnetAddr(ip) && !tailnet_ensure_peer(ip, WAIT_MS) && tailnet_status() == TAILNET_CONNECTED) {
-      // Connected, but this address is not a peer: MicroLink would drop the
-      // packets and the caller would wait out its whole timeout. Fail now.
+    if (isTailnetAddr(ip) && !tailnet_ensure_peer(ip, WAIT_MS)) {
+      // Connected but not a peer (MicroLink would drop the packets), or
+      // Tailscale is not up in this boot (the packets would go out over WiFi
+      // to nowhere): the caller would wait out its whole timeout. Fail now.
       errno = EHOSTUNREACH;
       return -1;
     }

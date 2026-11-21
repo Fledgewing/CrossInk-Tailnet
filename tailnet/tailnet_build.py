@@ -80,7 +80,7 @@ SWITCHES = {
     # --- System (shim/TailnetSysSwitches.h). Stack sizes are bytes, 0 = the framework's
     # own size; the proposed C3 size is in each comment, to set from the X3's stack report.
     "TAILNET_STACK_LOG":                  (1,      0,      0),      # measurement: task stack report
-    "TAILNET_TASK_STACK_WRAP":            (1,      0,      0),      # links the size table below (and the hole hold)
+    "TAILNET_TASK_STACK_WRAP":            (1,      0,      0),      # links the size table below
     "TAILNET_STACK_ESP_TIMER":            (0,      0,      0),      # 4096 -> 4096 proposed (measure)
     "TAILNET_STACK_TCPIP":                (0,      0,      0),      # 4096 -> 3072 proposed
     "TAILNET_STACK_ARDUINO_EVENTS":       (0,      0,      0),      # 4096 -> 2560 proposed
@@ -99,7 +99,7 @@ SWITCHES = {
     "TAILNET_WIFI_ALLOC_COUNT":           (0,      0,      0),      # measurement: WiFi driver heap totals
     # --- Network boots (ui/TailnetNetPhase.cpp)
     "TAILNET_PROBE_CATALOG_LIVE":         (1,      None,   None),   # Tailscale in the catalog boot, screen kept
-    "TAILNET_PARK_DURING_CONNECT":        (1,      0,      0),      # live catalog: framebuffer parked while Tailscale connects
+    "TAILNET_PARK_DURING_CONNECT":        (1,      0,      0),      # live catalog: cached start kept, else control parked + restart
     # --- CrossInk patches 0004 (memory cuts, include/CrossInkTailnetCuts.h) and 0005 (WiFi join).
     # BookOrbit sync: a new TLS session needs this much free heap (0 = upstream's 55000)...
     "CROSSINK_TAILNET_SYNC_TLS_FLOOR":    (35000,  35000,  35000),

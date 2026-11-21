@@ -67,27 +67,6 @@ __attribute__((unused)) static uint32_t lookupSize(const char* name, uint32_t* r
 }
 #endif
 
-// A heap block held until a named task is about to be created (see
-// tailnet_hold_until_task in TailnetSysSwitches.h).
-static void* s_hold;
-static const char* s_hold_task;
-
-void tailnet_hold_release(void) {
-  void* block = __atomic_exchange_n(&s_hold, NULL, __ATOMIC_ACQ_REL);
-  free(block);
-}
-
-void tailnet_hold_until_task(void* block, const char* task) {
-#if TAILNET_TASK_STACK_WRAP
-  s_hold_task = task;
-  void* old = __atomic_exchange_n(&s_hold, block, __ATOMIC_ACQ_REL);
-  free(old);
-#else
-  (void)task;
-  free(block);  // no hook to wait for
-#endif
-}
-
 #if TAILNET_TASK_STACK_WRAP
 
 static uint32_t sizeFor(const char* name, uint32_t requested) {
@@ -116,9 +95,6 @@ BaseType_t __wrap_xTaskCreatePinnedToCore(TaskFunction_t fn, const char* const n
                                           void* const arg, UBaseType_t prio, TaskHandle_t* const handle,
                                           const BaseType_t core) {
   const uint32_t size = sizeFor(name, stack);
-  if (name && s_hold_task && __atomic_load_n(&s_hold, __ATOMIC_ACQUIRE) && strcmp(name, s_hold_task) == 0) {
-    tailnet_hold_release();
-  }
   const BaseType_t ret = __real_xTaskCreatePinnedToCore(fn, name, size, arg, prio, handle, core);
   if (ret == pdPASS) recordSize(name, stack, size);
   return ret;
