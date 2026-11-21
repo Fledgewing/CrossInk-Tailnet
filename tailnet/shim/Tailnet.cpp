@@ -49,7 +49,7 @@ const char* NVS_KEY_RELAY_FIXED = "relay_rgn";  // region picked by the user
 const char* NVS_KEY_SERVER_RGN = "srv_rgn";     // learned home region of the server
 const char* NVS_KEY_SERVER_IP = "srv_ip";       // tailnet address last connected to
 
-enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, REQ_REPIN, REQ_RELAY };
+enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, REQ_REPIN, REQ_RELAY, REQ_REFRESH };
 
 QueueHandle_t s_queue = nullptr;
 microlink_t* s_ml = nullptr;  // owned by the worker task
@@ -67,6 +67,9 @@ bool s_pin_loaded = false;       // worker task only
 // is offline or not on the tailnet). Written by callers of tailnet_ensure_peer.
 portMUX_TYPE s_tried_lock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t s_tried[4];
+// One-shot control (MicroLink's ML_LITE_CONTROL_ONESHOT): the peer whose
+// failed tunnel already got a fresh map this WiFi session (0 = none).
+std::atomic<uint32_t> s_tunnel_refreshed{0};
 
 // The login URL is written by MicroLink's task (via the state callback) and
 // read by UI tasks.
@@ -320,6 +323,7 @@ void workerTask(void*) {
           portENTER_CRITICAL(&s_tried_lock);
           memset(s_tried, 0, sizeof(s_tried));
           portEXIT_CRITICAL(&s_tried_lock);
+          s_tunnel_refreshed.store(0);
           break;
         case REQ_LOGOUT:
           stopMl();
@@ -347,6 +351,15 @@ void workerTask(void*) {
             stopMl();
           }
           s_relay_matched = false;
+          break;
+        case REQ_REFRESH:
+          // One-shot control: fetch a fresh map with the (new) pin, without
+          // restarting MicroLink. The tunnel stays up meanwhile.
+          if (s_running && s_ml) {
+            tailnet_ml_set_priority_peer(s_ml, loadPin());
+            const esp_err_t err = microlink_control_refresh(s_ml);
+            if (err != ESP_OK) TLOGW("control refresh: %s", esp_err_to_name(err));
+          }
           break;
         case REQ_RECHECK:
           break;
@@ -492,8 +505,8 @@ static void rememberServer(uint32_t ip) {
 // out (see tailnet_ml_request_handshake). Re-asks every 2.5 s: a request made
 // before the relay connection is up is dropped. A peer that never answers is
 // left to the caller's own timeout.
-static void bringUpTunnel(uint32_t ip, uint32_t timeout_ms) {
-  if (tailnet_ml_tunnel_up(s_ml, ip)) return;
+static bool bringUpTunnel(uint32_t ip, uint32_t timeout_ms) {
+  if (tailnet_ml_tunnel_up(s_ml, ip)) return true;
   const uint32_t limit = timeout_ms < 15000 ? timeout_ms : 15000;
   uint32_t waited = 0;
   tailnet_ml_request_handshake(s_ml, ip);
@@ -504,9 +517,37 @@ static void bringUpTunnel(uint32_t ip, uint32_t timeout_ms) {
   }
   if (tailnet_ml_tunnel_up(s_ml, ip)) {
     TLOGW("tunnel to %u.%u.%u.%u up after %lu ms", IP_ARGS(ip), (unsigned long)waited);
-  } else {
-    TLOGW("tunnel to %u.%u.%u.%u: no WireGuard session after %lu ms", IP_ARGS(ip), (unsigned long)waited);
+    return true;
   }
+  TLOGW("tunnel to %u.%u.%u.%u: no WireGuard session after %lu ms", IP_ARGS(ip), (unsigned long)waited);
+  return false;
+}
+
+// One-shot control: ask the worker for a fresh map (a new control session)
+// and wait until one has succeeded. False if none did within timeout_ms.
+static bool refreshControl(uint32_t timeout_ms) {
+  const uint32_t before = microlink_control_sessions();
+  post(REQ_REFRESH);
+  uint32_t waited = 0;
+  while (waited < timeout_ms) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    waited += 100;
+    if (microlink_control_sessions() != before) return true;
+    // Nothing running a second after asking: the session gave up.
+    if (waited >= 1000 && s_ml && !microlink_control_busy(s_ml)) break;
+  }
+  TLOGW("control refresh: no new map after %lu ms", (unsigned long)waited);
+  return false;
+}
+
+// Bring up the tunnel; with one-shot control, a peer that does not answer
+// may have moved (new key, relay or endpoints) since the map was fetched:
+// fetch a fresh one once per WiFi session and try again.
+static void bringUpTunnelOrRefresh(uint32_t ip, uint32_t timeout_ms) {
+  if (bringUpTunnel(ip, timeout_ms)) return;
+  if (!microlink_control_oneshot() || s_tunnel_refreshed.exchange(ip) == ip) return;
+  TLOGW("tunnel to %u.%u.%u.%u: refreshing the map and retrying", IP_ARGS(ip));
+  if (refreshControl(timeout_ms)) bringUpTunnel(ip, timeout_ms);
 }
 
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
@@ -519,7 +560,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   for (int i = 0; i < 30 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
   if (peerKnown(ip)) {
     rememberServer(ip);
-    bringUpTunnel(ip, timeout_ms);
+    bringUpTunnelOrRefresh(ip, timeout_ms);
     return true;
   }
   if (ip == s_pin.load() || !markTried(ip)) {
@@ -529,16 +570,21 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   TLOGW("connect %u.%u.%u.%u: not in peer table (%d peers); pinning", IP_ARGS(ip),
            s_ml ? microlink_get_peer_count(s_ml) : 0);
   storePin(ip);  // remembered across reboots: pinned from the next start on
-  post(REQ_REPIN);
-  // Wait for the restart to begin, then for it to finish.
-  for (int i = 0; i < 50 && tailnet_status() == TAILNET_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(100));
-  if (!tailnet_wait_connected(timeout_ms)) return false;
+  if (microlink_control_oneshot()) {
+    // One-shot control: a fresh map with the pin, no restart.
+    if (!refreshControl(timeout_ms)) return false;
+  } else {
+    post(REQ_REPIN);
+    // Wait for the restart to begin, then for it to finish.
+    for (int i = 0; i < 50 && tailnet_status() == TAILNET_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (!tailnet_wait_connected(timeout_ms)) return false;
+  }
   for (int i = 0; i < 50 && !peerKnown(ip); i++) vTaskDelay(pdMS_TO_TICKS(100));
   const bool known = peerKnown(ip);
   if (known) {
     TLOGW("connect %u.%u.%u.%u: peer added after pinning", IP_ARGS(ip));
     rememberServer(ip);
-    bringUpTunnel(ip, timeout_ms);
+    bringUpTunnelOrRefresh(ip, timeout_ms);
   } else {
     TLOGW("connect %u.%u.%u.%u: still not a peer after pinning (check ACLs)", IP_ARGS(ip));
   }

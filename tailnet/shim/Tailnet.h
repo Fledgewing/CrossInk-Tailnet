@@ -58,7 +58,9 @@ bool tailnet_wait_connected(uint32_t timeout_ms);
 
 // Make sure MicroLink tracks the peer at ip (host byte order). On a tailnet
 // larger than its peer table, a peer can be left out; this pins it as the
-// priority peer (remembered in NVS) and restarts MicroLink so it is added.
+// priority peer (remembered in NVS) and restarts MicroLink so it is added
+// (with one-shot control, the C3 build: runs a control session for a fresh
+// map instead, and runs one more if the peer's tunnel does not come up).
 // Tried once per peer per WiFi session. Blocks up to about 2 x timeout_ms.
 bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms);
 

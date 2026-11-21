@@ -40,7 +40,7 @@ has_psram = env.BoardConfig().get("build.mcu", "") == "esp32s3"  # noqa: F821
 # Same source list as MicroLink's CMakeLists.txt. Cellular, failover and the
 # config web server compile to stubs when their CONFIG_ML_* switch is off.
 ML_SRCS = [
-    "microlink.c", "ml_coord.c", "ml_coord_tls.c", "ml_derp.c", "ml_net_io.c",
+    "microlink.c", "ml_coord.c", "ml_coord_tls.c", "ml_map_stream.c", "ml_derp.c", "ml_net_io.c",
     "ml_wg_mgr.c", "ml_stun.c", "ml_noise.c", "ml_h2.c", "ml_udp.c", "ml_filter.c",
     "ml_routes.c", "ml_nat66.c", "ml_ota.c", "ml_tcp.c", "ml_peer_nvs.c",
     "ml_zerocopy.c", "ml_cellular.c", "ml_at_socket.c", "ml_at_validate.c",
