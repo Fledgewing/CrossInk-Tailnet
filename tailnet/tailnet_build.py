@@ -347,7 +347,9 @@ def _process_project_deps_with_tailnet(env):
                           # TailnetTlsMem.c: mbedTLS buffers in PSRAM
                           "-Wl,--wrap=esp_mbedtls_mem_calloc",
                           # TailnetWifiMem.c: the WiFi init switches
-                          "-Wl,--wrap=esp_wifi_init"])
+                          "-Wl,--wrap=esp_wifi_init",
+                          # TailnetStacks.c: MicroLink stops before WiFi goes off
+                          "-Wl,--wrap=esp_wifi_stop"])
     if SWITCH_VALUES.get("TAILNET_TASK_STACK_WRAP"):
         # TailnetStacks.c: task stack sizes by name, and the timer task's. CrossInk v2
         # wraps xTaskCreatePinnedToCore itself; its wrapper then calls the shim's hooks
@@ -355,9 +357,6 @@ def _process_project_deps_with_tailnet(env):
         if not upstream_wraps_task_create:
             env.Append(LINKFLAGS=["-Wl,--wrap=xTaskCreatePinnedToCore"])
         env.Append(LINKFLAGS=["-Wl,--wrap=vApplicationGetTimerTaskMemory"])
-    if SWITCH_VALUES.get("TAILNET_STACK_LOG"):
-        # TailnetStacks.c: the stack report before WiFi goes off
-        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_stop"])
 
 
 env.AddMethod(_process_project_deps_with_tailnet, "ProcessProjectDeps")  # noqa: F821

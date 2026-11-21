@@ -61,6 +61,9 @@ enum Request : uint8_t { REQ_WIFI_UP, REQ_WIFI_DOWN, REQ_RECHECK, REQ_LOGOUT, RE
 QueueHandle_t s_queue = nullptr;
 microlink_t* s_ml = nullptr;  // owned by the worker task
 bool s_running = false;       // worker task only
+// MicroLink's tasks are alive: set once microlink_start() succeeds, cleared once
+// microlink_stop() has returned. Read by tailnet_stop_before_wifi_off() on other tasks.
+std::atomic<bool> s_ml_live{false};
 bool s_wifi_up = false;       // worker task only
 
 std::atomic<int> s_status{TAILNET_OFF};
@@ -261,6 +264,7 @@ void stopMl() {
     TLOGW("microlink_stop timed out; retrying");
   }
   s_running = false;
+  s_ml_live = false;
   s_ip.store(0);
   portENTER_CRITICAL(&s_url_lock);
   s_url[0] = '\0';
@@ -465,6 +469,7 @@ void startMl() {
     return;
   }
   s_running = true;
+  s_ml_live = true;
   TLOGI("MicroLink started");
 }
 
@@ -1158,6 +1163,27 @@ extern "C" bool tailnet_wait_ready(uint32_t timeout_ms) {
   (void)timeout_ms;
   return true;
 #endif
+}
+
+extern "C" void tailnet_stop_before_wifi_off(uint32_t timeout_ms) {
+  // MicroLink's stop takes ~1 s (the relay task leaves its blocking read). Turned off
+  // without waiting, WiFi was deinitialised under its still-running tasks, and the
+  // caller went on (the sleep sync: redraw and deep sleep) while they tore down.
+  // The worker, MicroLink's own tasks and the event tasks must never wait here.
+  if (!s_ml_live.load() || !mayWaitForTailscale()) return;
+#if TAILNET_LAZY_WORKER
+  s_link_up.store(false);
+#endif
+  post(REQ_WIFI_DOWN);
+  const TickType_t start = xTaskGetTickCount();
+  while (s_ml_live.load()) {
+    if (elapsedMs(start) >= timeout_ms) {
+      TLOGW("MicroLink still stopping after %lu ms; turning WiFi off anyway", (unsigned long)timeout_ms);
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  TLOGI("MicroLink stopped before WiFi off (%lu ms)", (unsigned long)elapsedMs(start));
 }
 
 extern "C" void tailnet_wait_idle(uint32_t timeout_ms) {

@@ -177,13 +177,16 @@ void tailnet_stack_report(const char* when) { (void)when; }
 
 #endif  // TAILNET_STACK_LOG
 
-#if TAILNET_STACK_LOG
 // "before WiFi off": every path that turns WiFi off (WiFi.mode(WIFI_OFF),
-// WiFi.disconnect(true)) stops the driver here, on the caller's task.
+// WiFi.disconnect(true), the restart's shutdown handler) stops the driver here,
+// on the caller's task. MicroLink stops first, so none of its tasks outlives the
+// driver (Tailnet.h); then the stack report (TAILNET_STACK_LOG).
 #include <esp_wifi.h>
+#include "Tailnet.h"
+#define TAILNET_STOP_BEFORE_WIFI_OFF_MS 5000
 esp_err_t __real_esp_wifi_stop(void);
 esp_err_t __wrap_esp_wifi_stop(void) {
+  tailnet_stop_before_wifi_off(TAILNET_STOP_BEFORE_WIFI_OFF_MS);
   tailnet_stack_report("WiFi off");
   return __real_esp_wifi_stop();
 }
-#endif

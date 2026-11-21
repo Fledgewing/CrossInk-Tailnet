@@ -124,6 +124,10 @@ bool tailnet_wait_ready(uint32_t timeout_ms);
 // Before turning WiFi off: waits (up to timeout_ms) for a running control
 // session to finish.
 void tailnet_wait_idle(uint32_t timeout_ms);
+// Before WiFi goes off (the esp_wifi_stop link wrap, TailnetStacks.c): stops MicroLink and
+// waits up to timeout_ms for its tasks to exit. No-op when it is not running, and on
+// MicroLink's, the worker's and the event tasks.
+void tailnet_stop_before_wifi_off(uint32_t timeout_ms);
 // Catalog probe (c3-catalog-probe): start Tailscale in this boot without
 // parking the framebuffer; one log line of heap numbers for a named step.
 void tailnet_probe_permit_unparked(void);
