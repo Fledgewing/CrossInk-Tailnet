@@ -240,6 +240,14 @@ _orig_process_project_deps = env.ProcessProjectDeps  # noqa: F821
 
 def _process_project_deps_with_tailnet(env):
     _orig_process_project_deps()
+    # pioarduino's hybrid pass (custom sdkconfig, the C3's firmware_tuned) first
+    # links a placeholder sketch from .dummy/ only to rebuild the IDF libraries.
+    # MicroLink has no place there: with DERP on wolfSSL it pulls wolfSSL's
+    # record code into that link, which then needs CrossInk's
+    # freeinkWolfsslWantsFullRecordBuffer (src/, not in the placeholder) and fails.
+    if (env.get("ARDUINO_LIB_COMPILE_FLAG") == "Build"
+            or os.path.basename(env.subst("$PROJECT_SRC_DIR")) == ".dummy"):
+        return
     ml_env = env.Clone()
     ml_env.Append(
         CPPPATH=[os.path.join(ml_dir, "include"), os.path.join(ml_dir, "src"), wg_dir,
