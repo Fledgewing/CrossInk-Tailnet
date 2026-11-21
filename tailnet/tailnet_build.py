@@ -35,6 +35,17 @@ pioenv = env.subst("$PIOENV")  # noqa: F821
 # Every CrossInk ESP32-S3 reader has 8 MB PSRAM; the ESP32-C3 (X3/X4) has none.
 has_psram = env.BoardConfig().get("build.mcu", "") == "esp32s3"  # noqa: F821
 
+# The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL, on with
+# CONFIG_ML_LITE below): the application already compiles Arduino-wolfSSL from
+# source, and its session is ~5 KB once connected against the prebuilt
+# mbedTLS's ~37 KB. Verifying Tailscale's relays (Let's Encrypt ECDSA chains,
+# signed with ecdsa-with-SHA384 by P-384 keys) needs SHA-384, which that build
+# leaves out, and SP math for P-384 keeps the handshake peak at ~24 KB instead
+# of ~43 KB with fast-math bignums. These apply to the whole wolfSSL library.
+derp_wolfssl = not has_psram
+if derp_wolfssl:
+    env.Append(CPPDEFINES=["WOLFSSL_SHA384", "WOLFSSL_SHA512", "WOLFSSL_SP_384"])  # noqa: F821
+
 # --- 1. MicroLink as a library ------------------------------------------------
 
 # Same source list as MicroLink's CMakeLists.txt. Cellular, failover and the
@@ -77,6 +88,14 @@ def _process_project_deps_with_tailnet(env):
                                   # The fork's small-memory client mode (Fledgewing/microlink,
                                   # crossink branch): the X3 has ~58 KB free once WiFi is up.
                                   ("CONFIG_ML_LITE", 1)])
+
+    if derp_wolfssl:
+        # ml_derp.c includes wolfSSL; the defines (WOLFSSL_USER_SETTINGS, ...)
+        # come with the cloned environment, the headers from its library.
+        wolfssl_src = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), pioenv, "Arduino-wolfSSL", "src")
+        if not os.path.isfile(os.path.join(wolfssl_src, "wolfssl", "ssl.h")):
+            raise RuntimeError(f"wolfSSL not found at {wolfssl_src}; the DERP relay TLS needs Arduino-wolfSSL")
+        ml_env.Append(CPPPATH=[wolfssl_src], CPPDEFINES=[("ML_LITE_DERP_WOLFSSL", 1)])
 
     build_dir = os.path.join(env.subst("$BUILD_DIR"), "tailnet")
     objs = []
