@@ -1,0 +1,344 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 6ec7b3d3..6eabb941 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -61,6 +61,14 @@
+ #define CROSSINK_TAILNET_NET_RENDER_STACK 0
+ #endif
+ 
++// BookOrbit catalog download boot (BOOKORBIT_DOWNLOAD) that ran with the network
++// parked (the C3 with Tailscale): once the download ends, done or failed, restart into
++// the catalog boot at the listing it was started from instead of ending on Home. Inert
++// where nothing parks (the S3 readers download in place and stay in the catalog).
++#ifndef CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
++#define CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index 6aba1394..0137b091 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -321,22 +321,36 @@ void BookOrbitCatalogBrowserActivity::onEnter() {
+   // A download boot comes back to the listing it left, whose pages are still in the
+   // list cache; any other entry starts a fresh catalog session.
+   BookOrbitDownloadResume resume;
+-  if (resumeDownload && BookOrbitCatalogListCache::takeDownloadResume(resume)) {
++  const auto restoreListing = [this](BookOrbitDownloadResume& saved) {
+     navLevel = NavLevel::Books;
+-    listQuery = std::move(resume.listQuery);
+-    listDefaultReadStatus = std::move(resume.listDefaultReadStatus);
+-    listTitle = std::move(resume.listTitle);
+-    listPage = resume.listPage;
+-    booksFromFacet = resume.booksFromFacet;
+-    selectorIndex = resume.selectorIndex;
+-    topIndex = resume.topIndex;
+-    facetSectionId = std::move(resume.facetSectionId);
+-    facetTitle = std::move(resume.facetTitle);
+-    facetPage = resume.facetPage;
+-    facetSelectorIndex = resume.facetSelectorIndex;
+-    facetTopIndex = resume.facetTopIndex;
+-    downloadFromHome = resume.fromHome;
++    listQuery = std::move(saved.listQuery);
++    listDefaultReadStatus = std::move(saved.listDefaultReadStatus);
++    listTitle = std::move(saved.listTitle);
++    listPage = saved.listPage;
++    booksFromFacet = saved.booksFromFacet;
++    selectorIndex = saved.selectorIndex;
++    topIndex = saved.topIndex;
++    facetSectionId = std::move(saved.facetSectionId);
++    facetTitle = std::move(saved.facetTitle);
++    facetPage = saved.facetPage;
++    facetSelectorIndex = saved.facetSelectorIndex;
++    facetTopIndex = saved.facetTopIndex;
++    downloadFromHome = saved.fromHome;
++  };
++  returnToListing = false;
++  if (resumeDownload && BookOrbitCatalogListCache::takeDownloadResume(resume)) {
++    restoreListing(resume);
+     pendingDownload = {resume.bookId, resume.fileId, std::move(resume.title), std::move(resume.path)};
++#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
++  } else if (networkBoot && BookOrbitCatalogListCache::takeCatalogReturn(resume)) {
++    // A download boot that ended with the network parked restarted back here: reopen
++    // the listing it was started from (its pages are still in the list cache).
++    restoreListing(resume);
++    returnFailure = resume.failure;
++    returnToListing = true;
++    LOG_INF("BookOrbit", "Catalog: back from the download to \"%s\" page %d (row %d, top %d, failure %d)",
++            listTitle.c_str(), listPage, selectorIndex, topIndex, returnFailure);
++#endif
+   } else {
+     BookOrbitCatalogListCache::clear();
+     // A BOOKORBIT_CATALOG boot the BookOrbit Home asked for brings its link on the SD card.
+@@ -403,6 +417,19 @@ void BookOrbitCatalogBrowserActivity::onWifiSelectionComplete(const bool connect
+     return;
+   }
+   sdFontSystem.releaseForNetwork(renderer);
++#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
++  if (returnToListing) {
++    returnToListing = false;
++    listFreedForDownload = true;  // Back from a failure's message rebuilds the listing
++    restoreBookListAfterDownload();
++    if (returnFailure != 0) {
++      errorMessage = returnFailure == 2 ? tr(STR_SD_CARD_FULL) : tr(STR_DOWNLOAD_FAILED);
++      state = BrowserState::ERROR;
++    }
++    requestUpdate();
++    return;
++  }
++#endif
+   if (entryLink.bookId != 0) {
+     // Back from the download lands on the listing the Home shelf drew from.
+     const BookOrbitCatalogLink link = std::move(entryLink);
+@@ -1275,24 +1302,11 @@ bool BookOrbitCatalogBrowserActivity::restartForDownload(const int64_t bookId, c
+             static_cast<long long>(bookId));
+     return false;
+   }
+-  BookOrbitDownloadResume resume;
++  BookOrbitDownloadResume resume = listingSnapshot();
+   resume.bookId = bookId;
+   resume.fileId = fileId;
+   resume.title = title;
+   resume.path = path;
+-  resume.listQuery = listQuery;
+-  resume.listDefaultReadStatus = listDefaultReadStatus;
+-  resume.listTitle = listTitle;
+-  resume.listPage = listPage;
+-  resume.booksFromFacet = booksFromFacet;
+-  resume.selectorIndex = selectorIndex;
+-  resume.topIndex = topIndex;
+-  resume.facetSectionId = facetSectionId;
+-  resume.facetTitle = facetTitle;
+-  resume.facetPage = facetPage;
+-  resume.facetSelectorIndex = facetSelectorIndex;
+-  resume.facetTopIndex = facetTopIndex;
+-  resume.fromHome = downloadFromHome;
+   if (!BookOrbitCatalogListCache::saveDownloadResume(resume)) {
+     LOG_ERR("BookOrbit", "Cannot save the download for its restart; downloading in place");
+     return false;
+@@ -1312,6 +1326,40 @@ bool BookOrbitCatalogBrowserActivity::restartForDownload(const int64_t bookId, c
+ #endif
+ }
+ 
++BookOrbitDownloadResume BookOrbitCatalogBrowserActivity::listingSnapshot() const {
++  BookOrbitDownloadResume resume;
++  resume.listQuery = listQuery;
++  resume.listDefaultReadStatus = listDefaultReadStatus;
++  resume.listTitle = listTitle;
++  resume.listPage = listPage;
++  resume.booksFromFacet = booksFromFacet;
++  resume.selectorIndex = selectorIndex;
++  resume.topIndex = topIndex;
++  resume.facetSectionId = facetSectionId;
++  resume.facetTitle = facetTitle;
++  resume.facetPage = facetPage;
++  resume.facetSelectorIndex = facetSelectorIndex;
++  resume.facetTopIndex = facetTopIndex;
++  resume.fromHome = downloadFromHome;
++  return resume;
++}
++
++#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
++bool BookOrbitCatalogBrowserActivity::restartBackToCatalog(const int failure) {
++  BookOrbitDownloadResume listing = listingSnapshot();
++  listing.failure = failure;
++  if (!BookOrbitCatalogListCache::saveCatalogReturn(listing)) {
++    LOG_ERR("BookOrbit", "Cannot save the listing for the catalog restart; ending on Home");
++    return false;
++  }
++  LOG_INF("BookOrbit", "Download done (failure %d): restarting into the catalog at page %d (row %d, top %d)", failure,
++          listPage, selectorIndex, topIndex);
++  silentRestartToNetwork(NetworkBootTarget::BOOKORBIT_CATALOG);
++  // Only returns when deep sleep is already under way, which ends this session anyway.
++  return true;
++}
++#endif
++
+ void BookOrbitCatalogBrowserActivity::runPendingDownload(const bool wifiConnected) {
+   const PendingDownload job = std::move(pendingDownload);
+   pendingDownload = PendingDownload{};
+@@ -1426,9 +1474,11 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+             static_cast<int>(result));
+   }
+ 
+-  // C3 + Tailscale: WiFi off and the framebuffer back first; the listing cannot be
+-  // fetched again without Tailscale, so the download ends on Home like one from there.
+-  if (tailnet_end_parked_network()) downloadFromHome = true;
++  // C3 + Tailscale: WiFi off and the framebuffer back first. This boot cannot fetch the
++  // listing again (Tailscale is gone with the network), so the download either restarts
++  // into the live catalog boot at the same listing (CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG,
++  // below) or ends on Home like one from there.
++  const bool parkedNetworkEnded = tailnet_end_parked_network();
+   const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
+   if (downloadFailed) {
+     // preservePartial kept the staged file for resuming between attempts; don't
+@@ -1453,6 +1503,14 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+     errorMessage = result == HttpDownloader::INSUFFICIENT_SPACE ? tr(STR_SD_CARD_FULL) : tr(STR_DOWNLOAD_FAILED);
+   }
+ 
++#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
++  if (parkedNetworkEnded && !downloadFromHome &&
++      restartBackToCatalog(!downloadFailed ? 0 : result == HttpDownloader::INSUFFICIENT_SPACE ? 2 : 1)) {
++    return;
++  }
++#endif
++  if (parkedNetworkEnded) downloadFromHome = true;
++
+   // A download from Home goes back there once done or cancelled; a failure first shows
+   // its message, which Back dismisses to Home as well.
+   if (downloadFromHome && !downloadFailed) {
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.h b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+index 5a999e6f..620753f9 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.h
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.h
+@@ -13,6 +13,8 @@
+ #include "network/BookOrbitCatalogClient.h"
+ #include "util/ButtonNavigator.h"
+ 
++struct BookOrbitDownloadResume;  // BookOrbitCatalogListCache.h
++
+ class OptionPopup;
+ 
+ /**
+@@ -118,6 +120,11 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
+   // The download was started from a BookOrbit Home shelf: whatever its outcome, it ends
+   // on Home rather than on the listing it was fetched through.
+   bool downloadFromHome = false;
++  // CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG: this catalog boot came back from a download
++  // boot; the listing it saved is reopened once Wi-Fi is up, with the download's failure
++  // (BookOrbitDownloadResume::failure) shown over it.
++  bool returnToListing = false;
++  int returnFailure = 0;
+ 
+   // Current book-list context, used to page and to return to the same list after a download.
+   BookOrbitBookQuery listQuery;
+@@ -280,6 +287,11 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
+   // boot. False when the download runs in place instead: on S3 boards, and for a
+   // BookOrbit Home shelf book in the catalog's network boot.
+   bool restartForDownload(int64_t bookId, int64_t fileId, const std::string& title, const std::string& path);
++  // The listing to come back to (no file): what a download restart saves.
++  BookOrbitDownloadResume listingSnapshot() const;
++  // Saves the listing and restarts into the live catalog boot (BOOKORBIT_CATALOG) at it.
++  // False when the listing cannot be saved.
++  bool restartBackToCatalog(int failure);
+   void runPendingDownload(bool wifiConnected);
+   // The transfer itself, then the listing it freed is rebuilt.
+   void transferBook(int64_t bookId, int64_t fileId, const std::string& finalPath);
+diff --git a/src/activities/browser/BookOrbitCatalogListCache.cpp b/src/activities/browser/BookOrbitCatalogListCache.cpp
+index 909aedd3..1ac389d5 100644
+--- a/src/activities/browser/BookOrbitCatalogListCache.cpp
++++ b/src/activities/browser/BookOrbitCatalogListCache.cpp
+@@ -17,6 +17,8 @@ constexpr char BOOKORBIT_LIST_CACHE_SUFFIX[] = ".json";
+ constexpr size_t BOOKORBIT_CACHE_PATH_CAP = 180;
+ constexpr char BOOKORBIT_DOWNLOAD_RESUME_PATH[] = "/.crosspoint/bookorbit_download.json";
+ constexpr char BOOKORBIT_ENTRY_LINK_PATH[] = "/.crosspoint/bookorbit_catalog_link.json";
++// CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG: the listing a download boot restarts back into.
++constexpr char BOOKORBIT_CATALOG_RETURN_PATH[] = "/.crosspoint/bookorbit_catalog_return.json";
+ 
+ bool writeJsonStringFile(const std::string& path, const std::string& text) {
+   FsFile file;
+@@ -284,7 +286,7 @@ void saveBooksPage(const BookOrbitBookQuery& query, const int page, const BookOr
+   writeJsonStringFile(cachePathForKey(booksCacheKey(query, page)), json);
+ }
+ 
+-bool saveDownloadResume(const BookOrbitDownloadResume& resume) {
++static bool saveResumeFile(const char* resumePath, const BookOrbitDownloadResume& resume) {
+   std::string json;
+   json.reserve(512);  // the keys alone take ~250 bytes; one allocation covers typical titles
+   const auto addString = [&json](const char* key, const std::string& value) {
+@@ -327,19 +329,17 @@ bool saveDownloadResume(const BookOrbitDownloadResume& resume) {
+   addNumber("facetSelectorIndex", resume.facetSelectorIndex);
+   addNumber("facetTopIndex", resume.facetTopIndex);
+   addNumber("fromHome", resume.fromHome ? 1 : 0);
++  addNumber("failure", resume.failure);
+   json += "}";
+-  return writeJsonStringFile(BOOKORBIT_DOWNLOAD_RESUME_PATH, json);
++  return writeJsonStringFile(resumePath, json);
+ }
+ 
+-bool takeDownloadResume(BookOrbitDownloadResume& outResume) {
+-  std::string json;
+-  const bool read = readJsonStringFile(BOOKORBIT_DOWNLOAD_RESUME_PATH, json);
+-  Storage.remove(BOOKORBIT_DOWNLOAD_RESUME_PATH);
+-  if (!read) {
+-    LOG_ERR("BookOrbit", "No download to resume at %s", BOOKORBIT_DOWNLOAD_RESUME_PATH);
+-    return false;
+-  }
++bool saveDownloadResume(const BookOrbitDownloadResume& resume) {
++  return saveResumeFile(BOOKORBIT_DOWNLOAD_RESUME_PATH, resume);
++}
+ 
++// Parses a file saveResumeFile() wrote; false when unreadable.
++static bool parseResumeFile(const std::string& json, BookOrbitDownloadResume& outResume) {
+   JsonDocument doc;
+   if (deserializeJson(doc, json) != DeserializationError::Ok) {
+     LOG_ERR("BookOrbit", "Unreadable download resume file");
+@@ -374,6 +374,19 @@ bool takeDownloadResume(BookOrbitDownloadResume& outResume) {
+   outResume.facetSelectorIndex = doc["facetSelectorIndex"] | 0;
+   outResume.facetTopIndex = doc["facetTopIndex"] | 0;
+   outResume.fromHome = (doc["fromHome"] | 0) != 0;
++  outResume.failure = doc["failure"] | 0;
++  return true;
++}
++
++bool takeDownloadResume(BookOrbitDownloadResume& outResume) {
++  std::string json;
++  const bool read = readJsonStringFile(BOOKORBIT_DOWNLOAD_RESUME_PATH, json);
++  Storage.remove(BOOKORBIT_DOWNLOAD_RESUME_PATH);
++  if (!read) {
++    LOG_ERR("BookOrbit", "No download to resume at %s", BOOKORBIT_DOWNLOAD_RESUME_PATH);
++    return false;
++  }
++  if (!parseResumeFile(json, outResume)) return false;
+   if (outResume.fileId == 0 || outResume.path.empty()) {
+     LOG_ERR("BookOrbit", "Download resume file names no file to fetch");
+     return false;
+@@ -381,6 +394,18 @@ bool takeDownloadResume(BookOrbitDownloadResume& outResume) {
+   return true;
+ }
+ 
++bool saveCatalogReturn(const BookOrbitDownloadResume& listing) {
++  return saveResumeFile(BOOKORBIT_CATALOG_RETURN_PATH, listing);
++}
++
++bool takeCatalogReturn(BookOrbitDownloadResume& outListing) {
++  if (!Storage.exists(BOOKORBIT_CATALOG_RETURN_PATH)) return false;
++  std::string json;
++  const bool read = readJsonStringFile(BOOKORBIT_CATALOG_RETURN_PATH, json);
++  Storage.remove(BOOKORBIT_CATALOG_RETURN_PATH);
++  return read && parseResumeFile(json, outListing);
++}
++
+ void discardDownloadResume() { Storage.remove(BOOKORBIT_DOWNLOAD_RESUME_PATH); }
+ 
+ bool saveEntryLink(const BookOrbitCatalogLink& link) {
+diff --git a/src/activities/browser/BookOrbitCatalogListCache.h b/src/activities/browser/BookOrbitCatalogListCache.h
+index 14c78a1f..f4f37b3c 100644
+--- a/src/activities/browser/BookOrbitCatalogListCache.h
++++ b/src/activities/browser/BookOrbitCatalogListCache.h
+@@ -34,6 +34,9 @@ struct BookOrbitDownloadResume {
+   int facetTopIndex = 0;
+   // Started from a BookOrbit Home shelf: the download ends on Home, not on a listing.
+   bool fromHome = false;
++  // Catalog return only (saveCatalogReturn()): how the download ended, for the listing
++  // to show. 0 done or cancelled, 1 failed, 2 the SD card is full.
++  int failure = 0;
+ };
+ 
+ namespace BookOrbitCatalogListCache {
+@@ -59,6 +62,13 @@ bool saveDownloadResume(const BookOrbitDownloadResume& resume);
+ bool takeDownloadResume(BookOrbitDownloadResume& outResume);
+ void discardDownloadResume();
+ 
++// CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG: the listing a download boot that ended
++// with the network parked restarts back into (the BOOKORBIT_CATALOG boot), with no
++// file to fetch. Kept outside the listing pages, which that boot reopens.
++bool saveCatalogReturn(const BookOrbitDownloadResume& listing);
++// Reads the saved listing and deletes the file; false, without logging, when none is saved.
++bool takeCatalogReturn(BookOrbitDownloadResume& outListing);
++
+ // The BookOrbit Home's link into the catalog, kept outside the listing pages too: on
+ // the X3 and X4 it waits here through the catalog's own network boot.
+ bool saveEntryLink(const BookOrbitCatalogLink& link);

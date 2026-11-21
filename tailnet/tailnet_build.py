@@ -135,6 +135,10 @@ SWITCHES = {
     # sits in the framebuffer's hole), so a fragmented heap cannot fail a handshake.
     "CROSSINK_TAILNET_TLS_ARENA":         (24576,  0,      0),
     "CROSSINK_TAILNET_WIFI_FAST_JOIN":    (1,      1,      1),      # patch 0005: last channel+BSSID first
+    # Patch 0007: a download boot that ran with the network parked (the C3 with Tailscale)
+    # restarts into the catalog at the listing it came from instead of ending on Home.
+    # Inert on the S3 readers: nothing parks there, they download in place and stay in the catalog.
+    "CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG": (1, 1,     1),
 }
 # Switches that stand for wolfSSL defines rather than a define of their own.
 WOLFSSL_SWITCH_DEFINES = {

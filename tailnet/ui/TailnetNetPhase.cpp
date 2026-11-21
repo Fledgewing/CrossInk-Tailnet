@@ -32,6 +32,7 @@
 #include "SilentRestart.h"
 #include "activities/browser/BookOrbitCatalogLink.h"
 #include "activities/browser/BookOrbitCatalogListCache.h"
+#include <CrossInkTailnetCuts.h>
 #include "network/SavedWifiConnect.h"
 
 extern GfxRenderer renderer;  // main.cpp
@@ -86,6 +87,11 @@ uint32_t s_catalog_flags = 0;                        // this boot's
 // The link the BookOrbit Home opened the catalog with: the catalog takes it off
 // the SD card, so a restart puts it back.
 BookOrbitCatalogLink* s_entry_link = nullptr;
+#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
+// The listing a download boot sent this catalog boot back to (saveCatalogReturn()):
+// the catalog takes it off the card too, so a restart puts it back as well.
+BookOrbitDownloadResume* s_return_listing = nullptr;
+#endif
 
 // Caller holds the RenderLock.
 bool unparkLocked() {
@@ -103,12 +109,19 @@ bool unparkLocked() {
 void dropEntryLink() {
   delete s_entry_link;
   s_entry_link = nullptr;
+#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
+  delete s_return_listing;
+  s_return_listing = nullptr;
+#endif
 }
 
 // Restarts into the live catalog with `flags` for the next boot. Does not return.
 void restartCatalog(uint32_t flags, const char* why) {
   LOG_INF("TNET", "Live catalog: restarting into the catalog (%s; flags %lu)", why, static_cast<unsigned long>(flags));
   if (s_entry_link) BookOrbitCatalogListCache::saveEntryLink(*s_entry_link);
+#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
+  if (s_return_listing) BookOrbitCatalogListCache::saveCatalogReturn(*s_return_listing);
+#endif
   s_rtc_flags = flags;
   s_rtc_magic = CATALOG_RTC_MAGIC;
   s_restarting = true;
@@ -147,6 +160,13 @@ extern "C" void tailnet_network_phase_begin(uint32_t target) {
       BookOrbitCatalogListCache::saveEntryLink(link);
       s_entry_link = new (std::nothrow) BookOrbitCatalogLink(std::move(link));
     }
+#if CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG
+    BookOrbitDownloadResume listing;
+    if (BookOrbitCatalogListCache::takeCatalogReturn(listing)) {
+      BookOrbitCatalogListCache::saveCatalogReturn(listing);
+      s_return_listing = new (std::nothrow) BookOrbitDownloadResume(std::move(listing));
+    }
+#endif
     LOG_INF("TNET", "Live catalog boot: flags %lu (after control %d, recovered %d, no Tailscale %d)",
             static_cast<unsigned long>(flags), (flags & CATALOG_AFTER_CONTROL) != 0, (flags & CATALOG_RECOVERED) != 0,
             (flags & CATALOG_NO_TAILSCALE) != 0);
