@@ -152,6 +152,18 @@ behave like a normal Tailscale client:
 
 **Settings > Tailscale > Diagnostics** shows both regions ("Relay: ours sea, server sea").
 
+## Sync while reading (X4 Pro, X4 Classic)
+
+With BookOrbit **Smart sync** on, **Settings > BookOrbit Sync > Sync While Reading** syncs the
+open book in the background every 10, 15, 30 or 60 minutes, every 25, 50 or 100 pages, or every
+one or two chapters (off by default). The book stays open: WiFi and Tailscale come up, the
+progress is synced with Smart sync's rules, and WiFi goes off again. A newer position on the
+server is never overwritten; it waits for the next sync when you open the book or the reader
+sleeps, as does any case Smart sync would ask about. Highlights, bookmarks and reading stats
+also wait for that sync. Nothing is shown while reading; without a network it simply tries
+again at the next interval. Not on the X3: a sync does not fit in its memory beside an open
+book.
+
 ## Limits
 
 - Only tailnet hosts go through the tunnel. Internet traffic (GitHub updates, public OPDS
