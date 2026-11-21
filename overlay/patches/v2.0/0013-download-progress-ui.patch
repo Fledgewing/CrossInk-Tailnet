@@ -1,0 +1,87 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index ee0bb49c..30fbae06 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -100,6 +100,19 @@
+ #define CROSSINK_TAILNET_PROMPT_KEEPS_NETWORK 0
+ #endif
+ 
++// A book download in a boot that parked the framebuffer for Tailscale (the C3's
++// BOOKORBIT_DOWNLOAD boot): once Tailscale is ready, the overlay takes the framebuffer back
++// with WiFi and Tailscale kept when the largest free block holds it plus
++// CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN bytes (the download's TLS handshake and full-record
++// buffer), and the download shows its progress bar. Otherwise the static "Downloading" screen
++// stays and the boot stays parked.
++#ifndef CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++#define CROSSINK_TAILNET_DOWNLOAD_PROGRESS 0
++#endif
++#ifndef CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN
++#define CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN 40000
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+index d5b5b668..bdc833b0 100644
+--- a/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
++++ b/src/activities/browser/BookOrbitCatalogBrowserActivity.cpp
+@@ -1492,6 +1492,11 @@ void BookOrbitCatalogBrowserActivity::runPendingDownload(const bool wifiConnecte
+     requestUpdate();
+     return;
+   }
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++  // C3 + Tailscale: the framebuffer back beside Tailscale when it fits, so the progress
++  // bar below is drawn; else the static screen drawn before WiFi joined stays.
++  tailnet_download_progress_unpark();
++#endif
+   showDownloadScreen(job.title);
+   transferBook(job.bookId, job.fileId, job.path);
+ }
+@@ -1557,6 +1562,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+   unsigned long lastProgressUpdateMs = 0;
+   unsigned long now = 0;
+   int percent = 0;
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++  // The lowest heap the download reached (sampled at every body chunk; the TLS handshake's
++  // own low is in the "TLS handshake + headers" probe line): the margin's evidence.
++  uint32_t lowestFree = ESP.getFreeHeap();
++  uint32_t lowestLargest = ESP.getMaxAllocHeap();
++#endif
+   for (int attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+     // Honor a Back press between attempts too: a failing download otherwise runs
+     // all its retries (TLS handshake included) with the cancel request ignored.
+@@ -1567,8 +1578,18 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+     downloadOptions.resumePartial = attempt > 0;
+     result = BookOrbitCatalogClient::downloadFile(
+         fileId, finalPath,
+-        [this, &lastRenderedPercent, &lastProgressUpdateMs, &percent, &now](const size_t downloaded,
+-                                                                            const size_t total) {
++        [this, &lastRenderedPercent, &lastProgressUpdateMs, &percent, &now
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++         ,
++         &lowestFree, &lowestLargest
++#endif
++    ](const size_t downloaded, const size_t total) {
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++          const uint32_t freeNow = ESP.getFreeHeap();
++          if (freeNow < lowestFree) lowestFree = freeNow;
++          const uint32_t largestNow = ESP.getMaxAllocHeap();
++          if (largestNow < lowestLargest) lowestLargest = largestNow;
++#endif
+           downloadProgress = downloaded;
+           downloadTotal = total;
+           percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+@@ -1599,6 +1620,12 @@ void BookOrbitCatalogBrowserActivity::transferBook(const int64_t bookId, const i
+   // listing again (Tailscale is gone with the network), so the download either restarts
+   // into the live catalog boot at the same listing (CROSSINK_TAILNET_DOWNLOAD_BACK_TO_CATALOG,
+   // below) or ends on Home like one from there.
++#if CROSSINK_TAILNET_DOWNLOAD_PROGRESS
++  if (tailnet_boot_parks()) {
++    LOG_INF("BookOrbit", "Download progress UI: lowest free heap during the download %u (smallest largest block %u)",
++            static_cast<unsigned>(lowestFree), static_cast<unsigned>(lowestLargest));
++  }
++#endif
+   const bool parkedNetworkEnded = tailnet_end_parked_network();
+   const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
+   if (downloadFailed) {
