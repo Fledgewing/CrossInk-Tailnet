@@ -17,6 +17,7 @@
 #include <Arduino.h>
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
+#include <esp_heap_caps.h>
 #include <Logging.h>
 
 #include <atomic>
@@ -24,6 +25,7 @@
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/RenderLock.h"
+#include "components/UITheme.h"
 #include "Tailnet.h"
 #include "TailnetSysSwitches.h"
 #include "network/SavedWifiConnect.h"
@@ -56,6 +58,9 @@ std::atomic<bool> s_pending{false};   // a render was skipped
 uint32_t s_last_tick = 0;             // main task only
 uint32_t s_idle_since = 0;
 bool s_escalated = false;
+// TAILNET_PARK_DURING_CONNECT: the live catalog boot parks only while
+// Tailscale connects (tailnet_wifi_joined()).
+std::atomic<bool> s_connect_park{false};
 
 // Caller holds the RenderLock.
 bool unparkLocked() {
@@ -73,6 +78,12 @@ bool unparkLocked() {
 }  // namespace
 
 extern "C" void tailnet_network_phase_begin(uint32_t target) {
+#if TAILNET_PARK_DURING_CONNECT
+  if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG: see connectParked()
+    s_connect_park = true;
+    return;
+  }
+#endif
 #if TAILNET_PROBE_CATALOG_LIVE
   if (tailnet_lite() && target == 11) {  // BOOKORBIT_CATALOG, screen kept
     tailnet_probe_permit_unparked();
@@ -100,7 +111,7 @@ extern "C" bool tailnet_end_parked_network(void) {
 }
 
 extern "C" bool tailnet_display_park(void) {
-  if (!s_armed.load()) return false;
+  if (!s_armed.load() && !s_connect_park.load()) return false;
   if (s_parked.load()) return true;
   RenderLock lock;  // not while a render draws into it
   // Lent to a layout build (FrameBufferLoan): the bytes are in use; keep it.
@@ -116,6 +127,21 @@ extern "C" bool tailnet_display_park(void) {
   s_parked = true;
   LOG_INF("TNET", "Framebuffer parked for Tailscale: free %u -> %u maxAlloc=%u", before, ESP.getFreeHeap(),
           ESP.getMaxAllocHeap());
+#if TAILNET_PARK_DURING_CONNECT
+  if (s_connect_park.load()) {
+    // The framebuffer must come back in one block while Tailscale stays up, so
+    // nothing long-lived may settle in its hole. Fill the hole again while
+    // MicroLink allocates its context and tunnel task; the hold is freed just
+    // before the control session's task (ml_coord) is created, so only the
+    // control session's transient buffers use it (TailnetStacks.c).
+    const uint32_t freed = ESP.getFreeHeap() - before;
+    void* hold = freed > 64 ? heap_caps_malloc(freed - 64, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : nullptr;
+    LOG_INF("TNET", "Framebuffer hole %s (%u bytes) until the control session starts: free=%u maxAlloc=%u",
+            hold ? "held" : "NOT held", static_cast<unsigned>(freed > 64 ? freed - 64 : 0), ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+    if (hold) tailnet_hold_until_task(hold, "ml_coord");
+  }
+#endif
   return true;
 }
 
@@ -173,8 +199,58 @@ extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
   return true;
 }
 
+#if TAILNET_PARK_DURING_CONNECT
+namespace {
+// The live catalog boot on the C3: with the framebuffer kept, the control
+// session takes the heap down to ~4 KB and leaves it fragmented. The panel
+// keeps its image unpowered, so: draw a notice, park the framebuffer while
+// Tailscale connects, then take it back before the catalog draws.
+void connectParked() {
+  if (!tailnet_enabled() || !tailnet_joined()) {
+    s_connect_park = false;  // no Tailscale in this boot
+    return;
+  }
+  {
+    RenderLock lock;
+    if (renderer.hasFrameBuffer()) GUI.drawPopup(renderer, "Connecting to Tailscale...");
+  }
+  LOG_INF("TNET", "Live catalog: before park: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  tailnet_permit_start(false);  // the worker parks the framebuffer, then starts MicroLink
+  const bool ready = tailnet_wait_ready(20000);
+  tailnet_hold_release();  // if the control session never started
+  if (tailnet_status() == TAILNET_CONNECTED) tailnet_stack_report("Tailscale ready");
+  LOG_INF("TNET", "Live catalog: after connect (%s): free=%u maxAlloc=%u", ready ? "ready" : "not ready",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  bool back;
+  {
+    RenderLock lock;
+    back = unparkLocked();  // logs "Framebuffer back: free maxAlloc"
+  }
+  if (back) {
+    s_connect_park = false;
+    tailnet_probe_permit_unparked();  // a MicroLink restart from here on keeps the framebuffer
+    if (s_pending.exchange(false)) activityManager.requestUpdate(true);
+    return;
+  }
+  // No 52 KB block with Tailscale up: WiFi off, the worker stops MicroLink and
+  // the framebuffer comes back; the catalog's fetch then fails and shows its
+  // error screen (Back goes Home).
+  LOG_ERR("TNET", "Live catalog: no room for the framebuffer with Tailscale up; turning WiFi off");
+  SavedWifiConnect::disconnect();
+  if (!tailnet_display_ready(10000)) LOG_ERR("TNET", "Framebuffer still parked after the network was turned off");
+  s_connect_park = false;
+}
+}  // namespace
+#endif
+
 extern "C" void tailnet_wifi_joined(void) {
   tailnet_stack_report("WiFi joined");  // TailnetStacks.c (TAILNET_STACK_LOG)
+#if TAILNET_PARK_DURING_CONNECT
+  if (s_connect_park.load()) {
+    connectParked();
+    return;
+  }
+#endif
   // Returns at once unless this boot runs Tailscale (tailnet_permit_start()).
   tailnet_wait_ready(20000);
   if (tailnet_status() == TAILNET_CONNECTED) tailnet_stack_report("Tailscale ready");

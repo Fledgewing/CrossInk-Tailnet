@@ -68,9 +68,23 @@
 #define CROSSINK_TAILNET_WIFI_FAST_JOIN 0
 #endif
 
+// Live catalog boot (target 11, the C3): draw "Connecting to Tailscale",
+// park the framebuffer while Tailscale connects, and take it back once
+// Tailscale is ready, before the catalog draws (ui/TailnetNetPhase.cpp).
+#ifndef TAILNET_PARK_DURING_CONNECT
+#define TAILNET_PARK_DURING_CONNECT 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Holds a heap block (malloc'd) until the task named `task` is about to be
+// created, then frees it (the xTaskCreatePinnedToCore wrap; without
+// TAILNET_TASK_STACK_WRAP it is freed at once). Used to keep the parked
+// framebuffer's hole filled while MicroLink's long-lived memory is allocated.
+void tailnet_hold_until_task(void* block, const char* task);
+// Frees a held block now, if one is still held.
+void tailnet_hold_release(void);
 // Prints every task's stack high-water mark to the console, tagged `when`.
 // No-op unless TAILNET_STACK_LOG. Never call it inside a critical section.
 void tailnet_stack_report(const char* when);

@@ -74,6 +74,7 @@ SWITCHES = {
     "TAILNET_WIFI_NO_NVS":          (1,      1,      1),     # WiFi driver config never in NVS
     "TAILNET_WIFI_ALLOC_COUNT":     (0,      0,      0),     # measurement: WiFi driver heap totals
     "CROSSINK_TAILNET_WIFI_FAST_JOIN": (1,   1,      1),     # patch 0005: last channel+BSSID first
+    "TAILNET_PARK_DURING_CONNECT":  (1,      0,      0),     # live catalog: framebuffer parked while Tailscale connects
 }
 
 
