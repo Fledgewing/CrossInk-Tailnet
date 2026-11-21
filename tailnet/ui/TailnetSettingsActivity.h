@@ -17,6 +17,9 @@
 // ClockSyncActivity does) and off again on exit.
 class TailnetSettingsActivity final : public Activity {
  public:
+#if CROSSINK_TAILNET_SETTINGS_PIN
+  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
+#endif
   static constexpr const char* NAME = "TailnetSettings";
   TailnetSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity(NAME, renderer, mappedInput) {}

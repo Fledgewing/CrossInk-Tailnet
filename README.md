@@ -164,6 +164,23 @@ also wait for that sync. Nothing is shown while reading; without a network it si
 again at the next interval. Not on the X3: a sync does not fit in its memory beside an open
 book.
 
+## Settings PIN
+
+**Settings > System > Settings PIN** sets an optional 4-digit PIN (Up/Down change a digit,
+Confirm moves on). While one is set, the reader asks for it before opening Settings, the
+BookOrbit, KOReader and OPDS account screens, Quick Actions and button setup, the plugin
+installer, and before joining or forgetting a WiFi network. The web file transfer answers
+"settings locked" for its settings, WiFi, OPDS, font and plugin-file pages, and hidden files
+(`.crosspoint`, `.crossink`) stay hidden on the reader, in the web file manager and over
+WebDAV. Reading, the library, the BookOrbit catalog, downloads and sync stay open. Once
+entered, the PIN holds until you leave Settings or the reader sleeps.
+
+It is a lock against children, not security: anyone can take the SD card out and edit the
+settings files. The PIN is kept in the reader's internal memory, so deleting the settings file
+does not remove it. If it is forgotten, create an empty file named `unlock-settings` in the
+`.crossink` folder of the SD card and restart the reader: the PIN is removed and the file
+deleted.
+
 ## Limits
 
 - Only tailnet hosts go through the tunnel. Internet traffic (GitHub updates, public OPDS
