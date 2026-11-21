@@ -108,6 +108,68 @@ derp_wolfssl = bool(SWITCH_VALUES.get("ML_LITE_DERP_WOLFSSL"))
 if derp_wolfssl:
     env.Append(CPPDEFINES=["WOLFSSL_SHA384", "WOLFSSL_SHA512", "WOLFSSL_SP_384"])  # noqa: F821
 
+# --- Per-device switches ----------------------------------------------------------
+# One row per switch: its value for each env (default = X3/X4 on the ESP32-C3,
+# x4-pro, x4-classic). An environment variable of the same name overrides the
+# row for one build, e.g. CROSSINK_TAILNET_NET_LOOP_STACK=0 pio run -e default.
+# Pure improvements are on everywhere; trade-offs are on for the C3 only.
+SWITCH_ENVS = ("default", "x4-pro", "x4-classic")
+SWITCHES = {
+    # CrossInk patch 0004 (memory cuts); the C side reads include/CrossInkTailnetCuts.h.
+    # BookOrbit sync: a new TLS session needs this much free heap (0 = upstream's 55000)...
+    "CROSSINK_TAILNET_SYNC_TLS_FLOOR": (35000, 35000, 35000),
+    # ...and a largest free block this big (measured X3 handshake peaks: up to 24.0 KB).
+    "CROSSINK_TAILNET_SYNC_TLS_BLOCK": (24576, 24576, 24576),
+    # Catalog bursts (open, Home refresh, shelf options) share one keep-alive connection.
+    "CROSSINK_TAILNET_CATALOG_KEEPALIVE": (1, 1, 1),
+    # Catalog JSON filters built after the download instead of during it.
+    "CROSSINK_TAILNET_FILTER_AFTER_TLS": (1, 1, 1),
+    # wolfSSL (whole library): RSA public-key operations only (RsaKey 5368 -> ~2140 B).
+    # Needs WOLFSSL_NO_CLIENT_AUTH, which drops the client-certificate signing code: the
+    # reader never presents a client certificate (no wolfSSL_use_* call anywhere)...
+    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": (1, 1, 1),
+    # ...and no session cache (784 B of .bss): nothing calls wolfSSL_set_session, so the
+    # client cache was written and never read. Needs MicroLink lite-xcuts (ml_derp.c
+    # skips wolfSSL_CTX_set_session_cache_mode, which NO_SESSION_CACHE removes).
+    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": (1, 1, 1),
+    # .bss moved to the heap until used: dictionary worker stack (4452 B), MiniBidi
+    # buffers (3072 B), font prewarm scan array (2052 B).
+    "CROSSINK_TAILNET_DICT_STACK_ON_DEMAND": (1, 0, 0),
+    "CROSSINK_TAILNET_BIDI_ON_DEMAND": (1, 0, 0),
+    "CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND": (1, 0, 0),
+    # loopTask stack in a network boot, bytes (0 = FreeInkUI's 16 KB everywhere).
+    "CROSSINK_TAILNET_NET_LOOP_STACK": (10240, 0, 0),
+    # Catalog root: no entry-count requests unless cached.
+    "CROSSINK_TAILNET_SKIP_ROOT_COUNTS": (1, 0, 0),
+    # wolfSSL arena for BookOrbit/catalog requests, bytes (0 = off): one block reserved
+    # when WiFi joins, before Tailscale, so a fragmented heap cannot fail a handshake.
+    "CROSSINK_TAILNET_TLS_ARENA": (24576, 0, 0),
+}
+# Switches that are a wolfSSL define rather than a CrossInk one.
+WOLFSSL_SWITCH_DEFINES = {
+    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": ["WOLFSSL_RSA_PUBLIC_ONLY", "WOLFSSL_NO_CLIENT_AUTH"],
+    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": ["NO_SESSION_CACHE"],
+}
+
+
+def switch_value(name):
+    if name in os.environ:
+        return int(os.environ[name], 0)
+    column = SWITCH_ENVS.index(pioenv) if pioenv in SWITCH_ENVS else 0
+    return SWITCHES[name][column]
+
+
+_switch_defines = []
+for _name in SWITCHES:
+    _value = switch_value(_name)
+    if _name in WOLFSSL_SWITCH_DEFINES:
+        if _value:
+            _switch_defines += WOLFSSL_SWITCH_DEFINES[_name]
+    else:
+        _switch_defines.append((_name, _value))
+env.Append(CPPDEFINES=_switch_defines)  # noqa: F821  CrossInk, its libraries and wolfSSL
+print("Tailnet switches (" + pioenv + "): " + ", ".join(f"{_n}={switch_value(_n)}" for _n in SWITCHES))
+
 # --- 1. MicroLink as a library ------------------------------------------------
 
 # Same source list as MicroLink's CMakeLists.txt. Cellular, failover and the
