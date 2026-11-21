@@ -10,7 +10,7 @@
 //   1. With the framebuffer parked (the panel keeps its image): WiFi on, one
 //      register-only control session that returns the login URL, WiFi off.
 //   2. The QR code, drawn with the network off. The user approves the reader
-//      on a phone, then presses Confirm.
+//      on a phone, then presses Check.
 //   3. Framebuffer parked again (the QR stays on the panel), WiFi on, one more
 //      register-only session with the same node key: authorized now, or not
 //      yet (the QR again). WiFi off, then the result.

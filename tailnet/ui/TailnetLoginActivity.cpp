@@ -137,7 +137,7 @@ void TailnetLoginActivity::render(RenderLock&&) {
       const bool again = state == State::NotApproved;
       renderer.drawCenteredText(UI_12_FONT_ID, top, again ? "Not approved yet" : "Log in to your tailnet", true,
                                 EpdFontFamily::BOLD);
-      renderer.drawCenteredText(UI_10_FONT_ID, top + lineH + 8, "Scan, approve this reader, then press Confirm");
+      renderer.drawCenteredText(UI_10_FONT_ID, top + lineH + 8, "Scan, approve this reader, then press Check");
       renderer.drawCenteredText(SMALL_FONT_ID, top + 2 * lineH + 8, "The check takes up to a minute");
       const int qrTop = top + 3 * lineH + 16;
       const int qrBottom = pageHeight - metrics.buttonHintsHeight - 2 * lineH;
