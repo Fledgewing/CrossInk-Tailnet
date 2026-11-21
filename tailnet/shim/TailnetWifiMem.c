@@ -36,9 +36,17 @@
 
 void tailnet_log_emit(const char* format, ...);  // TailnetLog.cpp
 
+// Overridable for measurement builds (tailnet_build.py). ESP-IDF's floors:
+// static RX >= 2, dynamic TX >= 1; the RX BA window is capped below.
+#ifndef TAILNET_WIFI_STATIC_RX
 #define TAILNET_WIFI_STATIC_RX 3
+#endif
+#ifndef TAILNET_WIFI_DYNAMIC_RX
 #define TAILNET_WIFI_DYNAMIC_RX 8
+#endif
+#ifndef TAILNET_WIFI_DYNAMIC_TX
 #define TAILNET_WIFI_DYNAMIC_TX 8
+#endif
 
 esp_err_t __real_esp_wifi_init(const wifi_init_config_t* config);
 
