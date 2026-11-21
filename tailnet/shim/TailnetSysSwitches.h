@@ -62,6 +62,13 @@
 #define TAILNET_WIFI_ALLOC_COUNT 0  // count the WiFi driver's heap use (measurement)
 #endif
 
+// Tailscale's low-memory stop (Tailnet.cpp, lite builds): free internal RAM must stay
+// below 8 KB this long (ms, sampled every second) before Tailscale is stopped. 0 = at
+// once, the first sample below (the old behaviour).
+#ifndef TAILNET_LOW_MEMORY_HOLD_MS
+#define TAILNET_LOW_MEMORY_HOLD_MS 0
+#endif
+
 // CrossInk patch 0005: join the last-used channel and BSSID first, then fall
 // back to the full scan.
 #ifndef CROSSINK_TAILNET_WIFI_FAST_JOIN

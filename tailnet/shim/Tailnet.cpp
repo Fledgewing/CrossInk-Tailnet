@@ -22,6 +22,7 @@
 extern "C" {
 #include "TailnetNetPhase.h"
 #include "TailnetSysSwitches.h"
+#include <esp_timer.h>
 #include "microlink.h"
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
 void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, char* peer, size_t len);
@@ -103,6 +104,8 @@ std::atomic<bool> s_low_memory{false};     // stopped for memory this WiFi sessi
 // Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
 // stop working well before 0, and a session would only spin retries.
 constexpr size_t LOW_MEMORY_BYTES = 8 * 1024;
+// When free RAM first went below LOW_MEMORY_BYTES (0 = not below); worker task only.
+uint32_t s_low_since = 0;
 const char* NVS_KEY_LOGIN_URL = "login_url";  // the last login URL, for the login boot's QR
 #endif
 
@@ -573,7 +576,19 @@ void workerTask(void*) {
 #if CONFIG_ML_LITE
     if (s_running) {
       const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-      if (free_now < LOW_MEMORY_BYTES) {
+      const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+      if (free_now >= LOW_MEMORY_BYTES) {
+        if (s_low_since) TLOGI("Low memory over: %u bytes free", (unsigned)free_now);
+        s_low_since = 0;
+      } else if (!s_low_since) {
+        // A request's handshake or JSON parse dips for a moment and gives it back:
+        // stop only if it stays low (TAILNET_LOW_MEMORY_HOLD_MS).
+        s_low_since = now_ms | 1u;
+        TLOGW("Low memory: %u bytes free (lowest %u); stopping Tailscale if it lasts %u ms", (unsigned)free_now,
+              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL), (unsigned)TAILNET_LOW_MEMORY_HOLD_MS);
+      }
+      if (s_low_since && now_ms - s_low_since >= TAILNET_LOW_MEMORY_HOLD_MS) {
+        s_low_since = 0;
         TLOGE("Low memory: %u bytes free (lowest %u); stopping Tailscale until WiFi reconnects", (unsigned)free_now,
               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         s_low_memory = true;
@@ -581,6 +596,8 @@ void workerTask(void*) {
         setStatus(TAILNET_FAILED);
         continue;
       }
+    } else {
+      s_low_since = 0;
     }
 #endif
     refreshFromHandle();

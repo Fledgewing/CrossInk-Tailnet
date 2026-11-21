@@ -90,6 +90,8 @@ SWITCHES = {
     "TAILNET_STACK_TMR_SVC":              (1024,   0,      0),      # 2560: X3 used ~0.3 KB
     "TAILNET_LAZY_WORKER":                (1,      1,      1),      # tailnet worker only while needed
     "TAILNET_WORKER_STACK":               (4096,   6144,   6144),   # worker stack bytes; 6144: X3 used ~2.6 KB
+    # Low-memory stop only when free RAM stays < 8 KB this long (ms); 0 = first sample (lite builds only).
+    "TAILNET_LOW_MEMORY_HOLD_MS":         (5000,   0,      0),
     # --- WiFi driver init (shim/TailnetWifiMem.c). Buffer counts: 0 = the framework's
     # count; any count set also turns AMPDU TX off and caps the RX BA window.
     # Small tier: the live catalog (framebuffer kept) and every boot not listed below.
