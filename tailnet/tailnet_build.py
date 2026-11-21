@@ -116,6 +116,10 @@ SWITCHES = {
     "CROSSINK_TAILNET_SYNC_TLS_BLOCK":    (24576,  24576,  24576),
     # Catalog bursts (open, Home refresh, shelf options) share one keep-alive connection.
     "CROSSINK_TAILNET_CATALOG_KEEPALIVE": (1,      1,      1),
+    # ...and in the catalog boot (BOOKORBIT_CATALOG) one connection for the whole boot, not per
+    # burst: its wolfSSL session sits in the TLS arena, so list screens reuse it instead of a fresh
+    # handshake next to the resident UI. Inert on the S3 readers (no catalog boot there).
+    "CROSSINK_TAILNET_CATALOG_BOOT_SESSION": (1,   1,      1),
     # Catalog JSON filters built after the download instead of during it.
     "CROSSINK_TAILNET_FILTER_AFTER_TLS":  (1,      1,      1),
     # wolfSSL (whole library): RSA public-key operations only (RsaKey 5368 -> ~2140 B).

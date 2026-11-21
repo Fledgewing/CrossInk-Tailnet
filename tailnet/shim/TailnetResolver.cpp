@@ -26,6 +26,10 @@
 #include <strings.h>
 
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <atomic>
 
 #include "Tailnet.h"
 
@@ -73,7 +77,20 @@ extern "C" int __wrap_lwip_getaddrinfo(const char* nodename, const char* servnam
   return __real_lwip_getaddrinfo(nodename, servname, hints, res);
 }
 
+namespace {
+// tailnet_connect_count(): the task counted, and its connects so far.
+std::atomic<TaskHandle_t> s_counted_task{nullptr};
+std::atomic<uint32_t> s_counted_connects{0};
+}  // namespace
+
+extern "C" uint32_t tailnet_connect_count(void) {
+  TaskHandle_t expected = nullptr;
+  s_counted_task.compare_exchange_strong(expected, xTaskGetCurrentTaskHandle());
+  return s_counted_connects.load();
+}
+
 extern "C" int __wrap_lwip_connect(int s, const struct sockaddr* name, socklen_t namelen) {
+  if (s_counted_task.load() == xTaskGetCurrentTaskHandle()) s_counted_connects.fetch_add(1);
   if (name && name->sa_family == AF_INET && namelen >= sizeof(struct sockaddr_in) &&
       reinterpret_cast<const struct sockaddr_in*>(name)->sin_addr.s_addr == 0) {
     // 0.0.0.0: the name did not resolve (e.g. the network was turned off).

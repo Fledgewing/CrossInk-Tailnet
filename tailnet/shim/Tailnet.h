@@ -130,6 +130,9 @@ void tailnet_probe_heap(const char* step);
 void tailnet_probe_window_begin(const char* what);
 void tailnet_probe_window_mark(const char* what, const char* phase);
 void tailnet_probe_window_end(const char* what, const char* phase);
+// TCP connects made so far by the task that first called this (the catalog's request
+// task): a catalog request that made none reused its kept connection.
+uint32_t tailnet_connect_count(void);
 
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.
