@@ -1,0 +1,34 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index e9743f4a..6ec7b3d3 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -55,6 +55,12 @@
+ #define CROSSINK_TAILNET_SKIP_ROOT_COUNTS 0
+ #endif
+ 
++// Render task (ActivityManager) stack, in bytes, in a network boot (overlay patch
++// 0006). Reader boots keep their own size. 0 = upstream's 8 KB; below 4096 is ignored.
++#ifndef CROSSINK_TAILNET_NET_RENDER_STACK
++#define CROSSINK_TAILNET_NET_RENDER_STACK 0
++#endif
++
+ #if CROSSINK_TAILNET_NET_LOOP_STACK
+ // Logs the calling task's stack high-water mark (bytes never used), for the
+ // network-boot loopTask stack cut. Defined in main.cpp.
+diff --git a/src/main.cpp b/src/main.cpp
+index 63de5fce..f489265d 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -399,7 +399,11 @@ void crossinkTailnetLogStackHighWater(const char* where) {
+ #elif CROSSINK_TAILNET_NET_LOOP_STACK
+ void crossinkTailnetLogStackHighWater(const char*) {}
+ #endif
+-constexpr uint32_t NETWORK_RENDER_TASK_STACK_BYTES = 8192;
++// CROSSINK_TAILNET_NET_RENDER_STACK (overlay patch 0006): the network render stack, bytes;
++// 0 keeps upstream's 8 KB. The X3's stack report (TAILNET_STACK_LOG, task ActivityManager)
++// showed 2.6 KB used over catalog, download and sync.
++constexpr uint32_t NETWORK_RENDER_TASK_STACK_BYTES =
++    CROSSINK_TAILNET_NET_RENDER_STACK >= 4096 ? CROSSINK_TAILNET_NET_RENDER_STACK : 8192;
+ // FreeType's anti-aliased rasterizer reserves a 16 KiB scratch pool on its
+ // caller's stack. Scalable fonts are S3-only, so leave C3's constrained reader
+ // stack unchanged and give S3 reader renders room for their normal call frames.

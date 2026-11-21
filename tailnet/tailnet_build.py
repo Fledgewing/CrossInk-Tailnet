@@ -78,17 +78,18 @@ SWITCHES = {
     "CONFIG_ML_H2_BUFFER_SIZE_KB":        (48,     None,   None),   # map buffers in internal RAM
     "CONFIG_ML_JSON_BUFFER_SIZE_KB":      (48,     None,   None),
     # --- System (shim/TailnetSysSwitches.h). Stack sizes are bytes, 0 = the framework's
-    # own size; the proposed C3 size is in each comment, to set from the X3's stack report.
+    # own size; each comment gives the size as created and the X3's worst use over catalog,
+    # download and sync (TAILNET_STACK_LOG report).
     "TAILNET_STACK_LOG":                  (1,      0,      0),      # measurement: task stack report
     "TAILNET_TASK_STACK_WRAP":            (1,      0,      0),      # links the size table below
-    "TAILNET_STACK_ESP_TIMER":            (0,      0,      0),      # 4096 -> 4096 proposed (measure)
-    "TAILNET_STACK_TCPIP":                (0,      0,      0),      # 4096 -> 3072 proposed
-    "TAILNET_STACK_ARDUINO_EVENTS":       (0,      0,      0),      # 4096 -> 2560 proposed
-    "TAILNET_STACK_SYS_EVT":              (0,      0,      0),      # 2048 -> 2048 proposed (measure)
-    "TAILNET_STACK_WIFI":                 (0,      0,      0),      # driver's own size; measure first
-    "TAILNET_STACK_TMR_SVC":              (0,      0,      0),      # 2560 -> 1536 proposed (no SW timers)
+    "TAILNET_STACK_ESP_TIMER":            (2048,   0,      0),      # 4608: X3 used ~0.4 KB
+    "TAILNET_STACK_TCPIP":                (3072,   0,      0),      # 4608: X3 used ~1.2 KB
+    "TAILNET_STACK_ARDUINO_EVENTS":       (0,      0,      0),      # 4096: X3 used ~2.3 KB, kept
+    "TAILNET_STACK_SYS_EVT":              (2048,   0,      0),      # 4608: X3 used ~0.9 KB
+    "TAILNET_STACK_WIFI":                 (0,      0,      0),      # driver's own size (not tunable)
+    "TAILNET_STACK_TMR_SVC":              (1024,   0,      0),      # 2560: X3 used ~0.3 KB
     "TAILNET_LAZY_WORKER":                (1,      1,      1),      # tailnet worker only while needed
-    "TAILNET_WORKER_STACK":               (6144,   6144,   6144),   # worker stack bytes (measure, then shrink on C3)
+    "TAILNET_WORKER_STACK":               (4096,   6144,   6144),   # worker stack bytes; 6144: X3 used ~2.6 KB
     # --- WiFi driver init (shim/TailnetWifiMem.c). Buffer counts: 0 = the framework's
     # count; any count set also turns AMPDU TX off and caps the RX BA window.
     "TAILNET_WIFI_STATIC_RX":             (2,      0,      0),
@@ -123,7 +124,9 @@ SWITCHES = {
     "CROSSINK_TAILNET_BIDI_ON_DEMAND":    (1,      0,      0),
     "CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND": (1,    0,      0),
     # loopTask stack in a network boot, bytes (0 = FreeInkUI's 16 KB everywhere).
-    "CROSSINK_TAILNET_NET_LOOP_STACK":    (10240,  0,      0),
+    "CROSSINK_TAILNET_NET_LOOP_STACK":    (10240,  0,      0),      # X3 catalog used ~8.6 KB: keep
+    # Render task (ActivityManager) stack in a network boot, bytes (patch 0006; 0 = upstream's 8 KB).
+    "CROSSINK_TAILNET_NET_RENDER_STACK":  (6144,   0,      0),      # 8192: X3 used ~2.6 KB
     # Catalog root: no entry-count requests unless cached. Off everywhere: with
     # keep-alive the counts cost round trips, not handshakes, and skipping them shows.
     "CROSSINK_TAILNET_SKIP_ROOT_COUNTS":  (0,      0,      0),
