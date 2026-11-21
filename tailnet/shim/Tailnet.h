@@ -91,6 +91,22 @@ int tailnet_relay_regions(uint16_t* ids, char (*codes)[8], int max);
 // Region code for an id ("" if unknown); our current home region code.
 void tailnet_relay_code(uint16_t id, char* out, size_t len);
 
+// Small-memory (lite) build: the ESP32-C3 readers, no PSRAM. MicroLink and the
+// display's framebuffer do not fit together there, so MicroLink starts only in
+// the boots that free the framebuffer for it (TailnetNetPhase.h), which call
+// tailnet_permit_start(); elsewhere WiFi works without Tailscale. Login is its
+// own boot: register_only makes MicroLink only register (no map, no relay).
+bool tailnet_lite(void);
+void tailnet_permit_start(bool register_only);
+// Login boot: waits until the register-only session has an answer:
+// TAILNET_NEEDS_LOGIN (tailnet_login_url() has the URL), TAILNET_CONNECTED
+// (logged in), TAILNET_FAILED (not accepted, or stopped for low memory), or
+// anything else after timeout_ms (no answer).
+tailnet_status_t tailnet_login_session(uint32_t timeout_ms);
+// Lite builds: the login URL the last login session got (kept in NVS until
+// the reader is logged in), for the QR once the network is off again.
+bool tailnet_saved_login_url(char* buf, size_t len);
+
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.
 bool tailnet_log_line(int newest_index, char* buf, size_t len);

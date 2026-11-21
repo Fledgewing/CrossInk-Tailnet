@@ -12,6 +12,27 @@ index 0af1308..0babbcc 100644
  
    // Lend the framebuffer's ~48 KB STORAGE to a memory-hungry phase (chapter
    // builds) without freeing it: the allocation never moves, so repeated loans
+diff --git a/src/SilentRestart.h b/src/SilentRestart.h
+index 164f9c4..9f293a4 100644
+--- a/src/SilentRestart.h
++++ b/src/SilentRestart.h
+@@ -3,6 +3,8 @@
+ #include <cstdint>
+ #include <string>
+ 
++#include "TailnetNetPhase.h"
++
+ // ESP.restart() with an RTC_NOINIT flag that survives the reboot, so setup()
+ // skips the boot splash and routes straight to a destination. Used to clear
+ // heap fragmentation accumulated during a wifi session.
+@@ -70,6 +72,7 @@ constexpr bool isNetworkBootTargetValue(const uint32_t value) {
+     case NetworkBootTarget::BOOKORBIT_CATALOG:
+     case NetworkBootTarget::BOOKORBIT_HOME_REFRESH:
+     case NetworkBootTarget::BOOKORBIT_HOME_SHELVES:
++    case static_cast<NetworkBootTarget>(TAILNET_LOGIN_TARGET):
+       return true;
+   }
+   return false;
 diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
 index 933e79a..06f0016 100644
 --- a/src/activities/ActivityManager.cpp
@@ -42,7 +63,7 @@ index 933e79a..06f0016 100644
      currentActivity->loop();
      // USB Drive normally restarts the device rather than replacing itself. The
 diff --git a/src/main.cpp b/src/main.cpp
-index 4dbb32b..b7cca27 100644
+index 4dbb32b..058fa3f 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -133,6 +133,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
@@ -96,3 +117,13 @@ index 4dbb32b..b7cca27 100644
        break;
      case BootResume::SplashlessWake:
        // One-shot flag: re-arm the splash for the next ordinary boot. Save
+@@ -1872,6 +1875,9 @@ void setup() {
+         }
+         break;
+       }
++      case static_cast<NetworkBootTarget>(TAILNET_LOGIN_TARGET):
++        launched = tailnet_login_boot();
++        break;
+       case NetworkBootTarget::BOOKORBIT_HOME_SHELVES: {
+         auto shelves = makeUniqueNoThrow<BookOrbitSettingsActivity>(
+             renderer, mappedInputManager, BookOrbitSettingsActivity::Page::Home, /*networkBoot=*/true);

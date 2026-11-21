@@ -4,6 +4,7 @@
 #include "Tailnet.h"
 
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -85,12 +86,39 @@ std::atomic<int> s_server_rgn{0};
 std::atomic<uint32_t> s_server_ip{0};
 bool s_relay_matched = false;  // worker only: one match-server restart per WiFi session
 
+#if CONFIG_ML_LITE
+// Lite builds (the C3: no PSRAM) start MicroLink only in boots that hand it
+// the framebuffer's memory (TailnetNetPhase.h): tailnet_permit_start().
+std::atomic<bool> s_permit{false};
+std::atomic<bool> s_register_only{false};  // the login boot: register, nothing more
+bool s_low_memory = false;                 // worker only: stopped for memory this WiFi session
+// Below this much free internal RAM MicroLink is stopped: WiFi, lwIP and DNS
+// stop working well before 0, and a session would only spin retries.
+constexpr size_t LOW_MEMORY_BYTES = 8 * 1024;
+const char* NVS_KEY_LOGIN_URL = "login_url";  // the last login URL, for the login boot's QR
+#endif
+
 uint8_t loadFlag(const char* key, std::atomic<int>& cache);
 void storeFlag(const char* key, std::atomic<int>& cache, bool value);
 
 void setStatus(tailnet_status_t st) {
   if (s_status.exchange(st) != st) s_generation.fetch_add(1);
 }
+
+#if CONFIG_ML_LITE
+// "" erases it.
+void saveLoginUrl(const char* url) {
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  if (url[0]) {
+    nvs_set_str(h, NVS_KEY_LOGIN_URL, url);
+  } else {
+    nvs_erase_key(h, NVS_KEY_LOGIN_URL);
+  }
+  nvs_commit(h);
+  nvs_close(h);
+}
+#endif
 
 void post(Request r) {
   if (s_queue) xQueueSend(s_queue, &r, 0);
@@ -130,11 +158,19 @@ void refreshFromHandle() {
       if (changed) {
         TLOGW("Tailscale login needed: %s", url);
         s_generation.fetch_add(1);
+#if CONFIG_ML_LITE
+        saveLoginUrl(url);
+#endif
       }
     }
   }
   s_ip.store(st == ML_STATE_CONNECTED ? microlink_get_vpn_ip(s_ml) : 0);
-  if (st == ML_STATE_CONNECTED) storeFlag(NVS_KEY_JOINED, s_joined, true);
+  if (st == ML_STATE_CONNECTED && !loadFlag(NVS_KEY_JOINED, s_joined)) {
+    storeFlag(NVS_KEY_JOINED, s_joined, true);
+#if CONFIG_ML_LITE
+    saveLoginUrl("");
+#endif
+  }
   setStatus(mapState(st));
 }
 
@@ -275,8 +311,16 @@ void storePin(uint32_t ip) {
 void startMl() {
   if (s_running) return;
 #if CONFIG_ML_LITE
-  // TailnetNetPhase.h: hand the display's framebuffer to the heap first.
-  if (tailnet_display_park) tailnet_display_park();
+  // TailnetNetPhase.h: hand the display's framebuffer to the heap first. The
+  // C3 cannot hold both, so no framebuffer parked, no MicroLink.
+  if (!tailnet_display_park || !tailnet_display_park()) {
+    TLOGW("Not starting: the display framebuffer could not be parked");
+    return;
+  }
+  microlink_control_register_only(s_register_only.load());
+  TLOGI("Starting%s (internal heap free %u, largest %u)", s_register_only.load() ? " for login" : "",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 #endif
   if (!s_ml) {
     microlink_config_t cfg = {};
@@ -306,7 +350,11 @@ void startMl() {
 }
 
 void reconcile() {
+#if CONFIG_ML_LITE
+  const bool want = s_wifi_up && loadEnabled() && s_permit.load() && !s_low_memory;
+#else
   const bool want = s_wifi_up && loadEnabled();
+#endif
   if (want && !s_running) startMl();
   if (!want && s_running) stopMl();
 #if CONFIG_ML_LITE
@@ -317,6 +365,7 @@ void reconcile() {
       microlink_destroy(s_ml);
       s_ml = nullptr;
     }
+    s_low_memory = false;
     if (tailnet_display_unpark) tailnet_display_unpark();
   }
 #endif
@@ -382,6 +431,19 @@ void workerTask(void*) {
       }
       reconcile();
     }
+#if CONFIG_ML_LITE
+    if (s_running) {
+      const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+      if (free_now < LOW_MEMORY_BYTES) {
+        TLOGE("Low memory: %u bytes free (lowest %u); stopping Tailscale until WiFi reconnects", (unsigned)free_now,
+              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+        s_low_memory = true;
+        stopMl();
+        setStatus(TAILNET_FAILED);
+        continue;
+      }
+    }
+#endif
     refreshFromHandle();
     if (s_running && tailnet_status() == TAILNET_CONNECTED) {
       matchServerRegion();
@@ -668,4 +730,52 @@ extern "C" void tailnet_relay_code(uint16_t id, char* out, size_t len) {
     }
   }
   snprintf(out, len, "region %u", (unsigned)id);
+}
+
+extern "C" bool tailnet_lite(void) {
+#if CONFIG_ML_LITE
+  return true;
+#else
+  return false;
+#endif
+}
+
+extern "C" void tailnet_permit_start(bool register_only) {
+#if CONFIG_ML_LITE
+  s_register_only = register_only;
+  s_permit = true;
+  post(REQ_RECHECK);
+#else
+  (void)register_only;
+#endif
+}
+
+extern "C" tailnet_status_t tailnet_login_session(uint32_t timeout_ms) {
+  const TickType_t start = xTaskGetTickCount();
+  for (;;) {
+    const tailnet_status_t st = tailnet_status();
+    char url[TAILNET_LOGIN_URL_MAX];
+    if (st == TAILNET_CONNECTED || st == TAILNET_FAILED || (st == TAILNET_NEEDS_LOGIN && tailnet_login_url(url, sizeof(url)))) {
+      return st;
+    }
+    if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeout_ms)) {
+      TLOGW("Login session: no answer from Tailscale after %lu ms", (unsigned long)timeout_ms);
+      return st;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+extern "C" bool tailnet_saved_login_url(char* buf, size_t len) {
+  if (!buf || len == 0) return false;
+  buf[0] = '\0';
+#if CONFIG_ML_LITE
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+    size_t n = len;
+    if (nvs_get_str(h, NVS_KEY_LOGIN_URL, buf, &n) != ESP_OK) buf[0] = '\0';
+    nvs_close(h);
+  }
+#endif
+  return buf[0] != '\0';
 }

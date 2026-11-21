@@ -1,15 +1,17 @@
 // The display framebuffer goes back to the heap while Tailscale runs (ESP32-C3).
+// Lite builds start Tailscale only in these boots (Tailnet.h, tailnet_lite()).
 //
 // On the X3 (ESP32-C3, no PSRAM) CrossInk keeps one ~52 KB framebuffer (48 KB on
 // the X4) in internal RAM for the whole boot. In the minimal network boots that
 // draw nothing the user must answer while WiFi is up (BookOrbit sync, the sync
-// behind the sleep screen, the BookOrbit Home refresh), it is freed before
-// MicroLink starts and allocated again once WiFi is off and MicroLink has freed
-// its memory. The e-ink panel keeps its last image unpowered meanwhile; screens
+// behind the sleep screen, the BookOrbit Home refresh, the login boot), it is
+// freed before MicroLink starts and allocated again once WiFi is off and
+// MicroLink has freed its memory. The e-ink panel keeps its last image unpowered meanwhile; screens
 // asked for in between are drawn once the framebuffer is back.
 //
 // Implemented in tailnet/ui/TailnetNetPhase.cpp (it needs CrossInk's renderer);
-// CrossInk calls the first four, the shim's worker calls the last two.
+// CrossInk calls tailnet_login_boot() and the next four; the shim's worker
+// calls the last two.
 #pragma once
 
 #include <stdbool.h>
@@ -18,6 +20,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// The overlay's own network boot (a NetworkBootTarget value well clear of
+// upstream's): Settings > Tailscale > Log in on the C3 (TailnetLoginActivity).
+#define TAILNET_LOGIN_TARGET 64u
+
+// main.cpp, in that boot: starts the login screen. False if it could not.
+bool tailnet_login_boot(void);
 
 // main.cpp, once the minimal network boot is ready. Arms parking for the boots
 // listed above (target is a NetworkBootTarget value), on the C3 only.
@@ -37,8 +46,9 @@ void tailnet_display_tick(void);
 bool tailnet_display_ready(uint32_t timeout_ms);
 
 // Shim worker: before MicroLink starts / after WiFi is down and MicroLink freed.
-// Weak, so builds without the UI side still link.
-void tailnet_display_park(void) __attribute__((weak));
+// park() is false when this boot does not park (MicroLink then stays off on
+// the C3). Weak, so builds without the UI side still link.
+bool tailnet_display_park(void) __attribute__((weak));
 void tailnet_display_unpark(void) __attribute__((weak));
 
 #ifdef __cplusplus

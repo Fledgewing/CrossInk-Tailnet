@@ -9,7 +9,9 @@
 #include <cstring>
 
 #include "MappedInputManager.h"
+#include "SilentRestart.h"
 #include "Tailnet.h"
+#include "TailnetNetPhase.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/TouchHeaderBackButton.h"
@@ -44,7 +46,8 @@ std::string statusLine() {
       return "Could not connect (see serial log)";
     case TAILNET_OFF:
     default:
-      return tailnet_joined() ? "On; connects when WiFi is on" : "On; not logged in";
+      if (!tailnet_joined()) return "On; not logged in";
+      return tailnet_lite() ? "On; connects for BookOrbit syncs" : "On; connects when WiFi is on";
   }
 }
 
@@ -69,6 +72,12 @@ void TailnetSettingsActivity::onExit() {
 void TailnetSettingsActivity::startLogin() {
   loggedOutNotice = false;
   if (!tailnet_enabled()) tailnet_set_enabled(true);
+  if (tailnet_lite()) {
+    // The C3 cannot hold this screen and Tailscale at once: log in from a
+    // network boot of its own (TailnetLoginActivity).
+    silentRestartToNetwork(static_cast<NetworkBootTarget>(TAILNET_LOGIN_TARGET));
+    return;
+  }
   mode = Mode::LOGIN;
   if (WiFi.status() == WL_CONNECTED) {
     requestUpdate();

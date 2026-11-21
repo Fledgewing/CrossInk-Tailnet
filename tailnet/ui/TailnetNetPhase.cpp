@@ -24,6 +24,7 @@
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/RenderLock.h"
+#include "Tailnet.h"
 #include "network/SavedWifiConnect.h"
 
 extern GfxRenderer renderer;  // main.cpp
@@ -31,9 +32,12 @@ extern GfxRenderer renderer;  // main.cpp
 namespace {
 
 // NetworkBootTarget values (SilentRestart.h) whose screens need no answer while
-// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_HOME_REFRESH.
-// (A sync that asks which position to keep is covered by the tick's fallback.)
-bool parksFor(uint32_t target) { return target == 8 || target == 9 || target == 12; }
+// WiFi is up: BOOKORBIT_SYNC, BOOKORBIT_SLEEP_SYNC, BOOKORBIT_HOME_REFRESH, and
+// the overlay's own login boot. (A sync that asks which position to keep is
+// covered by the tick's fallback.) Only these boots run Tailscale on the C3.
+bool parksFor(uint32_t target) {
+  return target == 8 || target == 9 || target == 12 || target == TAILNET_LOGIN_TARGET;
+}
 
 std::atomic<bool> s_armed{false};
 std::atomic<bool> s_parked{false};
@@ -59,25 +63,30 @@ bool unparkLocked() {
 }  // namespace
 
 extern "C" void tailnet_network_phase_begin(uint32_t target) {
-#if CONFIG_IDF_TARGET_ESP32C3
-  s_armed = parksFor(target);
-#else
-  (void)target;  // the S3 readers keep the framebuffer in PSRAM
-#endif
+  // The S3 readers keep the framebuffer in PSRAM and run Tailscale anywhere.
+  if (!tailnet_lite() || !parksFor(target)) return;
+  s_armed = true;
+  tailnet_permit_start(target == TAILNET_LOGIN_TARGET);
 }
 
-extern "C" void tailnet_display_park(void) {
-  if (!s_armed.load() || s_parked.load()) return;
+extern "C" bool tailnet_display_park(void) {
+  if (!s_armed.load()) return false;
+  if (s_parked.load()) return true;
   RenderLock lock;  // not while a render draws into it
   // Lent to a layout build (FrameBufferLoan): the bytes are in use; keep it.
-  if (!renderer.hasFrameBuffer()) return;
+  if (!renderer.hasFrameBuffer()) {
+    LOG_ERR("TNET", "Framebuffer lent to a build; not parking it");
+    return false;
+  }
   const uint32_t before = ESP.getFreeHeap();
   display.releaseFrameBuffer();
   renderer.releaseFrameBufferForBuild();  // nothing left to lend: just clears the renderer's pointer
   s_net_down = false;
+  s_escalated = false;
   s_parked = true;
   LOG_INF("TNET", "Framebuffer parked for Tailscale: free %u -> %u maxAlloc=%u", before, ESP.getFreeHeap(),
           ESP.getMaxAllocHeap());
+  return true;
 }
 
 extern "C" void tailnet_display_unpark(void) {
