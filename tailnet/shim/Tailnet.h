@@ -106,6 +106,15 @@ tailnet_status_t tailnet_login_session(uint32_t timeout_ms);
 // Lite builds: the login URL the last login session got (kept in NVS until
 // the reader is logged in), for the QR once the network is off again.
 bool tailnet_saved_login_url(char* buf, size_t len);
+// Called once WiFi has joined, before the first request (TailnetNetPhase.h's
+// tailnet_wifi_joined()): in a lite build's parked network boot, blocks until
+// Tailscale can carry traffic: control session done and closed (its memory
+// back), BookOrbit server in the peer table, WireGuard tunnel to it up. At most
+// timeout_ms. Returns at once elsewhere. False if Tailscale did not connect.
+bool tailnet_wait_ready(uint32_t timeout_ms);
+// Before turning WiFi off: waits (up to timeout_ms) for a running control
+// session to finish.
+void tailnet_wait_idle(uint32_t timeout_ms);
 
 // Recent MicroLink and shim log lines, newest first (index 0). False past the
 // end. Captured in RAM because the framework's console log is mostly off.

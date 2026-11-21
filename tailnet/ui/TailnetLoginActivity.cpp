@@ -52,6 +52,7 @@ void TailnetLoginActivity::runSession() {
     st = tailnet_login_session(SESSION_TIMEOUT_MS);
     if (st == TAILNET_NEEDS_LOGIN && tailnet_login_url(buf, sizeof(buf))) url = buf;
   }
+  tailnet_wait_idle(10000);  // never cut a control session off mid-exchange
   SavedWifiConnect::disconnect();
   if (!tailnet_display_ready(FRAMEBUFFER_BACK_MS)) {
     LOG_ERR("TNET", "Login: framebuffer did not come back; restarting");

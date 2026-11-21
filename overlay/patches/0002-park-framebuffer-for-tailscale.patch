@@ -71,6 +71,26 @@ index 933e79a..3793a7e 100644
    // Replace for the same reason as the catalog: authentication is a TLS session, and the
    // settings screens it is reached through hold 15-20KB that the handshake needs. Nothing
    // is lost by dropping them — the activity ends in a silentRestart() to the home screen
+diff --git a/src/activities/network/WifiSelectionActivity.cpp b/src/activities/network/WifiSelectionActivity.cpp
+index 44125d2..2070975 100644
+--- a/src/activities/network/WifiSelectionActivity.cpp
++++ b/src/activities/network/WifiSelectionActivity.cpp
+@@ -24,6 +24,7 @@
+ #include "components/UIThemeTokens.h"
+ #include "components/UiAppHelpers.h"
+ #include "fontIds.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace fui = freeink::ui;
+ 
+@@ -758,6 +759,7 @@ void WifiSelectionActivity::checkConnectionStatus() {
+     sConnectionAttemptLoggingActive = false;
+ #endif
+     LOG_INF("WIFI", "Connected to ssid=%s ip=%s rssi=%d", selectedSSID.c_str(), connectedIP.c_str(), WiFi.RSSI());
++    tailnet_wifi_joined();
+ 
+ #if defined(ENABLE_SERIAL_LOG) && LOG_LEVEL >= 2
+     uint8_t connectedBssid[6] = {};
 diff --git a/src/main.cpp b/src/main.cpp
 index 4dbb32b..e12fc03 100644
 --- a/src/main.cpp
@@ -139,3 +159,23 @@ index 4dbb32b..e12fc03 100644
        case NetworkBootTarget::BOOKORBIT_HOME_SHELVES: {
          auto shelves = makeUniqueNoThrow<BookOrbitSettingsActivity>(
              renderer, mappedInputManager, BookOrbitSettingsActivity::Page::Home, /*networkBoot=*/true);
+diff --git a/src/network/SavedWifiConnect.cpp b/src/network/SavedWifiConnect.cpp
+index 178cecc..cbd6c63 100644
+--- a/src/network/SavedWifiConnect.cpp
++++ b/src/network/SavedWifiConnect.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "WifiCredentialStore.h"
++#include "TailnetNetPhase.h"
+ 
+ namespace {
+ // WifiSelectionActivity's own figures: its auto-connect timeout, and the heap below
+@@ -52,6 +53,7 @@ bool join(const WifiCredential& credential, const SavedWifiConnect::StopCheck sh
+       LOG_INF("WIFI", "Joined %s (rssi=%d)", credential.ssid.c_str(), WiFi.RSSI());
+       // Next time, the network that answered here is the first one tried.
+       WIFI_STORE.setLastConnectedSsid(credential.ssid);
++      tailnet_wifi_joined();
+       return true;
+     }
+     if (isJoinFailure(status)) break;

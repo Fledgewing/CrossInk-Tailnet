@@ -5,6 +5,7 @@
 
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -787,4 +788,65 @@ extern "C" bool tailnet_saved_login_url(char* buf, size_t len) {
   }
 #endif
   return buf[0] != '\0';
+}
+
+namespace {
+uint32_t elapsedMs(TickType_t start) { return (uint32_t)((xTaskGetTickCount() - start) * portTICK_PERIOD_MS); }
+
+void logHeap(const char* what, TickType_t start) {
+  TLOGI("%s after %lu ms: heap free %u, largest block %u", what, (unsigned long)elapsedMs(start),
+        (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+}  // namespace
+
+extern "C" bool tailnet_wait_ready(uint32_t timeout_ms) {
+#if CONFIG_ML_LITE
+  // Only the parked network boots run Tailscale, and the login boot needs no
+  // traffic, only its register-only session.
+  if (!s_permit.load() || s_register_only.load() || !loadEnabled() || !tailnet_joined()) return true;
+  const TickType_t start = xTaskGetTickCount();
+  auto left = [&]() -> uint32_t {
+    const uint32_t e = elapsedMs(start);
+    return e < timeout_ms ? timeout_ms - e : 0;
+  };
+  TLOGI("Waiting for Tailscale before the first request (up to %lu ms)", (unsigned long)timeout_ms);
+  if (!tailnet_wait_connected(timeout_ms)) {
+    TLOGW("Tailscale not ready (status %d)", (int)tailnet_status());
+    logHeap("Tailscale wait over", start);
+    return false;
+  }
+  // The one-shot control session closes once its map is in: its task stack
+  // and Noise/H2 buffers come back then, and the request's heap check needs them.
+  while (s_ml && microlink_control_busy(s_ml) && left() > 0) vTaskDelay(pdMS_TO_TICKS(50));
+  if (s_ml && microlink_control_busy(s_ml)) TLOGW("Control session still running");
+  const uint32_t ip = serverIp();
+  bool up = false;
+  if (ip && s_ml) {
+    for (int i = 0; i < 30 && !peerKnown(ip) && left() > 0; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (peerKnown(ip)) {
+      up = left() > 0 && bringUpTunnel(ip, left());
+    } else {
+      TLOGW("BookOrbit server %u.%u.%u.%u not in the peer table yet", IP_ARGS(ip));
+    }
+  }
+  TLOGI("Tailscale ready: server %u.%u.%u.%u, tunnel %s", IP_ARGS(ip), up ? "up" : "not up yet");
+  logHeap("Tailscale wait over", start);
+  return true;
+#else
+  (void)timeout_ms;
+  return true;
+#endif
+}
+
+extern "C" void tailnet_wait_idle(uint32_t timeout_ms) {
+  // Before WiFi goes off: a control session cut mid-exchange leaves the coord
+  // task retrying against a dead socket (errno 113) until it gives up.
+  const TickType_t start = xTaskGetTickCount();
+  while (s_ml && microlink_control_busy(s_ml)) {
+    if (elapsedMs(start) >= timeout_ms) {
+      TLOGW("Control session still running after %lu ms; turning WiFi off anyway", (unsigned long)timeout_ms);
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
 }

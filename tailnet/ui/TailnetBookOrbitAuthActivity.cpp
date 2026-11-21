@@ -66,6 +66,7 @@ void TailnetBookOrbitAuthActivity::run() {
   }
   LOG_INF("TNET", "BookOrbit authentication: result %d (tailnet status %d), free=%u maxAlloc=%u",
           static_cast<int>(result), static_cast<int>(tailnet_status()), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  tailnet_wait_idle(10000);  // never cut a control session off mid-exchange
   SavedWifiConnect::disconnect();
   if (!tailnet_display_ready(FRAMEBUFFER_BACK_MS)) {
     LOG_ERR("TNET", "BookOrbit authentication: framebuffer did not come back; restarting");

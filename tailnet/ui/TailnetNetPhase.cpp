@@ -145,3 +145,8 @@ extern "C" bool tailnet_display_ready(uint32_t timeout_ms) {
   }
   return true;
 }
+
+extern "C" void tailnet_wifi_joined(void) {
+  if (!s_armed.load()) return;  // only the parked boots run Tailscale on the C3
+  tailnet_wait_ready(20000);
+}

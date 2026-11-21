@@ -37,6 +37,11 @@ bool tailnet_login_boot(void);
 bool tailnet_redirect_bookorbit_auth(void);
 bool tailnet_bookorbit_auth_boot(void);
 
+// CrossInk, right after WiFi joins (SavedWifiConnect and WifiSelectionActivity):
+// waits for Tailscale in the boots that run it (tailnet_wait_ready()), so the
+// first request's heap check and connect see it ready. No-op elsewhere.
+void tailnet_wifi_joined(void);
+
 // main.cpp, once the minimal network boot is ready. Arms parking for the boots
 // listed above (target is a NetworkBootTarget value), on the C3 only.
 void tailnet_network_phase_begin(uint32_t target);
