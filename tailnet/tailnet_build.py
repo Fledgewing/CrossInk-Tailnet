@@ -135,6 +135,9 @@ SWITCHES = {
     "CROSSINK_TAILNET_DICT_STACK_ON_DEMAND": (1,   0,      0),
     "CROSSINK_TAILNET_BIDI_ON_DEMAND":    (1,      0,      0),
     "CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND": (1,    0,      0),
+    # Catalog rows: the five strings of a row in one heap block (patch 0010). The 60-row
+    # window reserve ~8.6 KB -> ~2.4 KB, one block per row instead of one per long string.
+    "CROSSINK_TAILNET_PACKED_ROWS":       (1,      0,      0),
     # loopTask stack in a network boot, bytes (0 = FreeInkUI's 16 KB everywhere).
     "CROSSINK_TAILNET_NET_LOOP_STACK":    (10240,  0,      0),      # X3 catalog used ~8.6 KB: keep
     # Render task (ActivityManager) stack in a network boot, bytes (patch 0006; 0 = upstream's 8 KB).
