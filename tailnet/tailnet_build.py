@@ -37,68 +37,138 @@ has_psram = env.BoardConfig().get("build.mcu", "") == "esp32s3"  # noqa: F821
 
 
 # --- Per-device switches ---------------------------------------------------------
-# ONE table for every memory/behaviour switch, one row per switch, one column
-# per env: "default" is the X3 and the X4 (ESP32-C3, no PSRAM), "x4-pro" and
-# "x4-classic" the ESP32-S3 readers (8 MB PSRAM). None leaves the switch to its
-# header default. Override one for a build with an environment variable of
-# the same name, e.g. ML_TASK_TUNNEL_STACK=8192 pio run -e default.
-# Switches named ML_*/CONFIG_ML_* reach MicroLink and the shim only; the rest
-# (TAILNET_*, CROSSINK_TAILNET_*) the whole program too.
+# ONE table for every memory/behaviour switch: one row per switch, one column
+# per env. "default" is the X3 and the X4 (ESP32-C3, no PSRAM), "x4-pro" and
+# "x4-classic" the ESP32-S3 readers (8 MB PSRAM); any other env takes its
+# chip's column (C3 -> default, S3 -> x4-pro). None leaves the switch to its
+# header default (#ifndef). Override one for a build with an environment
+# variable of the same name, e.g. ML_TASK_TUNNEL_STACK=8192 pio run -e default.
+# Where each value goes:
+#   ML_* / CONFIG_ML_*      MicroLink and the shim only (ml_config.h territory);
+#   WOLFSSL_SWITCH_DEFINES  the wolfSSL defines they stand for (whole build);
+#   everything else         a -D for the whole build (CrossInk, MicroLink, shim).
 # Rule: an improvement with no functional or performance downside is on for
 # every env; a trade-off (smaller queues, stacks, caches, DERP only...) is on
 # for "default" only.
+SWITCH_ENVS = ("default", "x4-pro", "x4-classic")
 SWITCHES = {
-    # Small-memory client mode (MicroLink fork): the X3's master default.
-    "CONFIG_ML_LITE":                {"default": 1,    "x4-pro": None, "x4-classic": None},
-    "ML_LITE_TASKS":                 {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP + WireGuard in one task
-    "ML_LITE_CONTEXT":               {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # small microlink_t, few peers
-    "ML_LITE_NO_DIRECT":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP only, no STUN/UDP
-    "ML_LITE_SMALL_FILTER":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},
-    "ML_LITE_DERP_WOLFSSL":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP TLS on wolfSSL
-    "ML_LITE_CONTROL_PLAIN":         {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # control on port 80, 443 fallback
-    "ML_LITE_CONTROL_ONESHOT":       {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # control then close
-    "ML_LITE_STREAM_MAP":            {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # streamed MapResponse
-    "ML_LITE_CACHED_START":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # skip control when cached state is valid
-    "ML_LITE_DERP_AFTER_CONTROL":    {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # relay connects after the session closed
-    "ML_LITE_REG_ONEBUF":            {"default": 1,    "x4-pro": 1,    "x4-classic": 1},     # one 4 KB RegisterResponse buffer
-    "ML_LITE_DERP_FRAME_CAP":        {"default": 4096, "x4-pro": 4096, "x4-classic": 4096},  # larger DERP frames drained, not allocated
-    "ML_LITE_DERP_LAZY":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # region table only when needed
-    "ML_LITE_DERP_TRIM":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # region table trimmed after a session
-    "ML_LITE_RX_ONEBUF":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # relayed packets: one buffer, decrypted in place
-    "ML_LITE_SMALL_QUEUES":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # wg_rx 4, derp_tx 4, disco 1, peer_update 4
-    "ML_LITE_NACL_CACHE_SLOTS":      {"default": 2,    "x4-pro": 0,    "x4-classic": 0},     # DISCO shared keys (0 = 24)
-    "ML_LITE_MAX_PEERS":             {"default": 1,    "x4-pro": None, "x4-classic": None},  # peer table with ML_LITE_CONTEXT
-    "ML_TASK_TUNNEL_STACK":          {"default": 5120, "x4-pro": None, "x4-classic": None},  # ~3.2 KB used after DERP TLS (X3 log)
-    "CONFIG_ML_MAX_PEERS":           {"default": 8,    "x4-pro": None, "x4-classic": None},
-    "CONFIG_ML_H2_BUFFER_SIZE_KB":   {"default": 48,   "x4-pro": None, "x4-classic": None},  # map buffers in internal RAM
-    "CONFIG_ML_JSON_BUFFER_SIZE_KB": {"default": 48,   "x4-pro": None, "x4-classic": None},
-    # WiFi driver buffers (tailnet/shim/TailnetWifiMem.c, CONFIG_ML_LITE only)
-    "TAILNET_WIFI_STATIC_RX":        {"default": 2,    "x4-pro": None, "x4-classic": None},
-    "TAILNET_WIFI_DYNAMIC_RX":       {"default": 4,    "x4-pro": None, "x4-classic": None},
-    "TAILNET_WIFI_DYNAMIC_TX":       {"default": 4,    "x4-pro": None, "x4-classic": None},
-    # Catalog probe: Tailscale in the catalog boot with the screen kept
-    "TAILNET_PROBE_CATALOG_LIVE":    {"default": 1,    "x4-pro": None, "x4-classic": None},
+    #                                     default  x4-pro  x4-classic
+    # --- MicroLink fork (small-memory client mode); CONFIG_ML_LITE is the X3's master default.
+    "CONFIG_ML_LITE":                     (1,      None,   None),
+    "ML_LITE_TASKS":                      (1,      0,      0),      # DERP + WireGuard in one task
+    "ML_LITE_CONTEXT":                    (1,      0,      0),      # small microlink_t, few peers
+    "ML_LITE_NO_DIRECT":                  (1,      0,      0),      # DERP only, no STUN/UDP
+    "ML_LITE_SMALL_FILTER":               (1,      0,      0),
+    "ML_LITE_DERP_WOLFSSL":               (1,      0,      0),      # DERP TLS on wolfSSL
+    "ML_LITE_CONTROL_PLAIN":              (1,      0,      0),      # control on port 80, 443 fallback
+    "ML_LITE_CONTROL_ONESHOT":            (1,      0,      0),      # control then close
+    "ML_LITE_STREAM_MAP":                 (1,      0,      0),      # streamed MapResponse
+    "ML_LITE_CACHED_START":               (1,      0,      0),      # skip control when cached state is valid
+    "ML_LITE_DERP_AFTER_CONTROL":         (1,      0,      0),      # relay connects after the session closed
+    "ML_LITE_REG_ONEBUF":                 (1,      1,      1),      # one 4 KB RegisterResponse buffer
+    "ML_LITE_DERP_FRAME_CAP":             (4096,   4096,   4096),   # larger DERP frames drained, not allocated
+    "ML_LITE_DERP_LAZY":                  (1,      0,      0),      # region table only when needed
+    "ML_LITE_DERP_TRIM":                  (1,      0,      0),      # region table trimmed after a session
+    "ML_LITE_RX_ONEBUF":                  (1,      0,      0),      # relayed packets: one buffer, decrypted in place
+    "ML_LITE_SMALL_QUEUES":               (1,      0,      0),      # wg_rx 4, derp_tx 4, disco 1, peer_update 4
+    "ML_LITE_NACL_CACHE_SLOTS":           (2,      0,      0),      # DISCO shared keys (0 = 24)
+    "ML_LITE_MAX_PEERS":                  (1,      None,   None),   # peer table with ML_LITE_CONTEXT
+    "ML_TASK_TUNNEL_STACK":               (5120,   None,   None),   # ~3.2 KB used after DERP TLS (X3 log)
+    "CONFIG_ML_MAX_PEERS":                (8,      None,   None),
+    "CONFIG_ML_H2_BUFFER_SIZE_KB":        (48,     None,   None),   # map buffers in internal RAM
+    "CONFIG_ML_JSON_BUFFER_SIZE_KB":      (48,     None,   None),
+    # --- System (shim/TailnetSysSwitches.h). Stack sizes are bytes, 0 = the framework's
+    # own size; the proposed C3 size is in each comment, to set from the X3's stack report.
+    "TAILNET_STACK_LOG":                  (1,      0,      0),      # measurement: task stack report
+    "TAILNET_TASK_STACK_WRAP":            (1,      0,      0),      # links the size table below (and the hole hold)
+    "TAILNET_STACK_ESP_TIMER":            (0,      0,      0),      # 4096 -> 4096 proposed (measure)
+    "TAILNET_STACK_TCPIP":                (0,      0,      0),      # 4096 -> 3072 proposed
+    "TAILNET_STACK_ARDUINO_EVENTS":       (0,      0,      0),      # 4096 -> 2560 proposed
+    "TAILNET_STACK_SYS_EVT":              (0,      0,      0),      # 2048 -> 2048 proposed (measure)
+    "TAILNET_STACK_WIFI":                 (0,      0,      0),      # driver's own size; measure first
+    "TAILNET_STACK_TMR_SVC":              (0,      0,      0),      # 2560 -> 1536 proposed (no SW timers)
+    "TAILNET_LAZY_WORKER":                (1,      1,      1),      # tailnet worker only while needed
+    "TAILNET_WORKER_STACK":               (6144,   6144,   6144),   # worker stack bytes (measure, then shrink on C3)
+    # --- WiFi driver init (shim/TailnetWifiMem.c). Buffer counts: 0 = the framework's
+    # count; any count set also turns AMPDU TX off and caps the RX BA window.
+    "TAILNET_WIFI_STATIC_RX":             (2,      0,      0),
+    "TAILNET_WIFI_DYNAMIC_RX":            (4,      0,      0),
+    "TAILNET_WIFI_DYNAMIC_TX":            (4,      0,      0),
+    "TAILNET_WIFI_RX_MGMT":               (3,      0,      0),      # RX mgmt buffers 5 -> 3 (0 = keep)
+    "TAILNET_WIFI_NO_NVS":                (1,      1,      1),      # WiFi driver config never in NVS
+    "TAILNET_WIFI_ALLOC_COUNT":           (0,      0,      0),      # measurement: WiFi driver heap totals
+    # --- Network boots (ui/TailnetNetPhase.cpp)
+    "TAILNET_PROBE_CATALOG_LIVE":         (1,      None,   None),   # Tailscale in the catalog boot, screen kept
+    "TAILNET_PARK_DURING_CONNECT":        (1,      0,      0),      # live catalog: framebuffer parked while Tailscale connects
+    # --- CrossInk patches 0004 (memory cuts, include/CrossInkTailnetCuts.h) and 0005 (WiFi join).
+    # BookOrbit sync: a new TLS session needs this much free heap (0 = upstream's 55000)...
+    "CROSSINK_TAILNET_SYNC_TLS_FLOOR":    (35000,  35000,  35000),
+    # ...and a largest free block this big (measured X3 handshake peaks: up to 24.0 KB).
+    "CROSSINK_TAILNET_SYNC_TLS_BLOCK":    (24576,  24576,  24576),
+    # Catalog bursts (open, Home refresh, shelf options) share one keep-alive connection.
+    "CROSSINK_TAILNET_CATALOG_KEEPALIVE": (1,      1,      1),
+    # Catalog JSON filters built after the download instead of during it.
+    "CROSSINK_TAILNET_FILTER_AFTER_TLS":  (1,      1,      1),
+    # wolfSSL (whole library): RSA public-key operations only (RsaKey 5368 -> ~2140 B).
+    # Needs WOLFSSL_NO_CLIENT_AUTH, which drops the client-certificate signing code: the
+    # reader never presents a client certificate (no wolfSSL_use_* call anywhere)...
+    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": (1, 1,      1),
+    # ...and no session cache (784 B of .bss): nothing calls wolfSSL_set_session, so the
+    # client cache was written and never read. Needs MicroLink lite-xcuts (ml_derp.c
+    # skips wolfSSL_CTX_set_session_cache_mode, which NO_SESSION_CACHE removes).
+    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": (1, 1,     1),
+    # .bss moved to the heap until used: dictionary worker stack (4452 B), MiniBidi
+    # buffers (3072 B), font prewarm scan array (2052 B).
+    "CROSSINK_TAILNET_DICT_STACK_ON_DEMAND": (1,   0,      0),
+    "CROSSINK_TAILNET_BIDI_ON_DEMAND":    (1,      0,      0),
+    "CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND": (1,    0,      0),
+    # loopTask stack in a network boot, bytes (0 = FreeInkUI's 16 KB everywhere).
+    "CROSSINK_TAILNET_NET_LOOP_STACK":    (10240,  0,      0),
+    # Catalog root: no entry-count requests unless cached. Off everywhere: with
+    # keep-alive the counts cost round trips, not handshakes, and skipping them shows.
+    "CROSSINK_TAILNET_SKIP_ROOT_COUNTS":  (0,      0,      0),
+    # wolfSSL arena for BookOrbit/catalog requests, bytes (0 = off): one block reserved
+    # when WiFi joins, before Tailscale (and before the framebuffer is parked, so it never
+    # sits in the framebuffer's hole), so a fragmented heap cannot fail a handshake.
+    "CROSSINK_TAILNET_TLS_ARENA":         (24576,  0,      0),
+    "CROSSINK_TAILNET_WIFI_FAST_JOIN":    (1,      1,      1),      # patch 0005: last channel+BSSID first
 }
+# Switches that stand for wolfSSL defines rather than a define of their own.
+WOLFSSL_SWITCH_DEFINES = {
+    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": ["WOLFSSL_RSA_PUBLIC_ONLY", "WOLFSSL_NO_CLIENT_AUTH"],
+    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": ["NO_SESSION_CACHE"],
+}
+SWITCH_COLUMN = pioenv if pioenv in SWITCH_ENVS else ("x4-pro" if has_psram else "default")
 
 
-def _switch_values():
-    col = pioenv if pioenv in ("default", "x4-pro", "x4-classic") else ("x4-pro" if has_psram else "default")
-    values = {}
-    for name, row in SWITCHES.items():
-        v = row.get(col)
-        if name in os.environ:
-            v = int(os.environ[name])
-        if v is not None:
-            values[name] = v
-    return values
+def switch_value(name):
+    """The switch's value for this build (env var, else its row); None = header default."""
+    if name in os.environ:
+        return int(os.environ[name], 0)
+    return SWITCHES[name][SWITCH_ENVS.index(SWITCH_COLUMN)]
 
 
-SWITCH_VALUES = _switch_values()
-print("Tailnet switches (" + pioenv + "): " + ", ".join(f"{k}={v}" for k, v in SWITCH_VALUES.items()))
-ML_DEFINES = [(k, v) for k, v in SWITCH_VALUES.items() if k.startswith(("ML_", "CONFIG_ML_", "TAILNET_WIFI_"))]
-env.Append(CPPDEFINES=[(k, v) for k, v in SWITCH_VALUES.items() if (k, v) not in ML_DEFINES])  # noqa: F821
+SWITCH_VALUES = {name: switch_value(name) for name in SWITCHES}
+print(f"Tailnet switches for {pioenv} (column {SWITCH_COLUMN}):")
+for _name, _value in SWITCH_VALUES.items():
+    _src = " (env override)" if _name in os.environ else ""
+    print(f"  {_name:<42} {'header default' if _value is None else _value}{_src}")
 
-# The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL, see SWITCHES): the application already compiles Arduino-wolfSSL from
+ML_DEFINES = []       # MicroLink + shim only (appended in _process_project_deps_with_tailnet)
+_global_defines = []  # the whole build
+for _name, _value in SWITCH_VALUES.items():
+    if _value is None:
+        continue
+    if _name in WOLFSSL_SWITCH_DEFINES:
+        if _value:
+            _global_defines += WOLFSSL_SWITCH_DEFINES[_name]
+    elif _name.startswith(("ML_", "CONFIG_ML_")):
+        ML_DEFINES.append((_name, _value))
+    else:
+        _global_defines.append((_name, _value))
+env.Append(CPPDEFINES=_global_defines)  # noqa: F821
+
+# The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL): the application already compiles Arduino-wolfSSL from
 # source, and its session is ~5 KB once connected against the prebuilt
 # mbedTLS's ~37 KB. Verifying Tailscale's relays (Let's Encrypt ECDSA chains,
 # signed with ecdsa-with-SHA384 by P-384 keys) needs SHA-384, which that build
@@ -107,68 +177,6 @@ env.Append(CPPDEFINES=[(k, v) for k, v in SWITCH_VALUES.items() if (k, v) not in
 derp_wolfssl = bool(SWITCH_VALUES.get("ML_LITE_DERP_WOLFSSL"))
 if derp_wolfssl:
     env.Append(CPPDEFINES=["WOLFSSL_SHA384", "WOLFSSL_SHA512", "WOLFSSL_SP_384"])  # noqa: F821
-
-# --- Per-device switches ----------------------------------------------------------
-# One row per switch: its value for each env (default = X3/X4 on the ESP32-C3,
-# x4-pro, x4-classic). An environment variable of the same name overrides the
-# row for one build, e.g. CROSSINK_TAILNET_NET_LOOP_STACK=0 pio run -e default.
-# Pure improvements are on everywhere; trade-offs are on for the C3 only.
-SWITCH_ENVS = ("default", "x4-pro", "x4-classic")
-SWITCHES = {
-    # CrossInk patch 0004 (memory cuts); the C side reads include/CrossInkTailnetCuts.h.
-    # BookOrbit sync: a new TLS session needs this much free heap (0 = upstream's 55000)...
-    "CROSSINK_TAILNET_SYNC_TLS_FLOOR": (35000, 35000, 35000),
-    # ...and a largest free block this big (measured X3 handshake peaks: up to 24.0 KB).
-    "CROSSINK_TAILNET_SYNC_TLS_BLOCK": (24576, 24576, 24576),
-    # Catalog bursts (open, Home refresh, shelf options) share one keep-alive connection.
-    "CROSSINK_TAILNET_CATALOG_KEEPALIVE": (1, 1, 1),
-    # Catalog JSON filters built after the download instead of during it.
-    "CROSSINK_TAILNET_FILTER_AFTER_TLS": (1, 1, 1),
-    # wolfSSL (whole library): RSA public-key operations only (RsaKey 5368 -> ~2140 B).
-    # Needs WOLFSSL_NO_CLIENT_AUTH, which drops the client-certificate signing code: the
-    # reader never presents a client certificate (no wolfSSL_use_* call anywhere)...
-    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": (1, 1, 1),
-    # ...and no session cache (784 B of .bss): nothing calls wolfSSL_set_session, so the
-    # client cache was written and never read. Needs MicroLink lite-xcuts (ml_derp.c
-    # skips wolfSSL_CTX_set_session_cache_mode, which NO_SESSION_CACHE removes).
-    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": (1, 1, 1),
-    # .bss moved to the heap until used: dictionary worker stack (4452 B), MiniBidi
-    # buffers (3072 B), font prewarm scan array (2052 B).
-    "CROSSINK_TAILNET_DICT_STACK_ON_DEMAND": (1, 0, 0),
-    "CROSSINK_TAILNET_BIDI_ON_DEMAND": (1, 0, 0),
-    "CROSSINK_TAILNET_FONT_SCAN_ON_DEMAND": (1, 0, 0),
-    # loopTask stack in a network boot, bytes (0 = FreeInkUI's 16 KB everywhere).
-    "CROSSINK_TAILNET_NET_LOOP_STACK": (10240, 0, 0),
-    # Catalog root: no entry-count requests unless cached.
-    "CROSSINK_TAILNET_SKIP_ROOT_COUNTS": (1, 0, 0),
-    # wolfSSL arena for BookOrbit/catalog requests, bytes (0 = off): one block reserved
-    # when WiFi joins, before Tailscale, so a fragmented heap cannot fail a handshake.
-    "CROSSINK_TAILNET_TLS_ARENA": (24576, 0, 0),
-}
-# Switches that are a wolfSSL define rather than a CrossInk one.
-WOLFSSL_SWITCH_DEFINES = {
-    "CROSSINK_TAILNET_WOLFSSL_RSA_PUBLIC_ONLY": ["WOLFSSL_RSA_PUBLIC_ONLY", "WOLFSSL_NO_CLIENT_AUTH"],
-    "CROSSINK_TAILNET_WOLFSSL_NO_SESSION_CACHE": ["NO_SESSION_CACHE"],
-}
-
-
-def switch_value(name):
-    if name in os.environ:
-        return int(os.environ[name], 0)
-    column = SWITCH_ENVS.index(pioenv) if pioenv in SWITCH_ENVS else 0
-    return SWITCHES[name][column]
-
-
-_switch_defines = []
-for _name in SWITCHES:
-    _value = switch_value(_name)
-    if _name in WOLFSSL_SWITCH_DEFINES:
-        if _value:
-            _switch_defines += WOLFSSL_SWITCH_DEFINES[_name]
-    else:
-        _switch_defines.append((_name, _value))
-env.Append(CPPDEFINES=_switch_defines)  # noqa: F821  CrossInk, its libraries and wolfSSL
-print("Tailnet switches (" + pioenv + "): " + ", ".join(f"{_n}={switch_value(_n)}" for _n in SWITCHES))
 
 # --- 1. MicroLink as a library ------------------------------------------------
 
@@ -251,10 +259,16 @@ def _process_project_deps_with_tailnet(env):
                           # prebuilt ERROR-only log level
                           "-Wl,--wrap=esp_log",
                           # TailnetTlsMem.c: mbedTLS buffers in PSRAM
-                          "-Wl,--wrap=esp_mbedtls_mem_calloc"])
-    if SWITCH_VALUES.get("CONFIG_ML_LITE"):
-        # TailnetWifiMem.c: fewer WiFi driver buffers (CONFIG_ML_LITE)
-        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_init"])
+                          "-Wl,--wrap=esp_mbedtls_mem_calloc",
+                          # TailnetWifiMem.c: the WiFi init switches
+                          "-Wl,--wrap=esp_wifi_init"])
+    if SWITCH_VALUES.get("TAILNET_TASK_STACK_WRAP"):
+        # TailnetStacks.c: task stack sizes by name, and the timer task's
+        env.Append(LINKFLAGS=["-Wl,--wrap=xTaskCreatePinnedToCore",
+                              "-Wl,--wrap=vApplicationGetTimerTaskMemory"])
+    if SWITCH_VALUES.get("TAILNET_STACK_LOG"):
+        # TailnetStacks.c: the stack report before WiFi goes off
+        env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_stop"])
 
 
 env.AddMethod(_process_project_deps_with_tailnet, "ProcessProjectDeps")  # noqa: F821

@@ -9,6 +9,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <lwip/dns.h>
 #include <lwip/tcpip.h>
@@ -20,6 +21,7 @@
 
 extern "C" {
 #include "TailnetNetPhase.h"
+#include "TailnetSysSwitches.h"
 #include "microlink.h"
 void tailnet_ml_set_priority_peer(microlink_t* ml, uint32_t vpn_ip);     // ml_priority.c
 void tailnet_ml_relay_codes(const microlink_t* ml, uint32_t vpn_ip, char* home, char* peer, size_t len);
@@ -123,9 +125,45 @@ void saveLoginUrl(const char* url) {
 }
 #endif
 
+#if TAILNET_LAZY_WORKER
+void workerTask(void*);
+// The worker exists only while it has work (TAILNET_LAZY_WORKER): most boots
+// never run Tailscale, and its stack is TAILNET_WORKER_STACK bytes of heap.
+SemaphoreHandle_t s_worker_lock = nullptr;  // guards s_worker and its exit
+TaskHandle_t s_worker = nullptr;
+std::atomic<bool> s_link_up{false};  // WiFi has an address (set by the event callback)
+bool loadEnabled();
+
+// Would a worker have anything to do with r? Without one, the state it would
+// track is rebuilt from s_link_up when one starts.
+bool workerWanted(Request r) {
+  if (r == REQ_LOGOUT) return true;
+#if CONFIG_ML_LITE
+  return s_link_up.load() && s_permit.load() && loadEnabled();
+#else
+  return s_link_up.load() && loadEnabled();
+#endif
+}
+
+void post(Request r) {
+  if (!s_queue || !s_worker_lock) return;
+  xSemaphoreTake(s_worker_lock, portMAX_DELAY);
+  if (!s_worker && workerWanted(r) &&
+      xTaskCreate(workerTask, "tailnet", TAILNET_WORKER_STACK, nullptr, 3, &s_worker) != pdPASS) {
+    s_worker = nullptr;
+    xSemaphoreGive(s_worker_lock);
+    TLOGE("No memory for the worker task (%u bytes; heap free %u)", (unsigned)TAILNET_WORKER_STACK,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return;
+  }
+  if (s_worker) xQueueSend(s_queue, &r, 0);
+  xSemaphoreGive(s_worker_lock);
+}
+#else
 void post(Request r) {
   if (s_queue) xQueueSend(s_queue, &r, 0);
 }
+#endif
 
 tailnet_status_t mapState(microlink_state_t st) {
   switch (st) {
@@ -375,6 +413,10 @@ void reconcile() {
   if (want && !s_running) startMl();
   if (!want && s_running) stopMl();
 #if CONFIG_ML_LITE
+  // A start made while parked (TAILNET_PARK_DURING_CONNECT) allowed MicroLink's
+  // own control fallback. Once the framebuffer is back (tailnet_probe_permit_unparked
+  // posts a recheck), a late cached-relay failure must not start a control session.
+  if (s_ml && s_unparked.load()) microlink_cached_start_peer(s_ml, serverIp(), false);
   if (!s_wifi_up) {
     // Free the context too (microlink_init again on the next start), so the
     // display can get its framebuffer back in one block.
@@ -389,8 +431,33 @@ void reconcile() {
 }
 
 void workerTask(void*) {
+#if TAILNET_LAZY_WORKER
+  // Requests that came while no worker ran were not queued: start from the
+  // current WiFi state, and a fresh WiFi session's bookkeeping.
+  s_wifi_up = s_link_up.load();
+  s_relay_matched = false;
+  portENTER_CRITICAL(&s_tried_lock);
+  memset(s_tried, 0, sizeof(s_tried));
+  portEXIT_CRITICAL(&s_tried_lock);
+  s_tunnel_refreshed.store(0);
+#endif
   for (;;) {
     Request r;
+#if TAILNET_LAZY_WORKER
+    // Nothing running and nothing held: leave. post() starts a new worker
+    // when a request needs one.
+    if (!s_running && !s_ml) {
+      xSemaphoreTake(s_worker_lock, portMAX_DELAY);
+      if (uxQueueMessagesWaiting(s_queue) == 0) {
+        TLOGI("Worker idle; exiting (stack: %u of %u bytes never used)", (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+              (unsigned)TAILNET_WORKER_STACK);
+        s_worker = nullptr;
+        xSemaphoreGive(s_worker_lock);
+        vTaskDelete(nullptr);
+      }
+      xSemaphoreGive(s_worker_lock);
+    }
+#endif
     // While running, wake every second to pick up states MicroLink does not
     // report through its callback (NEEDS_LOGIN, the URL, the VPN address).
     const TickType_t wait = s_running ? pdMS_TO_TICKS(1000) : portMAX_DELAY;
@@ -470,6 +537,9 @@ void workerTask(void*) {
 }
 
 void onWifiEvent(arduino_event_id_t event) {
+#if TAILNET_LAZY_WORKER
+  s_link_up.store(event == ARDUINO_EVENT_WIFI_STA_GOT_IP);
+#endif
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       // lwIP's DNS cache outlives a change of network: a name answered by
@@ -500,7 +570,11 @@ extern "C" void initVariant() {
   s_queue = xQueueCreate(8, sizeof(Request));
   // MicroLink's own tasks do the network work; this one only sequences
   // start/stop, but microlink_init() and NVS writes need some stack.
-  xTaskCreate(workerTask, "tailnet", 6144, nullptr, 3, nullptr);
+#if TAILNET_LAZY_WORKER
+  s_worker_lock = xSemaphoreCreateMutex();  // post() creates the worker when needed
+#else
+  xTaskCreate(workerTask, "tailnet", TAILNET_WORKER_STACK, nullptr, 3, nullptr);
+#endif
   WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_LOST_IP);
   WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
@@ -859,6 +933,11 @@ extern "C" void tailnet_probe_window_end(const char* what, const char* phase) {
   if (s_probe_window) heap_caps_monitor_local_minimum_free_size_stop();
   s_probe_window = false;
   TLOGI("probe %s: done; lowest since boot %u", what, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+  static bool s_reported = false;  // TailnetStacks.c: after the first HTTPS request
+  if (!s_reported) {
+    s_reported = true;
+    tailnet_stack_report("first HTTPS request done");
+  }
 }
 
 extern "C" tailnet_status_t tailnet_login_session(uint32_t timeout_ms) {
