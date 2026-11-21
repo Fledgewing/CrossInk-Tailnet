@@ -6,6 +6,7 @@
  * keeping the node's keys and session.
  */
 #include "microlink_internal.h"
+#include "wireguardif.h"
 #include <stdio.h>
 
 void tailnet_ml_set_priority_peer(microlink_t *ml, uint32_t vpn_ip) {
@@ -76,3 +77,24 @@ void tailnet_ml_request_handshake(microlink_t *ml, uint32_t vpn_ip) {
 }
 
 bool tailnet_ml_tunnel_up(microlink_t *ml, uint32_t vpn_ip) { return ml && ml_wg_mgr_peer_is_up(ml, vpn_ip); }
+
+/* The path to a peer for a log line: "direct a.b.c.d:port, rtt N ms" (the
+ * last DISCO pong) or "DERP region R, rtt N ms" (the last WireGuard
+ * handshake's initiation -> response time). */
+void tailnet_ml_path(const microlink_t *ml, uint32_t vpn_ip, char *out, size_t len) {
+    snprintf(out, len, "unknown");
+    for (int i = 0; ml && vpn_ip && i < ML_MAX_PEERS; i++) {
+        const ml_peer_t *p = &ml->peers[i];
+        if (!p->active || p->vpn_ip != vpn_ip) continue;
+        if (p->has_direct_path && p->best_ip) {
+            snprintf(out, len, "direct %u.%u.%u.%u:%u, rtt %lu ms",
+                     (unsigned)(p->best_ip >> 24) & 0xff, (unsigned)(p->best_ip >> 16) & 0xff,
+                     (unsigned)(p->best_ip >> 8) & 0xff, (unsigned)p->best_ip & 0xff,
+                     (unsigned)p->best_port, (unsigned long)p->best_rtt_ms);
+        } else {
+            snprintf(out, len, "DERP region %u, rtt %lu ms", (unsigned)p->derp_region,
+                     (unsigned long)wireguardif_last_handshake_rtt_ms());
+        }
+        return;
+    }
+}
