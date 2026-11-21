@@ -276,6 +276,11 @@ uint32_t serverIp() {
 // region if ours differs (remembered, so later starts use it right away).
 void matchServerRegion() {
   if (!s_ml || s_relay_matched || s_relay_mode.load() != TAILNET_RELAY_MATCH_SERVER) return;
+#if CONFIG_ML_LITE
+  // The restart would run a control session; the catalog session (framebuffer
+  // kept) has no room for one. The next network boot follows the server.
+  if (s_unparked.load()) return;
+#endif
   const uint16_t theirs = tailnet_ml_peer_region(s_ml, serverIp());
   const uint16_t ours = tailnet_ml_home_region(s_ml);
   if (!theirs || !ours || theirs == ours) return;
@@ -343,6 +348,13 @@ void startMl() {
   // is (re)applied on every start.
   tailnet_ml_set_priority_peer(s_ml, loadPin());
   tailnet_ml_set_forced_region(s_ml, forcedRegion());
+#if CONFIG_ML_LITE
+  // Skip the control session when the state the last one left is still good
+  // (MicroLink's ML_LITE_CACHED_START): it needs the server this reader talks
+  // to in the peer cache. A control session as fallback may start by itself
+  // only with the framebuffer parked: with it kept (catalog) there is no room.
+  microlink_cached_start_peer(s_ml, serverIp(), !s_unparked.load());
+#endif
   setStatus(TAILNET_STARTING);
   const esp_err_t err = microlink_start(s_ml);
   if (err != ESP_OK) {
@@ -617,7 +629,18 @@ static bool bringUpTunnel(uint32_t ip, uint32_t timeout_ms) {
 
 // One-shot control: ask the worker for a fresh map (a new control session)
 // and wait until one has succeeded. False if none did within timeout_ms.
-static bool refreshControl(uint32_t timeout_ms) {
+static bool refreshControl(uint32_t timeout_ms, const char* why) {
+  // State a cached start relied on is wrong: the next start runs a session.
+  if (s_ml && microlink_control_cached(s_ml)) microlink_control_cache_invalidate(why);
+#if CONFIG_ML_LITE
+  // Never a control session in the catalog session (framebuffer kept): its
+  // peak and the fragmentation it leaves break the requests that follow.
+  if (s_unparked.load()) {
+    TLOGW("Control fallback needed (%s); not with the framebuffer kept", why);
+    return false;
+  }
+#endif
+  TLOGW("Control fallback: %s", why);
   const uint32_t before = microlink_control_sessions();
   post(REQ_REFRESH);
   uint32_t waited = 0;
@@ -639,7 +662,7 @@ static void bringUpTunnelOrRefresh(uint32_t ip, uint32_t timeout_ms) {
   if (bringUpTunnel(ip, timeout_ms)) return;
   if (!microlink_control_oneshot() || s_tunnel_refreshed.exchange(ip) == ip) return;
   TLOGW("tunnel to %u.%u.%u.%u: refreshing the map and retrying", IP_ARGS(ip));
-  if (refreshControl(timeout_ms)) bringUpTunnel(ip, timeout_ms);
+  if (refreshControl(timeout_ms, "no WireGuard handshake")) bringUpTunnel(ip, timeout_ms);
 }
 
 extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
@@ -674,7 +697,7 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   storePin(ip);  // remembered across reboots: pinned from the next start on
   if (microlink_control_oneshot()) {
     // One-shot control: a fresh map with the pin, no restart.
-    if (!refreshControl(timeout_ms)) return false;
+    if (!refreshControl(timeout_ms, "peer not in the table")) return false;
   } else {
     post(REQ_REPIN);
     // Wait for the restart to begin, then for it to finish.

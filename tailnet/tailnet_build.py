@@ -35,14 +35,76 @@ pioenv = env.subst("$PIOENV")  # noqa: F821
 # Every CrossInk ESP32-S3 reader has 8 MB PSRAM; the ESP32-C3 (X3/X4) has none.
 has_psram = env.BoardConfig().get("build.mcu", "") == "esp32s3"  # noqa: F821
 
-# The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL, on with
-# CONFIG_ML_LITE below): the application already compiles Arduino-wolfSSL from
+
+# --- Per-device switches ---------------------------------------------------------
+# ONE table for every memory/behaviour switch, one row per switch, one column
+# per env: "default" is the X3 and the X4 (ESP32-C3, no PSRAM), "x4-pro" and
+# "x4-classic" the ESP32-S3 readers (8 MB PSRAM). None leaves the switch to its
+# header default. Override one for a build with an environment variable of
+# the same name, e.g. ML_TASK_TUNNEL_STACK=8192 pio run -e default.
+# Switches named ML_*/CONFIG_ML_* reach MicroLink and the shim only; the rest
+# (TAILNET_*, CROSSINK_TAILNET_*) the whole program too.
+# Rule: an improvement with no functional or performance downside is on for
+# every env; a trade-off (smaller queues, stacks, caches, DERP only...) is on
+# for "default" only.
+SWITCHES = {
+    # Small-memory client mode (MicroLink fork): the X3's master default.
+    "CONFIG_ML_LITE":                {"default": 1,    "x4-pro": None, "x4-classic": None},
+    "ML_LITE_TASKS":                 {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP + WireGuard in one task
+    "ML_LITE_CONTEXT":               {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # small microlink_t, few peers
+    "ML_LITE_NO_DIRECT":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP only, no STUN/UDP
+    "ML_LITE_SMALL_FILTER":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},
+    "ML_LITE_DERP_WOLFSSL":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # DERP TLS on wolfSSL
+    "ML_LITE_CONTROL_PLAIN":         {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # control on port 80, 443 fallback
+    "ML_LITE_CONTROL_ONESHOT":       {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # control then close
+    "ML_LITE_STREAM_MAP":            {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # streamed MapResponse
+    "ML_LITE_CACHED_START":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # skip control when cached state is valid
+    "ML_LITE_DERP_AFTER_CONTROL":    {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # relay connects after the session closed
+    "ML_LITE_REG_ONEBUF":            {"default": 1,    "x4-pro": 1,    "x4-classic": 1},     # one 4 KB RegisterResponse buffer
+    "ML_LITE_DERP_FRAME_CAP":        {"default": 4096, "x4-pro": 4096, "x4-classic": 4096},  # larger DERP frames drained, not allocated
+    "ML_LITE_DERP_LAZY":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # region table only when needed
+    "ML_LITE_DERP_TRIM":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # region table trimmed after a session
+    "ML_LITE_RX_ONEBUF":             {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # relayed packets: one buffer, decrypted in place
+    "ML_LITE_SMALL_QUEUES":          {"default": 1,    "x4-pro": 0,    "x4-classic": 0},     # wg_rx 4, derp_tx 4, disco 1, peer_update 4
+    "ML_LITE_NACL_CACHE_SLOTS":      {"default": 2,    "x4-pro": 0,    "x4-classic": 0},     # DISCO shared keys (0 = 24)
+    "ML_LITE_MAX_PEERS":             {"default": 1,    "x4-pro": None, "x4-classic": None},  # peer table with ML_LITE_CONTEXT
+    "ML_TASK_TUNNEL_STACK":          {"default": 5120, "x4-pro": None, "x4-classic": None},  # ~3.2 KB used after DERP TLS (X3 log)
+    "CONFIG_ML_MAX_PEERS":           {"default": 8,    "x4-pro": None, "x4-classic": None},
+    "CONFIG_ML_H2_BUFFER_SIZE_KB":   {"default": 48,   "x4-pro": None, "x4-classic": None},  # map buffers in internal RAM
+    "CONFIG_ML_JSON_BUFFER_SIZE_KB": {"default": 48,   "x4-pro": None, "x4-classic": None},
+    # WiFi driver buffers (tailnet/shim/TailnetWifiMem.c, CONFIG_ML_LITE only)
+    "TAILNET_WIFI_STATIC_RX":        {"default": 2,    "x4-pro": None, "x4-classic": None},
+    "TAILNET_WIFI_DYNAMIC_RX":       {"default": 4,    "x4-pro": None, "x4-classic": None},
+    "TAILNET_WIFI_DYNAMIC_TX":       {"default": 4,    "x4-pro": None, "x4-classic": None},
+    # Catalog probe: Tailscale in the catalog boot with the screen kept
+    "TAILNET_PROBE_CATALOG_LIVE":    {"default": 1,    "x4-pro": None, "x4-classic": None},
+}
+
+
+def _switch_values():
+    col = pioenv if pioenv in ("default", "x4-pro", "x4-classic") else ("x4-pro" if has_psram else "default")
+    values = {}
+    for name, row in SWITCHES.items():
+        v = row.get(col)
+        if name in os.environ:
+            v = int(os.environ[name])
+        if v is not None:
+            values[name] = v
+    return values
+
+
+SWITCH_VALUES = _switch_values()
+print("Tailnet switches (" + pioenv + "): " + ", ".join(f"{k}={v}" for k, v in SWITCH_VALUES.items()))
+ML_DEFINES = [(k, v) for k, v in SWITCH_VALUES.items() if k.startswith(("ML_", "CONFIG_ML_", "TAILNET_WIFI_"))]
+env.Append(CPPDEFINES=[(k, v) for k, v in SWITCH_VALUES.items() if (k, v) not in ML_DEFINES])  # noqa: F821
+
+# The C3's DERP relay TLS runs on wolfSSL (ML_LITE_DERP_WOLFSSL, see SWITCHES): the application already compiles Arduino-wolfSSL from
 # source, and its session is ~5 KB once connected against the prebuilt
 # mbedTLS's ~37 KB. Verifying Tailscale's relays (Let's Encrypt ECDSA chains,
 # signed with ecdsa-with-SHA384 by P-384 keys) needs SHA-384, which that build
 # leaves out, and SP math for P-384 keeps the handshake peak at ~24 KB instead
 # of ~43 KB with fast-math bignums. These apply to the whole wolfSSL library.
-derp_wolfssl = not has_psram
+derp_wolfssl = bool(SWITCH_VALUES.get("ML_LITE_DERP_WOLFSSL"))
 if derp_wolfssl:
     env.Append(CPPDEFINES=["WOLFSSL_SHA384", "WOLFSSL_SHA512", "WOLFSSL_SP_384"])  # noqa: F821
 
@@ -67,29 +129,6 @@ WG_CRYPTO = ["blake2s.c", "chacha20.c", "chacha20poly1305.c", "poly1305-donna.c"
 _orig_process_project_deps = env.ProcessProjectDeps  # noqa: F821
 
 
-# --- Catalog probe (branch c3-catalog-probe only, C3 only) ----------------------
-# Each cut has its own switch: set the environment variable to 0 to turn it
-# off, e.g. TAILNET_PROBE_TUNNEL_STACK=0 pio run -e default.
-def _probe_switch(name, default="1"):
-    return os.environ.get(name, default) != "0"
-
-
-PROBE_DEFINES = []
-if not has_psram:
-    if _probe_switch("TAILNET_PROBE_CATALOG_LIVE"):  # Tailscale in the catalog boot, screen kept
-        PROBE_DEFINES.append(("TAILNET_PROBE_CATALOG_LIVE", 1))
-    if _probe_switch("TAILNET_PROBE_TUNNEL_STACK"):  # a. tunnel task stack 8192 -> 5120
-        PROBE_DEFINES.append(("ML_TASK_TUNNEL_STACK", 5120))
-    if _probe_switch("TAILNET_PROBE_DERP_TRIM"):  # b. DERP region table: home + peers' regions only
-        PROBE_DEFINES.append(("ML_LITE_DERP_TRIM", 1))
-    if _probe_switch("TAILNET_PROBE_WIFI_SMALL"):  # c. WiFi static RX 2, dynamic RX 4, dynamic TX 4
-        PROBE_DEFINES += [("TAILNET_WIFI_STATIC_RX", 2), ("TAILNET_WIFI_DYNAMIC_RX", 4), ("TAILNET_WIFI_DYNAMIC_TX", 4)]
-    if _probe_switch("TAILNET_PROBE_ONE_PEER"):  # d. peer table 2 -> 1
-        PROBE_DEFINES.append(("ML_LITE_MAX_PEERS", 1))
-    print("Tailnet catalog probe switches: " + ", ".join(f"{k}={v}" for k, v in PROBE_DEFINES))
-env.Append(CPPDEFINES=[d for d in PROBE_DEFINES if d[0] == "TAILNET_PROBE_CATALOG_LIVE"])  # noqa: F821  CrossInk + ui
-
-
 def _process_project_deps_with_tailnet(env):
     _orig_process_project_deps()
     ml_env = env.Clone()
@@ -101,17 +140,10 @@ def _process_project_deps_with_tailnet(env):
         CPPDEFINES=["WIREGUARD_CRYPTO_REFC", ("LOG_LOCAL_LEVEL", 3)],
         CCFLAGS=["-include", config_h, "-Wno-stringop-overread"],
     )
-    # The peer table stays small (ml_config.h: 16; 8 here on the C3): the reader
-    # only needs its servers, and tailnet_ensure_peer() pins one that a large
-    # tailnet would otherwise leave out.
-    if not has_psram:
-        # No PSRAM: the map-response buffers come from internal RAM.
-        ml_env.Append(CPPDEFINES=[("CONFIG_ML_H2_BUFFER_SIZE_KB", 48), ("CONFIG_ML_JSON_BUFFER_SIZE_KB", 48),
-                                  ("CONFIG_ML_MAX_PEERS", 8),
-                                  # The fork's small-memory client mode (Fledgewing/microlink,
-                                  # crossink branch): the X3 has ~58 KB free once WiFi is up.
-                                  ("CONFIG_ML_LITE", 1)])
-        ml_env.Append(CPPDEFINES=PROBE_DEFINES)
+    # Per-device switches (SWITCHES above). The peer table stays small
+    # (ml_config.h: 16; 8 on the C3): the reader only needs its servers, and
+    # tailnet_ensure_peer() pins one that a large tailnet would otherwise leave out.
+    ml_env.Append(CPPDEFINES=ML_DEFINES)
 
     if derp_wolfssl:
         # ml_derp.c includes wolfSSL; the defines (WOLFSSL_USER_SETTINGS, ...)
@@ -119,7 +151,7 @@ def _process_project_deps_with_tailnet(env):
         wolfssl_src = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), pioenv, "Arduino-wolfSSL", "src")
         if not os.path.isfile(os.path.join(wolfssl_src, "wolfssl", "ssl.h")):
             raise RuntimeError(f"wolfSSL not found at {wolfssl_src}; the DERP relay TLS needs Arduino-wolfSSL")
-        ml_env.Append(CPPPATH=[wolfssl_src], CPPDEFINES=[("ML_LITE_DERP_WOLFSSL", 1)])
+        ml_env.Append(CPPPATH=[wolfssl_src])
 
     build_dir = os.path.join(env.subst("$BUILD_DIR"), "tailnet")
     objs = []
@@ -158,8 +190,8 @@ def _process_project_deps_with_tailnet(env):
                           "-Wl,--wrap=esp_log",
                           # TailnetTlsMem.c: mbedTLS buffers in PSRAM
                           "-Wl,--wrap=esp_mbedtls_mem_calloc"])
-    if not has_psram:
-        # TailnetWifiMem.c: fewer WiFi driver buffers (C3 only, CONFIG_ML_LITE)
+    if SWITCH_VALUES.get("CONFIG_ML_LITE"):
+        # TailnetWifiMem.c: fewer WiFi driver buffers (CONFIG_ML_LITE)
         env.Append(LINKFLAGS=["-Wl,--wrap=esp_wifi_init"])
 
 
