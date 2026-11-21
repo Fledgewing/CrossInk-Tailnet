@@ -697,27 +697,63 @@ extern "C" uint32_t tailnet_resolve(const char* name) {
   return microlink_resolve(s_ml, q);
 }
 
-extern "C" bool tailnet_wait_connected(uint32_t timeout_ms) {
+namespace {
+uint32_t elapsedMs(TickType_t start) { return (uint32_t)((xTaskGetTickCount() - start) * portTICK_PERIOD_MS); }
+
+// Tasks that must never wait for Tailscale: MicroLink's own (ml_*), lwIP's
+// (tiT), the worker that starts MicroLink, and the event tasks that feed it.
+bool mayWaitForTailscale() {
+  const char* name = pcTaskGetName(nullptr);
+  if (!name) return true;
+  return strncmp(name, "ml_", 3) != 0 && strcmp(name, "tiT") != 0 && strcmp(name, "tailnet") != 0 &&
+         strcmp(name, "arduino_events") != 0 && strcmp(name, "sys_evt") != 0 && strcmp(name, "wifi") != 0 &&
+         strcmp(name, "esp_timer") != 0;
+}
+
+// Tailscale is enabled and logged in and WiFi is up, but MicroLink has not been
+// started yet (the worker starts it on GOT_IP): worth a short wait.
+bool aboutToStart() {
+#if CONFIG_ML_LITE
+  if (!s_permit.load() || s_low_memory.load()) return false;
+#endif
+  return loadEnabled() && tailnet_joined() && WiFi.isConnected();
+}
+}  // namespace
+
+extern "C" bool tailnet_wait_connected_for(const char* what, uint32_t timeout_ms) {
   const TickType_t start = xTaskGetTickCount();
+  if (tailnet_status() == TAILNET_CONNECTED) return true;
+  if (!mayWaitForTailscale()) return false;
+  bool logged = false;
   for (;;) {
     const tailnet_status_t st = tailnet_status();
-    if (st == TAILNET_CONNECTED) return true;
-#if CONFIG_ML_LITE
-    // A network boot's first request can come right after GOT_IP, before the
-    // worker has parked the framebuffer and started MicroLink: give it a moment.
-    if (st == TAILNET_OFF && s_permit.load() && !s_low_memory.load() && loadEnabled() &&
-        (xTaskGetTickCount() - start) < pdMS_TO_TICKS(3000) && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(timeout_ms)) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
+    const uint32_t waited = elapsedMs(start);
+    if (st == TAILNET_CONNECTED) {
+      if (logged) TLOGI("%s: Tailscale ready after %lu ms", what, (unsigned long)waited);
+      return true;
     }
-#endif
-    // Only a start in progress is worth waiting for; off, failed or waiting
-    // for a login will not change within a request's timeout.
-    if (st != TAILNET_STARTING && st != TAILNET_RECONNECTING) return false;
-    if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeout_ms)) return false;
+    // Waiting is worth it only for a start in progress (or one about to begin
+    // right after GOT_IP, for up to 3 s); off, failed, logged out or stopped
+    // (low memory, WiFi down) will not change within a request's timeout.
+    const bool starting = st == TAILNET_STARTING || st == TAILNET_RECONNECTING;
+    const bool soon = st == TAILNET_OFF && waited < 3000 && aboutToStart();
+    if (!starting && !soon) {
+      if (what) TLOGW("%s: Tailscale not up (status %d); failing at once", what, (int)st);
+      return false;
+    }
+    if (waited >= timeout_ms) {
+      if (what) TLOGW("%s: Tailscale still not ready after %lu ms (status %d)", what, (unsigned long)waited, (int)st);
+      return false;
+    }
+    if (what && !logged) {
+      logged = true;
+      TLOGI("%s waiting for Tailscale (up to %lu ms)", what, (unsigned long)timeout_ms);
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
+
+extern "C" bool tailnet_wait_connected(uint32_t timeout_ms) { return tailnet_wait_connected_for(nullptr, timeout_ms); }
 
 namespace {
 bool peerKnown(uint32_t ip) {
@@ -822,7 +858,9 @@ extern "C" bool tailnet_ensure_peer(uint32_t ip, uint32_t timeout_ms) {
   char what[24];
   snprintf(what, sizeof(what), "%u.%u.%u.%u", IP_ARGS(ip));
   tailnet_start_on_demand(what);
-  if (!tailnet_wait_connected(timeout_ms)) {
+  char label[40];
+  snprintf(label, sizeof(label), "connect %s", what);
+  if (!tailnet_wait_connected_for(label, timeout_ms)) {
     TLOGW("connect %u.%u.%u.%u: tailnet not connected", IP_ARGS(ip));
     return false;
   }
@@ -1076,7 +1114,6 @@ extern "C" bool tailnet_saved_login_url(char* buf, size_t len) {
 }
 
 namespace {
-uint32_t elapsedMs(TickType_t start) { return (uint32_t)((xTaskGetTickCount() - start) * portTICK_PERIOD_MS); }
 
 void logHeap(const char* what, TickType_t start) {
   TLOGI("%s after %lu ms: heap free %u, largest block %u", what, (unsigned long)elapsedMs(start),

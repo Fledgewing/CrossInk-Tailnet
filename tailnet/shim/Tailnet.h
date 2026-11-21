@@ -55,6 +55,9 @@ void tailnet_logout(void);
 // Block until the tailnet is connected, while it is starting or reconnecting.
 // Returns false at once when it is off, failed or waiting for a login.
 bool tailnet_wait_connected(uint32_t timeout_ms);
+// The same, logging "<what> waiting for Tailscale (up to N ms)" and the outcome.
+// Never waits on MicroLink's own tasks, lwIP's or the Tailscale worker.
+bool tailnet_wait_connected_for(const char* what, uint32_t timeout_ms);
 
 // Make sure MicroLink tracks the peer at ip (host byte order). On a tailnet
 // larger than its peer table, a peer can be left out; this pins it as the
