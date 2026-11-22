@@ -153,6 +153,12 @@ For each release, the release notes ("Licenses and source") link:
    version or commit, and whose `freeink-sdk` submodule commit is fixed by the tag;
 3. the MicroLink commit (the `third_party/microlink` submodule at that overlay commit).
 
+Releases from v1.6.1.33 and v2.0.0.32 on also attach `source-<version>.tar.gz`: all of the
+above in one archive (the overlay with MicroLink, CrossInk after the overlay with the FreeInk
+SDK, each reader's PlatformIO library sources as fetched, the Arduino core source and a
+`BUILD.md`). It leaves out only the public pioarduino platform package (prebuilt ESP-IDF and
+toolchain), which `BUILD.md` links. For older releases the archive is available on request.
+
 To rebuild a release: check out the overlay commit with submodules and the upstream tag
 with submodules, then follow [Building locally](README.md#building-locally). PlatformIO
 fetches the platform, the Arduino core, the prebuilt ESP-IDF libraries and the libraries at

@@ -233,6 +233,7 @@ then run the same commands. CI builds with PlatformIO Core 6.1.19 (pioarduino); 
 - **Corresponding source:** each release's notes ("Licenses and source") link the exact overlay
   commit, the CrossInk-Bookorbit tag, the MicroLink commit and these build instructions
   ([Building locally](#building-locally)). The upstream tag's `platformio.ini` pins the platform and
-  every library version.
+  every library version. Releases also attach `source-<version>.tar.gz` with all of that source,
+  including the libraries and the Arduino core, in one archive.
 
 Not affiliated with or endorsed by Tailscale Inc.

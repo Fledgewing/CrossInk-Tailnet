@@ -4,7 +4,8 @@
 # Reads the MicroLink submodule pin and URL from this repository at <overlay-commit>
 # (needs that commit locally), and the upstream tag's freeink-sdk pin and platform from
 # GitHub with `gh` (GH_TOKEN). Env: OVERLAY_REPO (default Fledgewing/CrossInk-Tailnet),
-# UPSTREAM_REPO (default agosez/CrossInk-Bookorbit).
+# UPSTREAM_REPO (default agosez/CrossInk-Bookorbit), SOURCE_ARCHIVE (attached, the default:
+# the release carries source-<version>.tar.gz; request: older releases without one).
 # Used by .github/workflows/build.yml for new releases and by hand for older ones.
 set -euo pipefail
 
@@ -48,3 +49,17 @@ Complete corresponding source:
 - Libraries: the exact versions and commits in \`lib_deps\` of the tag's [\`platformio.ini\`](https://github.com/$upstream_repo/blob/$tag_enc/platformio.ini)$(
   [ -n "$platform" ] && printf '\n- Platform: [pioarduino platform-espressif32 %s](%s) (Arduino core, prebuilt ESP-IDF, toolchain), PlatformIO Core 6.1.19' "${platform%% *}" "${platform#* }")
 EOF
+
+if [ "${SOURCE_ARCHIVE:-attached}" = request ]; then
+  cat <<EOF
+
+This release has no source archive attached. A complete copy of the source above, in one
+archive, is available on request: open an issue at https://github.com/$overlay_repo/issues.
+EOF
+else
+  cat <<'EOF'
+
+All of the above, with every library's source exactly as built and the Arduino core source, is
+in `source-<version>.tar.gz` attached to this release (see `BUILD.md` inside).
+EOF
+fi
