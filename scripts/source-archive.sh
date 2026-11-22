@@ -9,7 +9,8 @@
 # Used by .github/workflows/build.yml; nothing is built.
 set -euo pipefail
 
-overlay="$(cd "$(dirname "$0")/.." && pwd)"
+here="$(cd "$(dirname "$0")/.." && pwd)"
+overlay="$here"
 upstream="" version="" out="" core=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -67,6 +68,11 @@ for envdir in "$libdeps"/*/; do
 done
 [ -n "$first" ] || { echo "no libraries in $libdeps; run pio pkg install first" >&2; exit 1; }
 
+# License list and texts at the archive root (from this script's checkout, which may be newer
+# than an older release's overlay commit).
+cp "$here/THIRD_PARTY_LICENSES.md" "$stage/"
+cp -R "$here/licenses" "$stage/licenses"
+
 core_version=""
 if [ -n "$core" ]; then
   mkdir -p "$stage/framework-arduinoespressif32"
@@ -87,7 +93,7 @@ cat > "$stage/BUILD.md" <<EOF
 
 This archive is the complete corresponding source of the CrossInk-Tailnet firmware
 $version (\`firmware-*.bin\`), which is distributed under GPL-3.0-or-later. See
-\`overlay/THIRD_PARTY_LICENSES.md\` and \`overlay/licenses/\` for every component's license.
+\`THIRD_PARTY_LICENSES.md\` and \`licenses/\` for every component's license.
 
 | Directory | What | Version |
 |---|---|---|
