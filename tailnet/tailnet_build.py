@@ -190,6 +190,10 @@ SWITCHES = {
     "CROSSINK_TAILNET_BACKGROUND_SYNC":   (0,      1,      1),
     # Patch 0023: optional settings PIN (off until one is set in Settings > Settings PIN).
     "CROSSINK_TAILNET_SETTINGS_PIN":      (1,      1,      1),
+    # Patch 0025: battery stats in the orbit-battery-stats/1 format (docs/BATTERY-STATS-DESIGN.md).
+    # 0 off, 1 record (/.crossink/battery.bin), 2 + Settings > System > Battery stats writes
+    # /battery_stats.json, 3 + the rates on that page and an export when USB Drive mode starts.
+    "CROSSINK_TAILNET_BATTERY_STATS":     (2,      3,      3),
 }
 # Switches that stand for wolfSSL defines rather than a define of their own.
 WOLFSSL_SWITCH_DEFINES = {
@@ -204,7 +208,8 @@ SWITCH_COLUMN = pioenv if pioenv in SWITCH_ENVS else ("x4-pro" if has_psram else
 # The 2.x features (patches 0022, 0023) exist only in the 2.x series.
 V2_ONLY_SWITCHES = ("CROSSINK_TAILNET_NO_NEARBY", "CROSSINK_TAILNET_NO_MDNS", "CROSSINK_TAILNET_NO_PLUGINS",
                     "CROSSINK_TAILNET_NO_ASSET_DOWNLOADS", "CROSSINK_TAILNET_WOLFSSL_NO_ERROR_STRINGS",
-                    "CROSSINK_TAILNET_BACKGROUND_SYNC", "CROSSINK_TAILNET_SETTINGS_PIN")
+                    "CROSSINK_TAILNET_BACKGROUND_SYNC", "CROSSINK_TAILNET_SETTINGS_PIN",
+                    "CROSSINK_TAILNET_BATTERY_STATS")
 try:
     CROSSINK_MAJOR = int(str(env.GetProjectConfig().get("crossink", "version")).split(".")[0])  # noqa: F821
 except Exception:

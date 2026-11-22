@@ -1,0 +1,1617 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 6b42be45..e598b8b3 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -155,6 +155,10 @@ bool tlsArenaActive();                                // the arena is reserved (
+ #ifndef CROSSINK_TAILNET_SETTINGS_PIN
+ #define CROSSINK_TAILNET_SETTINGS_PIN 0
+ #endif
++// Patch 0025: battery stats tier (0 off, 1 record, 2 + export, 3 + stats page).
++#ifndef CROSSINK_TAILNET_BATTERY_STATS
++#define CROSSINK_TAILNET_BATTERY_STATS 0
++#endif
+ 
+ // Frontlight re-applied after the first paint of every boot (overlay patch 0024, main.cpp
+ // loop() and HalFrontlight::reapply()). An X4 Pro sometimes woke with the light dark while
+diff --git a/lib/BatteryStats/BatteryStatsCore.cpp b/lib/BatteryStats/BatteryStatsCore.cpp
+new file mode 100644
+index 00000000..9a0bf38e
+--- /dev/null
++++ b/lib/BatteryStats/BatteryStatsCore.cpp
+@@ -0,0 +1,493 @@
++#include "BatteryStatsCore.h"
++
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++namespace batterystats {
++
++namespace {
++void put16(uint8_t* p, uint16_t v) {
++  p[0] = static_cast<uint8_t>(v);
++  p[1] = static_cast<uint8_t>(v >> 8);
++}
++void put32(uint8_t* p, uint32_t v) {
++  put16(p, static_cast<uint16_t>(v));
++  put16(p + 2, static_cast<uint16_t>(v >> 16));
++}
++uint16_t get16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
++uint32_t get32(const uint8_t* p) { return get16(p) | (static_cast<uint32_t>(get16(p + 2)) << 16); }
++
++bool endsWith(const char* s, const char* ext) {
++  const size_t n = strlen(s), m = strlen(ext);
++  if (n < m) return false;
++  for (size_t i = 0; i < m; i++) {
++    char c = s[n - m + i];
++    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
++    if (c != ext[i]) return false;
++  }
++  return true;
++}
++
++// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
++void civilFromDays(int32_t z, int32_t& y, uint32_t& m, uint32_t& d) {
++  z += 719468;
++  const int32_t era = (z >= 0 ? z : z - 146096) / 146097;
++  const uint32_t doe = static_cast<uint32_t>(z - era * 146097);
++  const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++  y = static_cast<int32_t>(yoe) + era * 400;
++  const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++  const uint32_t mp = (5 * doy + 2) / 153;
++  d = doy - (153 * mp + 2) / 5 + 1;
++  m = mp < 10 ? mp + 3 : mp - 9;
++  y += m <= 2;
++}
++
++const char* stateName(uint8_t s) {
++  switch (s) {
++    case STATE_STANDBY: return "standby";
++    case STATE_READING: return "reading";
++    case STATE_AWAKE: return "awake";
++    default: return "charging";
++  }
++}
++const char* contentName(uint8_t c) { return c == CONTENT_XTC ? "xtc" : "text"; }
++
++constexpr uint32_t DAY_S = 86400;
++constexpr uint32_t RECENT_S = 7 * DAY_S;
++}  // namespace
++
++void encodeHeader(uint8_t out[HEADER_SIZE], const uint8_t boardId) {
++  memcpy(out, LOG_MAGIC, 4);
++  out[4] = 1;  // record version
++  out[5] = boardId;
++  out[6] = out[7] = 0;
++}
++
++bool headerValid(const uint8_t in[HEADER_SIZE]) { return memcmp(in, LOG_MAGIC, 4) == 0 && in[4] == 1; }
++
++void encode(const Record& r, uint8_t out[RECORD_SIZE]) {
++  put32(out, r.t);
++  out[4] = r.kind;
++  out[5] = r.era;
++  out[6] = r.flags;
++  out[7] = r.pct;
++  put16(out + 8, r.mv);
++  out[10] = r.lightLevel;
++  out[11] = r.full;
++  put16(out + 12, r.pages);
++  put16(out + 14, r.partial);
++}
++
++Record decode(const uint8_t in[RECORD_SIZE]) {
++  Record r;
++  r.t = get32(in);
++  r.kind = in[4];
++  r.era = in[5];
++  r.flags = in[6];
++  r.pct = in[7];
++  r.mv = get16(in + 8);
++  r.lightLevel = in[10];
++  r.full = in[11];
++  r.pages = get16(in + 12);
++  r.partial = get16(in + 14);
++  return r;
++}
++
++uint8_t contentForPath(const char* path) {
++  if (!path || !*path) return CONTENT_NONE;
++  if (endsWith(path, ".xtc") || endsWith(path, ".xtch")) return CONTENT_XTC;
++  if (endsWith(path, ".epub") || endsWith(path, ".txt") || endsWith(path, ".md")) return CONTENT_TEXT;
++  return CONTENT_NONE;  // image previews and anything else are not books
++}
++
++float pctFromMillivolts(const uint16_t mv) {
++  // Resting 1S Li-ion curve, the same knee points as the SDK's percentageFromMillivolts.
++  static constexpr uint16_t MV[] = {3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 4000, 4100, 4200};
++  static constexpr uint8_t PCT[] = {0, 5, 10, 20, 30, 40, 50, 60, 75, 90, 100};
++  if (mv <= MV[0]) return 0;
++  for (size_t i = 1; i < sizeof(MV) / sizeof(MV[0]); i++) {
++    if (mv <= MV[i]) return PCT[i - 1] + float(PCT[i] - PCT[i - 1]) * float(mv - MV[i - 1]) / float(MV[i] - MV[i - 1]);
++  }
++  return 100;
++}
++
++int32_t localDay(const uint32_t utc, const int32_t offsetMin) {
++  const int64_t local = static_cast<int64_t>(utc) + static_cast<int64_t>(offsetMin) * 60;
++  return static_cast<int32_t>(local >= 0 ? local / DAY_S : (local - DAY_S + 1) / DAY_S);
++}
++
++void formatDay(const int32_t day, char* buf, const size_t len) {
++  int32_t y;
++  uint32_t m, d;
++  civilFromDays(day, y, m, d);
++  snprintf(buf, len, "%04d-%02u-%02u", static_cast<int>(y), static_cast<unsigned>(m), static_cast<unsigned>(d));
++}
++
++void formatTime(const uint32_t utc, const int32_t offsetMin, char* buf, const size_t len) {
++  const int64_t local = static_cast<int64_t>(utc) + static_cast<int64_t>(offsetMin) * 60;
++  const int32_t day = localDay(utc, offsetMin);
++  const uint32_t sec = static_cast<uint32_t>(local - static_cast<int64_t>(day) * DAY_S);
++  char date[12];
++  formatDay(day, date, sizeof(date));
++  const int32_t off = offsetMin < 0 ? -offsetMin : offsetMin;
++  snprintf(buf, len, "%sT%02u:%02u:%02u%c%02d:%02d", date, static_cast<unsigned>(sec / 3600),
++           static_cast<unsigned>(sec / 60 % 60), static_cast<unsigned>(sec % 60), offsetMin < 0 ? '-' : '+',
++           static_cast<int>(off / 60), static_cast<int>(off % 60));
++}
++
++// ---- Pooled least squares ---------------------------------------------------
++double Pooled::pctPerHour(const bool rising) const {
++  const double slope = sxy / sxx;  // % per hour
++  return (rising ? slope : -slope) + 0.0;  // + 0.0 turns -0 into 0
++}
++
++bool Pooled::se(double& out) const {
++  // One intercept per segment plus the shared slope.
++  const int32_t df = static_cast<int32_t>(points) - static_cast<int32_t>(segments) - 1;
++  if (df <= 0 || sxx <= 0) return false;
++  double ssr = syy - sxy * sxy / sxx;
++  if (ssr < 0) ssr = 0;
++  out = std::sqrt(ssr / df / sxx);
++  return true;
++}
++
++// ---- Analyzer -----------------------------------------------------------------
++Analyzer::Analyzer(const Config& c, const uint32_t nowS, const SegmentFn seg, const DayFn day, void* context)
++    : cfg(c), now(nowS), onSegment(seg), onDay(day), ctx(context) {}
++
++float Analyzer::pctOf(const Record& r) const {
++  if (cfg.voltageEstimate && r.mv) return pctFromMillivolts(r.mv);
++  return r.pct;
++}
++
++void Analyzer::add(const Record& r) {
++  if (haveLast) interval(last, r);
++  last = r;
++  haveLast = true;
++}
++
++// The state of the stretch that follows record `a`.
++static uint8_t stateAfter(const Record& a) {
++  if (a.kind == KIND_SLEEP) return STATE_STANDBY;
++  if (a.flags & FLAG_USB) return STATE_CHARGING;
++  return a.content() != CONTENT_NONE ? STATE_READING : STATE_AWAKE;
++}
++
++void Analyzer::interval(const Record& a, const Record& b) {
++  uint8_t state = stateAfter(a);
++  const bool approx = (a.flags | b.flags) & FLAG_APPROX_TIME;
++  // Unknown stretches: time ran backwards or across a lost clock, power was lost while
++  // awake, or the device charged while asleep (it cannot see when that started).
++  if (b.t < a.t || (approx && a.era != b.era)) state = STATE_UNKNOWN;
++  if (b.kind == KIND_BOOT && b.resetClass() != RESET_CONTINUE && a.kind != KIND_SLEEP) state = STATE_UNKNOWN;
++  if (b.kind == KIND_BOOT && b.resetClass() == RESET_CRASH) state = STATE_UNKNOWN;
++  if (state == STATE_STANDBY && ((b.flags & FLAG_USB) || pctOf(b) > pctOf(a))) state = STATE_UNKNOWN;
++
++  const bool light = state == STATE_READING && cfg.hasLight && (a.flags & FLAG_LIGHT);
++  const bool radio = (a.flags & FLAG_RADIO) != 0;
++  const uint8_t content = state == STATE_READING ? a.content() : CONTENT_NONE;
++  if (segOpen && (state != seg.state || content != seg.content || light != seg.light || radio != seg.radio)) {
++    closeSegment();
++  }
++  if (state == STATE_UNKNOWN) return;
++
++  const float pa = pctOf(a), pb = pctOf(b);
++  if (!segOpen) {
++    segOpen = true;
++    seg = Segment();
++    seg.start = a.t;
++    seg.timeKnown = !approx;
++    seg.state = state;
++    seg.content = content;
++    seg.light = light;
++    seg.radio = radio;
++    seg.lightLevel = light ? a.lightLevel : 0;
++    seg.startPct = pa;
++    sT = sY = sTT = sTY = sYY = 0;
++    n = 1;
++    sY = pa;
++    sYY = double(pa) * pa;
++  }
++  if (approx) seg.timeKnown = false;
++  seg.end = b.t;
++  seg.durationS += b.t - a.t;
++  seg.endPct = pb;
++  seg.pages += b.pages;
++  seg.full += b.full;
++  seg.partial += b.partial;
++  const double t = (b.t - seg.start) / 3600.0;
++  n++;
++  sT += t;
++  sY += pb;
++  sTT += t * t;
++  sTY += t * pb;
++  sYY += double(pb) * pb;
++
++  if (!approx) {
++    addDayTime(a.t, b.t, state);
++    if (dayOpen) {
++      cur.pages += b.pages;
++      cur.full += b.full;
++      cur.partial += b.partial;
++      if (state != STATE_CHARGING && pb < pa) cur.usedPct += pa - pb;
++      if (b.kind == KIND_CHARGE && (b.flags & FLAG_USB)) cur.charges++;
++    }
++  }
++  if (now >= b.t && now - b.t <= RECENT_S) {
++    if (state == STATE_STANDBY) recentStandbyS += b.t - a.t;
++    if (state == STATE_READING || state == STATE_AWAKE) recentAwakeS += b.t - a.t;
++  }
++}
++
++void Analyzer::closeSegment() {
++  if (!segOpen) return;
++  segOpen = false;
++  if (n < 2 || seg.durationS == 0) return;
++  const double mT = sT / n, mY = sY / n;
++  const double sxx = sTT - n * mT * mT, sxy = sTY - n * mT * mY, syy = sYY - n * mY * mY;
++  const auto fold = [&](Category c) {
++    Pooled& p = pooled[c];
++    p.sxx += sxx;
++    p.sxy += sxy;
++    p.syy += syy;
++    p.points += n;
++    p.segments++;
++    p.hours += seg.durationS / 3600.0;
++    p.changePct += std::fabs(seg.startPct - seg.endPct);
++    p.pages += seg.pages;
++    p.full += seg.full;
++  };
++  switch (seg.state) {
++    case STATE_STANDBY: fold(CAT_STANDBY); break;
++    case STATE_AWAKE: fold(CAT_AWAKE); break;
++    case STATE_CHARGING: fold(CAT_CHARGING); break;
++    case STATE_READING:
++      fold(CAT_READING);
++      if (seg.content == CONTENT_TEXT) fold(CAT_READING_TEXT);
++      if (seg.content == CONTENT_XTC) fold(CAT_READING_XTC);
++      if (cfg.hasLight) fold(seg.light ? CAT_READING_LIGHT_ON : CAT_READING_LIGHT_OFF);
++      fold(seg.radio ? CAT_READING_RADIO_ON : CAT_READING_RADIO_OFF);
++      break;
++    default: break;
++  }
++  if (onSegment && seg.end >= cfg.segmentsSince) onSegment(ctx, seg);
++}
++
++void Analyzer::dayFor(const int32_t day) {
++  if (dayOpen && cur.day == day) return;
++  if (dayOpen && onDay) onDay(ctx, cur);
++  dayOpen = true;
++  cur = Day();
++  cur.day = day;
++  const uint32_t idx = static_cast<uint32_t>(day) + 1;
++  if (!firstDay || idx < firstDay) firstDay = idx;
++  if (idx > lastDay) lastDay = idx;
++  days++;
++}
++
++void Analyzer::addDayTime(uint32_t from, const uint32_t to, const uint8_t state) {
++  while (from < to) {
++    const int32_t day = localDay(from, cfg.utcOffsetMin);
++    dayFor(day);
++    const int64_t dayEnd = (static_cast<int64_t>(day) + 1) * DAY_S - static_cast<int64_t>(cfg.utcOffsetMin) * 60;
++    const uint32_t stop = static_cast<int64_t>(to) < dayEnd ? to : static_cast<uint32_t>(dayEnd);
++    const uint32_t s = stop - from;
++    if (state == STATE_STANDBY) cur.standbyS += s;
++    else if (state == STATE_CHARGING) cur.chargeS += s;
++    else cur.awakeS += s;
++    from = stop;
++  }
++  // Counts and drops land on the day the stretch ends.
++  dayFor(localDay(to > 0 ? to - 1 : 0, cfg.utcOffsetMin));
++}
++
++void Analyzer::finish() {
++  closeSegment();
++  if (dayOpen && onDay) onDay(ctx, cur);
++  dayOpen = false;
++}
++
++// ---- Summary (the companion's display thresholds) ------------------------------
++static bool shown(const Pooled& p, double minHours) { return p.has() && p.hours >= minHours && p.changePct > 2; }
++
++Summary summarize(const Analyzer& a) {
++  Summary s;
++  const Pooled& sb = a.rate(CAT_STANDBY);
++  const Pooled& rd = a.rate(CAT_READING);
++  s.dataHours = static_cast<float>(sb.hours + rd.hours + a.rate(CAT_AWAKE).hours);
++  s.pct = a.haveLast ? a.last.pct : 0;
++  if ((s.standby = shown(sb, 1))) s.standbyPctH = static_cast<float>(sb.pctPerHour(false));
++  if ((s.reading = shown(rd, 1))) s.readingPctH = static_cast<float>(rd.pctPerHour(false));
++  if (s.reading && rd.pages >= 100) {
++    s.per100 = true;
++    s.per100Pages = static_cast<float>(s.readingPctH * rd.hours / rd.pages * 100);
++  }
++  const double recent = a.recentAwakeS + a.recentStandbyS;
++  if (s.standby && s.reading && recent >= 24 * 3600.0) {
++    const double f = a.recentAwakeS / recent;
++    const double drain = f * s.readingPctH + (1 - f) * s.standbyPctH;
++    if (drain > 0) {
++      s.timeLeft = true;
++      s.timeLeftH = static_cast<float>(s.pct / drain);
++    }
++  }
++  return s;
++}
++
++// ---- JSON ---------------------------------------------------------------------
++void JsonOut::raw(const char* s) {
++  if (ok) ok = write(ctx, s, strlen(s));
++}
++
++void JsonOut::printf(const char* fmt, ...) {
++  char buf[256];
++  va_list ap;
++  va_start(ap, fmt);
++  const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++  va_end(ap);
++  if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
++    ok = false;
++    return;
++  }
++  if (ok) ok = write(ctx, buf, static_cast<size_t>(n));
++}
++
++namespace {
++struct ExportCtx {
++  JsonOut* out;
++  const Config* cfg;
++  bool first;
++};
++
++void writeDay(void* p, const Day& d) {
++  auto* x = static_cast<ExportCtx*>(p);
++  char day[12];
++  formatDay(d.day, day, sizeof(day));
++  x->out->printf(
++      "%s\n{\"day\":\"%s\",\"used_pct\":%.1f,\"screen_on_min\":%u,\"standby_min\":%u,\"charge_min\":%u,"
++      "\"pages\":%u,\"full\":%u,\"partial\":%u,\"charges\":%u}",
++      x->first ? "" : ",", day, static_cast<double>(d.usedPct), static_cast<unsigned>(d.awakeS / 60),
++      static_cast<unsigned>(d.standbyS / 60), static_cast<unsigned>(d.chargeS / 60), static_cast<unsigned>(d.pages),
++      static_cast<unsigned>(d.full), static_cast<unsigned>(d.partial), static_cast<unsigned>(d.charges));
++  x->first = false;
++}
++
++void writeSegment(void* p, const Segment& s) {
++  auto* x = static_cast<ExportCtx*>(p);
++  char start[32] = "null", end[32] = "null";
++  if (s.timeKnown) {
++    char a[28], b[28];
++    formatTime(s.start, x->cfg->utcOffsetMin, a, sizeof(a));
++    formatTime(s.end, x->cfg->utcOffsetMin, b, sizeof(b));
++    snprintf(start, sizeof(start), "\"%s\"", a);
++    snprintf(end, sizeof(end), "\"%s\"", b);
++  }
++  x->out->printf("%s\n{\"start\":%s,\"end\":%s,\"duration_s\":%u,\"state\":\"%s\",\"start_pct\":%.1f,\"end_pct\":%.1f",
++                 x->first ? "" : ",", start, end, static_cast<unsigned>(s.durationS), stateName(s.state),
++                 static_cast<double>(s.startPct), static_cast<double>(s.endPct));
++  if (s.state == STATE_READING) x->out->printf(",\"content\":\"%s\"", contentName(s.content));
++  if (s.state == STATE_READING && x->cfg->hasLight) {
++    x->out->printf(",\"light\":\"%s\"", s.light ? "on" : "off");
++    if (s.light) x->out->printf(",\"light_level\":%u", static_cast<unsigned>(s.lightLevel));
++  }
++  x->out->printf(",\"radio\":\"%s\",\"pages\":%u,\"full\":%u,\"partial\":%u}", s.radio ? "on" : "off",
++                 static_cast<unsigned>(s.pages), static_cast<unsigned>(s.full), static_cast<unsigned>(s.partial));
++  x->first = false;
++}
++
++struct RateRow {
++  Category cat;
++  uint8_t state;
++  const char* dim;
++  const char* value;
++};
++constexpr RateRow RATE_ROWS[] = {
++    {CAT_STANDBY, STATE_STANDBY, nullptr, nullptr},
++    {CAT_READING, STATE_READING, nullptr, nullptr},
++    {CAT_AWAKE, STATE_AWAKE, nullptr, nullptr},
++    {CAT_CHARGING, STATE_CHARGING, nullptr, nullptr},
++    {CAT_READING_TEXT, STATE_READING, "content", "text"},
++    {CAT_READING_XTC, STATE_READING, "content", "xtc"},
++    {CAT_READING_LIGHT_ON, STATE_READING, "light", "on"},
++    {CAT_READING_LIGHT_OFF, STATE_READING, "light", "off"},
++    {CAT_READING_RADIO_ON, STATE_READING, "radio", "on"},
++    {CAT_READING_RADIO_OFF, STATE_READING, "radio", "off"},
++};
++}  // namespace
++
++bool exportJson(JsonOut& out, const DeviceInfo& dev, const Config& cfg, const uint32_t now, const bool nowKnown,
++                const FeedFn feed, void* feedCtx, const DoneFn done, void* doneCtx) {
++  char when[32];
++  if (nowKnown) formatTime(now, cfg.utcOffsetMin, when, sizeof(when));
++  out.printf("{\"schema\":\"orbit-battery-stats/1\",\"source\":\"crossink-firmware\",\"source_version\":\"%s\",",
++             dev.version);
++  if (nowKnown) out.printf("\"generated\":\"%s\",", when);
++  out.printf("\"battery_source\":\"%s\",\"device\":{\"manufacturer\":\"Xteink\",\"model\":\"%s\"", dev.batterySource,
++             dev.model);
++  if (dev.capacityMah) out.printf(",\"capacity_mah\":%u,\"capacity_source\":\"board_profile\"", dev.capacityMah);
++  out.raw("},\n\"daily\":[");
++
++  // Pass 1: days and rates.
++  ExportCtx x{&out, &cfg, true};
++  Analyzer a(cfg, now, nullptr, writeDay, &x);
++  if (!feed(feedCtx, a)) return false;
++  a.finish();
++  out.raw("],\n\"segments\":[");
++
++  // Pass 2: segments of the reporting window.
++  x.first = true;
++  {
++    Analyzer b(cfg, now, writeSegment, nullptr, &x);
++    if (!feed(feedCtx, b)) return false;
++    b.finish();
++  }
++  out.raw("],\n\"rates\":[");
++
++  bool first = true;
++  for (const RateRow& row : RATE_ROWS) {
++    const Pooled& p = a.rate(row.cat);
++    if (!p.has()) continue;
++    out.printf("%s\n{\"state\":\"%s\"", first ? "" : ",", stateName(row.state));
++    if (row.dim) out.printf(",\"%s\":\"%s\"", row.dim, row.value);
++    out.printf(",\"pct_per_h\":%.4f", p.pctPerHour(row.state == STATE_CHARGING));
++    double se;
++    if (p.se(se)) out.printf(",\"se\":%.4f", se);
++    out.printf(",\"hours\":%.2f,\"change_pct\":%.1f,\"segments\":%u}", p.hours, p.changePct,
++               static_cast<unsigned>(p.segments));
++    first = false;
++  }
++  out.raw("],\n\"per_100\":[");
++  first = true;
++  static constexpr Category PER100[] = {CAT_READING, CAT_READING_TEXT, CAT_READING_XTC};
++  for (const Category c : PER100) {
++    const Pooled& p = a.rate(c);
++    if (!p.has()) continue;
++    const double used = p.pctPerHour(false) * p.hours;
++    const char* content = c == CAT_READING_TEXT ? "text" : c == CAT_READING_XTC ? "xtc" : nullptr;
++    const uint32_t counts[2] = {p.pages, p.full};
++    const char* units[2] = {"pages", "full_refreshes"};
++    for (int u = 0; u < 2; u++) {
++      if (counts[u] < 100) continue;
++      out.printf("%s\n{\"state\":\"reading\"", first ? "" : ",");
++      if (content) out.printf(",\"content\":\"%s\"", content);
++      out.printf(",\"unit\":\"%s\",\"pct\":%.3f,\"count\":%u}", units[u], used / counts[u] * 100,
++                 static_cast<unsigned>(counts[u]));
++      first = false;
++    }
++  }
++  out.raw("]");
++  if (a.days) {
++    char d1[12], d2[12];
++    formatDay(static_cast<int32_t>(a.firstDay) - 1, d1, sizeof(d1));
++    formatDay(static_cast<int32_t>(a.lastDay) - 1, d2, sizeof(d2));
++    out.printf(",\n\"period\":{\"first_day\":\"%s\",\"last_day\":\"%s\",\"days\":%u}", d1, d2,
++               static_cast<unsigned>(a.lastDay - a.firstDay + 1));
++  }
++  out.raw("}\n");
++  if (done) done(doneCtx, a);
++  return out.ok;
++}
++
++}  // namespace batterystats
+diff --git a/lib/BatteryStats/BatteryStatsCore.h b/lib/BatteryStats/BatteryStatsCore.h
+new file mode 100644
+index 00000000..e1ee497c
+--- /dev/null
++++ b/lib/BatteryStats/BatteryStatsCore.h
+@@ -0,0 +1,208 @@
++#pragma once
++
++// Battery stats, hardware-free part (CrossInk-Tailnet patch 0025): the on-SD record
++// format and the analysis behind the `orbit-battery-stats/1` export
++// (BookOrbit-Android docs/STATS.md). The device side (src/util/BatteryStats.cpp)
++// appends one record per transition and feeds the file back through Analyzer.
++
++#include <cstddef>
++#include <cstdint>
++
++namespace batterystats {
++
++// ---- On-SD log: an 8-byte header, then 16-byte little-endian records ----------
++constexpr char LOG_MAGIC[4] = {'O', 'B', 'S', '1'};
++constexpr size_t HEADER_SIZE = 8;
++constexpr size_t RECORD_SIZE = 16;
++
++enum Kind : uint8_t {
++  KIND_BOOT = 1,     // SD mounted after a reset; flags carry the reset class
++  KIND_SLEEP = 2,    // last record before deep sleep
++  KIND_RESTART = 3,  // software restart (network boot, sleep sync)
++  KIND_LEVEL = 4,    // battery % changed while awake
++  KIND_RADIO = 5,    // Wi-Fi radio on/off (flags)
++  KIND_CHARGE = 6,   // USB power plugged/unplugged (flags)
++  KIND_CONTENT = 7,  // book opened/closed (flags)
++  KIND_LIGHT = 8,    // frontlight on/off (flags)
++};
++
++enum Content : uint8_t { CONTENT_NONE = 0, CONTENT_TEXT = 1, CONTENT_XTC = 2 };
++
++// Reset class of a KIND_BOOT record: what happened before it.
++enum ResetClass : uint8_t {
++  RESET_CONTINUE = 0,  // deep-sleep wake or software restart: no power was lost
++  RESET_POWER_ON = 1,  // power-on: a latch-off sleep's wake, or a cold boot
++  RESET_CRASH = 2,     // panic, watchdog or brownout
++};
++
++constexpr uint8_t FLAG_APPROX_TIME = 0x01;  // clock not backed by an RTC
++constexpr uint8_t FLAG_USB = 0x02;          // external power present
++constexpr uint8_t FLAG_RADIO = 0x04;        // Wi-Fi radio on
++constexpr uint8_t FLAG_LIGHT = 0x08;        // frontlight on
++constexpr uint8_t FLAG_CONTENT_SHIFT = 4;   // 2 bits: Content
++constexpr uint8_t FLAG_RESET_SHIFT = 6;     // 2 bits: ResetClass (KIND_BOOT only)
++
++struct Record {
++  uint32_t t = 0;  // UTC epoch seconds
++  uint8_t kind = 0;
++  uint8_t era = 0;  // WallClock era, truncated: approximate times compare only within one era
++  uint8_t flags = 0;
++  uint8_t pct = 0;      // battery %, 0-100
++  uint16_t mv = 0;      // battery mV, 0 = unknown
++  uint8_t lightLevel = 0;  // 0-100
++  uint8_t full = 0;     // full/half refreshes since the previous record (saturating)
++  uint16_t pages = 0;   // page turns since the previous record
++  uint16_t partial = 0; // fast/grayscale refreshes since the previous record
++
++  uint8_t content() const { return (flags >> FLAG_CONTENT_SHIFT) & 0x03; }
++  uint8_t resetClass() const { return (flags >> FLAG_RESET_SHIFT) & 0x03; }
++};
++
++void encodeHeader(uint8_t out[HEADER_SIZE], uint8_t boardId);
++bool headerValid(const uint8_t in[HEADER_SIZE]);
++void encode(const Record& r, uint8_t out[RECORD_SIZE]);
++Record decode(const uint8_t in[RECORD_SIZE]);
++
++uint8_t contentForPath(const char* path);  // by extension: epub/txt/md -> text, xtc/xtch -> xtc
++
++// Battery % from mV off a 1S Li-ion curve, interpolated (the X4's ADC; the SDK's
++// own mapping rounds to 10 % steps).
++float pctFromMillivolts(uint16_t mv);
++
++// ---- Analysis -----------------------------------------------------------------
++enum State : uint8_t { STATE_STANDBY = 0, STATE_READING, STATE_AWAKE, STATE_CHARGING, STATE_UNKNOWN };
++
++struct Segment {
++  uint32_t start = 0, end = 0;  // UTC epoch seconds
++  bool timeKnown = false;       // false: start/end are not real times (write null)
++  uint32_t durationS = 0;
++  uint8_t state = STATE_UNKNOWN;
++  uint8_t content = CONTENT_NONE;
++  bool light = false, radio = false;
++  uint8_t lightLevel = 0;
++  float startPct = 0, endPct = 0;
++  uint32_t pages = 0, full = 0, partial = 0;
++};
++
++struct Day {
++  int32_t day = 0;  // local days since 1970-01-01
++  float usedPct = 0;
++  uint32_t awakeS = 0, standbyS = 0, chargeS = 0;
++  uint32_t pages = 0, full = 0, partial = 0, charges = 0;
++};
++
++// Rate categories: a state alone, or a state with exactly one dimension.
++enum Category : uint8_t {
++  CAT_STANDBY = 0,
++  CAT_READING,
++  CAT_AWAKE,
++  CAT_CHARGING,
++  CAT_READING_TEXT,
++  CAT_READING_XTC,
++  CAT_READING_LIGHT_ON,
++  CAT_READING_LIGHT_OFF,
++  CAT_READING_RADIO_ON,
++  CAT_READING_RADIO_OFF,
++  CAT_COUNT
++};
++
++struct Pooled {
++  double sxx = 0, sxy = 0, syy = 0;  // centred per segment, then pooled
++  uint32_t points = 0, segments = 0;
++  double hours = 0, changePct = 0;
++  uint32_t pages = 0, full = 0;
++
++  bool has() const { return sxx > 0 && segments > 0; }
++  double pctPerHour(bool rising) const;  // positive drain (or rise for charging)
++  bool se(double& out) const;           // standard error of the slope
++};
++
++struct Config {
++  int32_t utcOffsetMin = 0;  // local time = UTC + offset, for days and ISO times
++  bool hasLight = false;     // write light on/off on reading segments
++  bool voltageEstimate = false;  // pct from mV (X4 ADC)
++  uint32_t segmentsSince = 0;    // segments that end before this are not reported (0 = all)
++};
++
++// Feed records in file order. Callbacks (optional) receive each closed segment and each
++// finished local day; the pooled rates are read after finish().
++class Analyzer {
++ public:
++  using SegmentFn = void (*)(void* ctx, const Segment&);
++  using DayFn = void (*)(void* ctx, const Day&);
++
++  Analyzer(const Config& cfg, uint32_t now, SegmentFn onSegment, DayFn onDay, void* ctx);
++  void add(const Record& r);
++  void finish();
++
++  const Pooled& rate(Category c) const { return pooled[c]; }
++  uint32_t firstDay = 0, lastDay = 0, days = 0;  // local day indexes (+1, 0 = none)
++  bool haveLast = false;
++  Record last;
++  // Last 7 days of non-charging time: awake share for the time-left estimate.
++  double recentAwakeS = 0, recentStandbyS = 0;
++
++ private:
++  void interval(const Record& a, const Record& b);
++  void closeSegment();
++  void addDayTime(uint32_t from, uint32_t to, uint8_t state);
++  void dayFor(int32_t day);
++  float pctOf(const Record& r) const;
++
++  Config cfg;
++  uint32_t now;
++  SegmentFn onSegment;
++  DayFn onDay;
++  void* ctx;
++  Pooled pooled[CAT_COUNT];
++
++  bool segOpen = false;
++  Segment seg;
++  double sT = 0, sY = 0, sTT = 0, sTY = 0, sYY = 0;  // current segment's sums (t in hours from start)
++  uint32_t n = 0;
++
++  bool dayOpen = false;
++  Day cur;
++};
++
++// What the on-device page shows. Rates follow the companion's thresholds.
++struct Summary {
++  bool standby = false, reading = false, per100 = false, timeLeft = false;
++  float standbyPctH = 0, readingPctH = 0, per100Pages = 0, timeLeftH = 0;
++  float dataHours = 0;  // non-charging hours behind the rates
++  uint8_t pct = 0;
++};
++Summary summarize(const Analyzer& a);
++
++// ---- JSON (orbit-battery-stats/1) -------------------------------------------
++// Writes through `write`; returns false once a write fails.
++struct JsonOut {
++  bool (*write)(void* ctx, const char* data, size_t len);
++  void* ctx;
++  bool ok = true;
++  void raw(const char* s);
++  void printf(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
++};
++
++struct DeviceInfo {
++  const char* model;          // "X4 Pro", "X4 Classic", "X3", "X4"
++  const char* batterySource;  // "fuel_gauge" | "voltage_estimate"
++  uint16_t capacityMah;       // 0 = unknown
++  const char* version;
++};
++
++// Two passes over the same records: `feed` is called twice with a fresh Analyzer
++// (first for the days, then for the segments) and must add every record in order.
++// `done` (optional) sees the first pass's analyzer, e.g. to summarize() it; passing
++// nullptr keeps summarize() out of builds without the stats page.
++using FeedFn = bool (*)(void* ctx, Analyzer& a);
++using DoneFn = void (*)(void* ctx, const Analyzer& a);
++bool exportJson(JsonOut& out, const DeviceInfo& dev, const Config& cfg, uint32_t now, bool nowKnown, FeedFn feed,
++                void* feedCtx, DoneFn done = nullptr, void* doneCtx = nullptr);
++
++// Helpers shared with the device side.
++int32_t localDay(uint32_t utc, int32_t offsetMin);
++void formatDay(int32_t day, char* buf, size_t len);                         // YYYY-MM-DD
++void formatTime(uint32_t utc, int32_t offsetMin, char* buf, size_t len);    // ISO-8601 with offset
++
++}  // namespace batterystats
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index e0b50c3d..f08a759c 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -718,6 +718,14 @@ STR_NO_SERVERS: "No OPDS servers configured"
+ STR_DELETE_SERVER: "Delete Server"
+ STR_OPDS_SERVERS: "OPDS Servers"
+ STR_TAILSCALE: "Tailscale"
++STR_BATTERY_STATS: "Battery stats"
++STR_BATTERY_STATS_SAVED: "Saved to"
++STR_BATTERY_STATS_FAILED: "Could not write the battery stats"
++STR_BATTERY_TIME_LEFT: "Time left"
++STR_BATTERY_STANDBY_RATE: "Standby"
++STR_BATTERY_READING_RATE: "Reading"
++STR_BATTERY_PER_100_PAGES: "Per 100 pages"
++STR_BATTERY_NOT_ENOUGH_DATA: "Not enough data yet"
+ STR_SETTINGS_PIN: "Settings PIN"
+ STR_ENTER_SETTINGS_PIN: "Enter Settings PIN"
+ STR_NEW_PIN: "New PIN"
+diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
+index 8ad58fb6..d8c5659b 100644
+--- a/lib/hal/HalDisplay.cpp
++++ b/lib/hal/HalDisplay.cpp
+@@ -119,6 +119,7 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
+ }
+ 
+ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  countRefresh(mode != RefreshMode::FAST_REFRESH);  // CrossInk-Tailnet patch 0025
+   HalSpiBus::Lock spiLock;
+ 
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+@@ -143,6 +144,7 @@ bool HalDisplay::restoreVisibleFrame() {
+ }
+ 
+ void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
++  countRefresh(mode != RefreshMode::FAST_REFRESH);  // CrossInk-Tailnet patch 0025
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+     einkDisplay.requestResync(1);
+   }
+@@ -170,6 +172,7 @@ bool HalDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback,
+ }
+ 
+ void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
++  countRefresh(mode != RefreshMode::FAST_REFRESH);  // CrossInk-Tailnet patch 0025
+   HalSpiBus::Lock spiLock;
+ 
+   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+@@ -238,6 +241,7 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
+ void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
+ 
+ void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
++  countRefresh(false);  // CrossInk-Tailnet patch 0025
+   HalSpiBus::Lock spiLock;
+   einkDisplay.displayGrayBuffer(turnOffScreen);
+ }
+diff --git a/lib/hal/HalDisplay.h b/lib/hal/HalDisplay.h
+index 41a31e46..19c0b19c 100644
+--- a/lib/hal/HalDisplay.h
++++ b/lib/hal/HalDisplay.h
+@@ -139,6 +139,26 @@ class HalDisplay {
+   uint16_t getDisplayWidthBytes() const;
+   uint32_t getBufferSize() const;
+ 
++#if CROSSINK_TAILNET_BATTERY_STATS
++  // CrossInk-Tailnet patch 0025: refreshes since the last call, full (FULL/HALF) and
++  // partial (FAST/grayscale); the battery stats take them into each record.
++  void takeRefreshCounts(uint16_t& full, uint16_t& partial) {
++    full = statsFull;
++    partial = statsPartial;
++    statsFull = statsPartial = 0;
++  }
++
++ private:
++  uint16_t statsFull = 0, statsPartial = 0;
++  void countRefresh(const bool full) {
++    uint16_t& n = full ? statsFull : statsPartial;
++    if (n < UINT16_MAX) n++;
++  }
++#else
++ private:
++  void countRefresh(bool) {}
++#endif
++
+  private:
+   void beginHardware();
+   bool hardwareReady = false;
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index f1fffc9d..8a572ec2 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1164,6 +1164,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+   systemSettings.push_back(SettingInfo::Submenu(StrId::STR_SYSTEM_DEVICE, SettingAction::SystemDevice));
+   systemSettings.push_back(SettingInfo::Submenu(StrId::STR_SYSTEM_FILES_CACHE, SettingAction::SystemFilesCache));
+   systemSettings.push_back(SettingInfo::Submenu(StrId::STR_READING_STATS, SettingAction::SystemReadingStats));
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_BATTERY_STATS, SettingAction::BatteryStats));
++#endif
+   systemSettings.push_back(SettingInfo::Submenu(StrId::STR_SYSTEM_ADVANCED, SettingAction::SystemAdvanced));
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
+ #if CROSSINK_APP_CAP_KOREADER_SYNC
+diff --git a/src/activities/network/UsbDriveActivity.cpp b/src/activities/network/UsbDriveActivity.cpp
+index cc9e4f5c..d536d1b1 100644
+--- a/src/activities/network/UsbDriveActivity.cpp
++++ b/src/activities/network/UsbDriveActivity.cpp
+@@ -1,5 +1,7 @@
+ #include "UsbDriveActivity.h"
+ 
++#include "util/BatteryStats.h"  // CrossInk-Tailnet patch 0025
++
+ #include <Arduino.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -41,6 +43,9 @@ void UsbDriveActivity::onEnter() {
+   // Invalidate while FAT is still mounted. USB writes bypass firmware hooks,
+   // and endUsbDrive() leaves the filesystem detached until the reboot.
+   ImageFolderIndex::invalidate();
++#if CROSSINK_TAILNET_BATTERY_STATS >= 3
++  BatteryStats::exportJson(nullptr);  // CrossInk-Tailnet patch 0025: current file on the computer
++#endif
+   if (!Storage.beginUsbDrive()) {
+     LOG_ERR("USB", "Unable to start USB Drive");
+     preparing = false;
+diff --git a/src/activities/reader/PluginReaderEvents.h b/src/activities/reader/PluginReaderEvents.h
+index ed3f6d3b..c2b09b72 100644
+--- a/src/activities/reader/PluginReaderEvents.h
++++ b/src/activities/reader/PluginReaderEvents.h
+@@ -2,12 +2,16 @@
+ #include <string>
+ 
+ #include "ReaderSession.h"
++#include "util/BatteryStats.h"  // CrossInk-Tailnet patch 0025
+ 
+ // Reader callers serialize these small fields with RenderLock. Rendering only
+ // records scalars; the main loop and exit path perform SD writes.
+ class PluginReaderEvents {
+  public:
+-  void noteTurn(bool forward) { session.noteTurn(forward, true); }
++  void noteTurn(bool forward) {
++    BatteryStats::countPage();  // CrossInk-Tailnet patch 0025: battery use per 100 pages
++    session.noteTurn(forward, true);
++  }
+   void rendered(int progressBasisPoints);
+   // Main-loop polling must never wait for a page render.
+   void pollWhenIdle(const std::string& book);
+diff --git a/src/activities/settings/BatteryStatsActivity.cpp b/src/activities/settings/BatteryStatsActivity.cpp
+new file mode 100644
+index 00000000..236b625c
+--- /dev/null
++++ b/src/activities/settings/BatteryStatsActivity.cpp
+@@ -0,0 +1,94 @@
++#include "BatteryStatsActivity.h"
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++
++#include <GfxRenderer.h>
++#include <I18n.h>
++
++#include <cstdio>
++
++#include "MappedInputManager.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++
++void BatteryStatsActivity::onEnter() {
++  Activity::onEnter();
++  runExport();  // opening the page writes a fresh export; the page shows what it found
++}
++
++void BatteryStatsActivity::runExport() {
++#if CROSSINK_TAILNET_BATTERY_STATS >= 3
++  haveSummary = BatteryStats::exportJson(&summary);
++  state = haveSummary ? State::Saved : State::Failed;
++#else
++  state = BatteryStats::exportJson(nullptr) ? State::Saved : State::Failed;
++#endif
++  requestUpdate();
++}
++
++void BatteryStatsActivity::render(RenderLock&&) {
++  const int pageHeight = renderer.getScreenHeight();
++  renderer.clearScreen();
++  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  if (mappedInput.hasTouchHardware()) {
++    TouchHeaderBackButton::draw(renderer, header, tr(STR_BATTERY_STATS), false);
++  } else {
++    GUI.drawHeader(renderer, header, tr(STR_BATTERY_STATS));
++  }
++
++  int y = pageHeight / 2 - 20;
++#if CROSSINK_TAILNET_BATTERY_STATS >= 3
++  if (haveSummary) {
++    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID) + 12;
++    y = header.y + header.height + lineHeight;
++    char line[64];
++    const auto rateLine = [&](const char* label, bool shown, float value, const char* unit) {
++      if (shown) {
++        snprintf(line, sizeof(line), "%s: %.2f %s", label, static_cast<double>(value), unit);
++      } else {
++        snprintf(line, sizeof(line), "%s: -", label);
++      }
++      renderer.drawCenteredText(UI_10_FONT_ID, y, line);
++      y += lineHeight;
++    };
++    if (summary.timeLeft) {
++      const unsigned hours = static_cast<unsigned>(summary.timeLeftH + 0.5f);
++      snprintf(line, sizeof(line), "%s: %u d %u h", tr(STR_BATTERY_TIME_LEFT), hours / 24, hours % 24);
++    } else {
++      snprintf(line, sizeof(line), "%s: -", tr(STR_BATTERY_TIME_LEFT));
++    }
++    renderer.drawCenteredText(UI_10_FONT_ID, y, line, true, EpdFontFamily::BOLD);
++    y += lineHeight;
++    rateLine(tr(STR_BATTERY_STANDBY_RATE), summary.standby, summary.standbyPctH, "%/h");
++    rateLine(tr(STR_BATTERY_READING_RATE), summary.reading, summary.readingPctH, "%/h");
++    rateLine(tr(STR_BATTERY_PER_100_PAGES), summary.per100, summary.per100Pages, "%");
++    if (!summary.standby || !summary.reading) {
++      snprintf(line, sizeof(line), "%s (%.1f h)", tr(STR_BATTERY_NOT_ENOUGH_DATA),
++               static_cast<double>(summary.dataHours));
++      renderer.drawCenteredText(UI_10_FONT_ID, y, line);
++      y += lineHeight;
++    }
++    y += lineHeight;
++  }
++#endif
++  if (state == State::Saved) {
++    renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_BATTERY_STATS_SAVED));
++    renderer.drawCenteredText(UI_10_FONT_ID, y + 30, BatteryStats::EXPORT_PATH);
++  } else if (state == State::Failed) {
++    renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_BATTERY_STATS_FAILED), true, EpdFontFamily::BOLD);
++  }
++
++  const auto labels = mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), "", "", "");
++  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++  renderer.displayBuffer();
++}
++
++void BatteryStatsActivity::loop() {
++  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
++      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    finish();
++  }
++}
++
++#endif  // CROSSINK_TAILNET_BATTERY_STATS >= 2
+diff --git a/src/activities/settings/BatteryStatsActivity.h b/src/activities/settings/BatteryStatsActivity.h
+new file mode 100644
+index 00000000..ae310119
+--- /dev/null
++++ b/src/activities/settings/BatteryStatsActivity.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include "activities/Activity.h"
++#include "util/BatteryStats.h"
++
++// Settings > System > Battery stats (CrossInk-Tailnet patch 0025, switch >= 2): exports
++// /battery_stats.json; at switch 3 it also shows time left and the drain rates.
++class BatteryStatsActivity final : public Activity {
++ public:
++  explicit BatteryStatsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++      : Activity("BatteryStats", renderer, mappedInput) {}
++
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++
++ private:
++  enum class State : uint8_t { Ready, Saved, Failed };
++  State state = State::Ready;
++#if CROSSINK_TAILNET_BATTERY_STATS >= 3
++  batterystats::Summary summary;
++  bool haveSummary = false;
++#endif
++  void runExport();
++};
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index ce2a1ea4..c69f3f4f 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -28,6 +28,9 @@
+ #if CROSSINK_TAILNET_SETTINGS_PIN
+ #include "SettingsPinActivity.h"
+ #endif
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++#include "BatteryStatsActivity.h"
++#endif
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+ #include "DeviceCapabilities.h"
+@@ -1746,6 +1749,11 @@ void SettingsActivity::toggleCurrentSetting() {
+             std::make_unique<SettingsPinActivity>(renderer, mappedInput, SettingsPinActivity::Mode::Manage),
+             resultHandler);
+         break;
++#endif
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++      case SettingAction::BatteryStats:
++        startActivityForResult(std::make_unique<BatteryStatsActivity>(renderer, mappedInput), resultHandler);
++        break;
+ #endif
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 2766cf72..8207d00a 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -68,6 +68,9 @@ enum class SettingAction {
+ #if CROSSINK_TAILNET_SETTINGS_PIN
+   SettingsPin,
+ #endif
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++  BatteryStats,
++#endif
+ };
+ 
+ struct SettingInfo {
+diff --git a/src/main.cpp b/src/main.cpp
+index 7d3c8ae0..4b1dc9df 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -143,6 +143,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+ #include "simulator/SimulatorSmokeTest.h"
+ #endif
+ #include "util/BatteryDiagnosticLog.h"
++#include "util/BatteryStats.h"  // CrossInk-Tailnet patch 0025
+ #include "util/ButtonNavigator.h"
+ #include "util/ButtonShortcutController.h"
+ #include "util/Dictionary.h"
+@@ -468,6 +469,7 @@ static PowerButtonWakeWatcher sleepSyncWakeWatcher;
+ static bool sleepSyncAfterQuickResumeSleep = false;
+ 
+ static void restartWithSilentToken(const bool restoreUsbSerial = false) {
++  BatteryStats::onRestart();  // CrossInk-Tailnet patch 0025
+   // Capture the live state for every destination without changing wake preferences.
+   silentRebootTarget |= SILENT_REBOOT_FRONTLIGHT_VALID;
+   if (Frontlight.isOn()) silentRebootTarget |= SILENT_REBOOT_FRONTLIGHT_ON;
+@@ -1406,6 +1408,7 @@ static void powerDownForDeepSleep() {
+   // Last chance to sample: startDeepSleep() cuts the SD rail on X3, so nothing
+   // can be written again until the next wake.
+   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
++  BatteryStats::onSleep();  // CrossInk-Tailnet patch 0025
+   // All sleep-time file writes are complete. Stop SDMMC before the power path
+   // cuts peripheral rails and isolates the bus pads; SPI boards are a no-op.
+   libraryScanSleepToken.save(!library::libraryIndexNeedsRefresh());
+@@ -1899,6 +1902,13 @@ void setup() {
+   // Needs SETTINGS for the clock's UTC offset, so it cannot run any earlier.
+   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Wake, BoardConfig::ACTIVE.name,
+                                sleepSyncBoot ? "SleepSync" : wakeupRouteName(wakeupReason));
++#if CROSSINK_TAILNET_BATTERY_STATS
++  // CrossInk-Tailnet patch 0025: what came before this boot decides how the stretch
++  // since the last record counts (see batterystats::ResetClass).
++  BatteryStats::begin(rawResetReason == ESP_RST_DEEPSLEEP || rawResetReason == ESP_RST_SW ? 0
++                      : rawResetReason == ESP_RST_POWERON || rawResetReason == ESP_RST_EXT ? 1
++                                                                                         : 2);
++#endif
+   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
+   I18N.begin(SETTINGS.languageCode, SETTINGS.languageCacheGeneration);
+   HyphenationPackStore::begin();
+@@ -2319,6 +2329,7 @@ static void reapplyFrontlightAfterFirstPaint() {
+ #endif
+ 
+ void loop() {
++  BatteryStats::poll();  // CrossInk-Tailnet patch 0025
+   static unsigned long maxLoopDuration = 0;
+   const unsigned long loopStartTime = millis();
+   static unsigned long lastMemPrint = 0;
+diff --git a/src/util/BatteryStats.cpp b/src/util/BatteryStats.cpp
+new file mode 100644
+index 00000000..efc91cea
+--- /dev/null
++++ b/src/util/BatteryStats.cpp
+@@ -0,0 +1,254 @@
++#include "BatteryStats.h"
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 1
++
++#include <Arduino.h>
++#include <BatteryMonitor.h>
++#include <BatteryStatsCore.h>
++#include <BoardConfig.h>
++#include <HalClock.h>
++#include <HalDisplay.h>
++#include <HalFrontlight.h>
++#include <HalGPIO.h>
++#include <HalPowerManager.h>
++#include <HalStorage.h>
++#include <Logging.h>
++#include <WallClock.h>
++#include <WiFi.h>
++
++#include <ctime>
++
++#include "AppVersion.h"
++#include "CrossPointSettings.h"
++#include "activities/Activity.h"
++#include "activities/ActivityManager.h"
++
++namespace BatteryStats {
++namespace {
++using namespace batterystats;
++
++constexpr char DIR[] = "/.crossink";
++constexpr char LOG_PATH[] = "/.crossink/battery.bin";
++constexpr char OLD_PATH[] = "/.crossink/battery.1.bin";
++// About seven years at ~100 records a day. The full file then becomes battery.1.bin
++// (kept, never deleted) and a new one starts; an older battery.1.bin is replaced.
++constexpr size_t MAX_LOG_BYTES = 4u * 1024u * 1024u;
++constexpr unsigned long CHECK_MS = 1000;        // book, USB power, frontlight
++constexpr unsigned long LEVEL_CHECK_MS = 60000;  // battery % (cached for 30 s by the power manager)
++
++bool started = false;
++uint16_t pages = 0;
++uint8_t content = CONTENT_NONE;
++bool usb = false, light = false;
++uint8_t lightLevel = 0;
++uint8_t lastPct = 0;
++unsigned long lastCheckMs = 0, lastLevelMs = 0;
++// Radio events arrive on the Arduino event task: kept here, written from the main loop.
++volatile bool radioOn = false;
++volatile bool radioPending = false;
++
++uint8_t boardId() {
++  switch (BoardConfig::ACTIVE.board) {
++    case BoardConfig::Board::XteinkX3:
++    case BoardConfig::Board::XteinkX3Uc8279: return 1;
++    case BoardConfig::Board::XteinkX4: return 2;
++    case BoardConfig::Board::XteinkX4Pro: return 3;
++    case BoardConfig::Board::XteinkX4Classic: return 4;
++    default: return 0;
++  }
++}
++
++void append(const uint8_t kind, uint8_t extraFlags = 0) {
++  static const BatteryMonitor battery;
++  Record r;
++  const time_t now = time(nullptr);
++  r.t = now > 0 ? static_cast<uint32_t>(now) : 0;
++  r.kind = kind;
++  r.era = static_cast<uint8_t>(WallClock::era());
++  r.flags = extraFlags | static_cast<uint8_t>(content << FLAG_CONTENT_SHIFT);
++  if (!halClock.isAvailable() || r.t < WallClock::MIN_PLAUSIBLE_EPOCH) r.flags |= FLAG_APPROX_TIME;
++  if (usb) r.flags |= FLAG_USB;
++  if (radioOn) r.flags |= FLAG_RADIO;
++  if (light) r.flags |= FLAG_LIGHT;
++  r.pct = lastPct = static_cast<uint8_t>(powerManager.getBatteryPercentage());
++  r.mv = battery.readMillivolts();
++  r.lightLevel = light ? lightLevel : 0;
++  uint16_t full = 0, partial = 0;
++  display.takeRefreshCounts(full, partial);
++  r.full = full > 255 ? 255 : static_cast<uint8_t>(full);
++  r.partial = partial;
++  r.pages = pages;
++  pages = 0;
++
++  uint8_t bytes[RECORD_SIZE];
++  encode(r, bytes);
++  Storage.mkdir(DIR);
++  HalFile file = Storage.open(LOG_PATH, O_RDWR | O_CREAT | O_APPEND);
++  if (!file) {
++    LOG_ERR("BSTAT", "Cannot open %s", LOG_PATH);
++    return;
++  }
++  size_t size = file.size();
++  if (size >= MAX_LOG_BYTES) {
++    file.close();
++    Storage.remove(OLD_PATH);
++    Storage.rename(LOG_PATH, OLD_PATH);
++    file = Storage.open(LOG_PATH, O_RDWR | O_CREAT | O_APPEND);
++    if (!file) return;
++    size = 0;
++  }
++  bool ok = true;
++  if (size == 0) {
++    uint8_t header[HEADER_SIZE];
++    encodeHeader(header, boardId());
++    ok = file.write(header, sizeof(header)) == sizeof(header);
++  }
++  if (ok) ok = file.write(bytes, sizeof(bytes)) == sizeof(bytes);
++  if (!file.close() || !ok) LOG_ERR("BSTAT", "Append to %s failed", LOG_PATH);
++}
++
++void onRadio(const arduino_event_id_t event) {
++  const bool on = event == ARDUINO_EVENT_WIFI_STA_START;
++  if (on == radioOn) return;
++  radioOn = on;
++  radioPending = true;
++}
++
++uint8_t currentContent() {
++  if (!activityManager.isReaderActivity()) return CONTENT_NONE;
++  return contentForPath(activityManager.getCurrentBookPath().c_str());
++}
++
++bool currentLight(uint8_t& level) {
++  level = Frontlight.brightness();
++  return Frontlight.present() && Frontlight.isOn();
++}
++}  // namespace
++
++void begin(const uint8_t resetClass) {
++  usb = gpio.isUsbConnectedCached();
++  light = currentLight(lightLevel);
++  started = true;
++  append(KIND_BOOT, static_cast<uint8_t>(resetClass << FLAG_RESET_SHIFT));
++  WiFi.onEvent(onRadio, ARDUINO_EVENT_WIFI_STA_START);
++  WiFi.onEvent(onRadio, ARDUINO_EVENT_WIFI_STA_STOP);
++  lastLevelMs = lastCheckMs = millis();
++}
++
++void poll() {
++  if (!started) return;
++  if (radioPending) {
++    radioPending = false;
++    append(KIND_RADIO);
++  }
++  const unsigned long now = millis();
++  if (now - lastCheckMs < CHECK_MS) return;
++  lastCheckMs = now;
++
++  const uint8_t c = currentContent();
++  if (c != content) {
++    content = c;
++    append(KIND_CONTENT);
++  }
++  const bool u = gpio.isUsbConnectedCached();
++  if (u != usb) {
++    usb = u;
++    append(KIND_CHARGE);
++  }
++  uint8_t level = 0;
++  const bool l = currentLight(level);
++  if (l != light) {
++    light = l;
++    lightLevel = level;
++    append(KIND_LIGHT);
++  } else if (l) {
++    lightLevel = level;
++  }
++  if (now - lastLevelMs >= LEVEL_CHECK_MS) {
++    lastLevelMs = now;
++    if (powerManager.getBatteryPercentage() != lastPct) append(KIND_LEVEL);
++  }
++}
++
++void onSleep() {
++  if (started) append(KIND_SLEEP);
++}
++
++void onRestart() {
++  if (started) append(KIND_RESTART);
++}
++
++void countPage() {
++  if (pages < UINT16_MAX) pages++;
++}
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++namespace {
++bool writeFile(void* ctx, const char* data, const size_t len) {
++  return static_cast<HalFile*>(ctx)->write(data, len) == len;
++}
++
++// Feeds every record of battery.1.bin (if any) and battery.bin to the analyzer.
++bool feed(void*, Analyzer& a) {
++  for (const char* path : {OLD_PATH, LOG_PATH}) {
++    if (!Storage.exists(path)) continue;
++    HalFile file = Storage.open(path, O_RDONLY);
++    if (!file) return false;
++    uint8_t buf[HEADER_SIZE > RECORD_SIZE ? HEADER_SIZE : RECORD_SIZE];
++    if (file.read(buf, HEADER_SIZE) != static_cast<int>(HEADER_SIZE) || !headerValid(buf)) {
++      file.close();
++      continue;
++    }
++    while (file.read(buf, RECORD_SIZE) == static_cast<int>(RECORD_SIZE)) a.add(decode(buf));
++    file.close();
++  }
++  return true;
++}
++
++const char* modelName() {
++  switch (boardId()) {
++    case 1: return "X3";
++    case 2: return "X4";
++    case 3: return "X4 Pro";
++    case 4: return "X4 Classic";
++    default: return BoardConfig::ACTIVE.name;
++  }
++}
++}  // namespace
++
++bool exportJson(Summary* summary) {
++  if (started) append(KIND_LEVEL);  // the current level closes the open stretch
++  const bool gauge = BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0;
++  DeviceInfo dev{modelName(), gauge ? "fuel_gauge" : "voltage_estimate",
++                 gauge ? BoardConfig::ACTIVE.batteryGauge.designCapacityMah : static_cast<uint16_t>(0),
++                 AppVersion::version()};
++  const time_t t = time(nullptr);
++  const uint32_t now = t > 0 ? static_cast<uint32_t>(t) : 0;
++  Config cfg;
++  cfg.utcOffsetMin = (static_cast<int32_t>(SETTINGS.clockUtcOffsetQ) - 48) * 15;
++  cfg.hasLight = Frontlight.present();
++  cfg.voltageEstimate = !gauge;
++  cfg.segmentsSince = now > 90u * 86400u ? now - 90u * 86400u : 0;  // the companion's 90 days
++
++  HalFile file = Storage.open(EXPORT_PATH, O_WRONLY | O_CREAT | O_TRUNC);
++  if (!file) return false;
++  JsonOut out{writeFile, &file};
++  const bool nowKnown = halClock.isAvailable() && now >= WallClock::MIN_PLAUSIBLE_EPOCH;
++#if CROSSINK_TAILNET_BATTERY_STATS >= 3
++  const auto done = [](void* ctx, const Analyzer& a) {
++    if (ctx) *static_cast<Summary*>(ctx) = summarize(a);
++  };
++  const bool ok = batterystats::exportJson(out, dev, cfg, now, nowKnown, feed, nullptr, done, summary);
++#else
++  (void)summary;
++  const bool ok = batterystats::exportJson(out, dev, cfg, now, nowKnown, feed, nullptr);
++#endif
++  const bool closed = file.close();
++  LOG_INF("BSTAT", "Export to %s %s", EXPORT_PATH, ok && closed ? "done" : "failed");
++  return ok && closed;
++}
++#endif
++
++}  // namespace BatteryStats
++
++#endif  // CROSSINK_TAILNET_BATTERY_STATS >= 1
+diff --git a/src/util/BatteryStats.h b/src/util/BatteryStats.h
+new file mode 100644
+index 00000000..91fae1e5
+--- /dev/null
++++ b/src/util/BatteryStats.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++// Battery stats (CrossInk-Tailnet patch 0025; switch CROSSINK_TAILNET_BATTERY_STATS):
++//   1 record: one 16-byte record per transition (boot, sleep, restart, Wi-Fi, USB power,
++//     book open/close, frontlight, 1 % step) appended to /.crossink/battery.bin. Never a
++//     timer or a wakeup: records are written where the firmware already is awake.
++//   2 + export: Settings > System > Battery stats writes /battery_stats.json in the
++//     orbit-battery-stats/1 format (BookOrbit-Android docs/STATS.md).
++//   3 + the numbers on that page, and an export whenever USB Drive mode starts.
++// At 0 every call below is an empty inline.
++
++#include <cstddef>
++#include <cstdint>
++
++#ifndef CROSSINK_TAILNET_BATTERY_STATS
++#define CROSSINK_TAILNET_BATTERY_STATS 0
++#endif
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++#include <BatteryStatsCore.h>
++#endif
++
++namespace BatteryStats {
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 1
++// After the SD card is mounted at boot. resetClass: batterystats::ResetClass.
++void begin(uint8_t resetClass);
++// Main loop: radio events, USB power, book, frontlight, battery steps.
++void poll();
++void onSleep();    // last SD write before deep sleep
++void onRestart();  // before a software restart
++void countPage();  // any page turn in a reader
++#else
++inline void begin(uint8_t) {}
++inline void poll() {}
++inline void onSleep() {}
++inline void onRestart() {}
++inline void countPage() {}
++#endif
++
++#if CROSSINK_TAILNET_BATTERY_STATS >= 2
++constexpr char EXPORT_PATH[] = "/battery_stats.json";
++// Writes EXPORT_PATH. `summary` (optional) receives the page's numbers.
++bool exportJson(batterystats::Summary* summary);
++#endif
++
++}  // namespace BatteryStats
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index c5ff83f1..d0ccc54b 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -125,6 +125,7 @@ add_subdirectory(library_recent_order)
+ add_subdirectory(scalable_fonts)
+ add_subdirectory(glyph_bitmap)
+ add_subdirectory(daily_reading_stats)
++add_subdirectory(battery_stats)  # CrossInk-Tailnet patch 0025
+ add_subdirectory(stats_storage)
+ add_subdirectory(sync_files)
+ add_subdirectory(sync_pending)
+diff --git a/test/battery_stats/BatteryStatsTest.cpp b/test/battery_stats/BatteryStatsTest.cpp
+new file mode 100644
+index 00000000..81696dc8
+--- /dev/null
++++ b/test/battery_stats/BatteryStatsTest.cpp
+@@ -0,0 +1,180 @@
++#include <BatteryStatsCore.h>
++#include <gtest/gtest.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++using namespace batterystats;
++
++namespace {
++constexpr uint32_t T0 = 1763712000;  // 2025-11-21T08:00:00Z
++
++Record rec(uint32_t t, uint8_t kind, uint8_t pct, uint8_t flags = 0, uint16_t pages = 0, uint8_t full = 0,
++           uint16_t partial = 0) {
++  Record r;
++  r.t = t;
++  r.kind = kind;
++  r.pct = pct;
++  r.flags = flags;
++  r.pages = pages;
++  r.full = full;
++  r.partial = partial;
++  return r;
++}
++
++constexpr uint8_t TEXT = CONTENT_TEXT << FLAG_CONTENT_SHIFT;
++constexpr uint8_t XTC = CONTENT_XTC << FLAG_CONTENT_SHIFT;
++constexpr uint32_t H = 3600;
++
++// Two days: two nights of standby, reading text and xtc, one charge.
++std::vector<Record> sampleLog() {
++  std::vector<Record> v;
++  uint32_t t = T0;
++  for (int day = 0; day < 2; day++) {
++    const uint8_t b = static_cast<uint8_t>(90 - 12 * day);
++    v.push_back(rec(t, KIND_BOOT, b));
++    v.push_back(rec(t + 60, KIND_CONTENT, b, TEXT));
++    v.push_back(rec(t + H, KIND_LEVEL, b - 3, TEXT, 60, 6, 54));
++    v.push_back(rec(t + 2 * H, KIND_CONTENT, b - 6, 0, 60, 6, 54));
++    v.push_back(rec(t + 2 * H + 60, KIND_CONTENT, b - 6, XTC));
++    v.push_back(rec(t + 3 * H, KIND_SLEEP, b - 8, XTC, 50, 50, 0));
++    v.push_back(rec(t + 13 * H, KIND_BOOT, b - 10));  // 10 h asleep: 0.2 %/h
++    v.push_back(rec(t + 14 * H, KIND_SLEEP, b - 10));
++    t += 24 * H;  // and 10 h more: 0.2 %/h
++  }
++  v.push_back(rec(t, KIND_BOOT, 66));
++  v.push_back(rec(t + 60, KIND_CHARGE, 66, FLAG_USB));
++  v.push_back(rec(t + 60 + H, KIND_CHARGE, 96, 0));
++  return v;
++}
++
++bool feedSample(void* ctx, Analyzer& a) {
++  for (const Record& r : *static_cast<std::vector<Record>*>(ctx)) a.add(r);
++  return true;
++}
++
++bool appendString(void* ctx, const char* data, size_t len) {
++  static_cast<std::string*>(ctx)->append(data, len);
++  return true;
++}
++}  // namespace
++
++TEST(BatteryStatsRecord, EncodesLittleEndianSixteenBytes) {
++  Record r = rec(0x01020304, KIND_LEVEL, 57, FLAG_USB | TEXT, 0x0506, 7, 0x0809);
++  r.era = 3;
++  r.mv = 0x0A0B;
++  r.lightLevel = 40;
++  uint8_t b[RECORD_SIZE];
++  encode(r, b);
++  const uint8_t want[RECORD_SIZE] = {4, 3, 2, 1, KIND_LEVEL, 3, FLAG_USB | TEXT, 57, 0x0B, 0x0A, 40, 7, 6, 5, 9, 8};
++  EXPECT_EQ(0, memcmp(b, want, sizeof(want)));
++  const Record d = decode(b);
++  EXPECT_EQ(d.t, r.t);
++  EXPECT_EQ(d.pages, r.pages);
++  EXPECT_EQ(d.partial, r.partial);
++  EXPECT_EQ(d.content(), CONTENT_TEXT);
++}
++
++TEST(BatteryStatsRecord, HeaderAndBootResetClass) {
++  uint8_t h[HEADER_SIZE];
++  encodeHeader(h, 3);
++  EXPECT_TRUE(headerValid(h));
++  h[0] = 'X';
++  EXPECT_FALSE(headerValid(h));
++  const Record r = rec(T0, KIND_BOOT, 50, static_cast<uint8_t>(RESET_CRASH << FLAG_RESET_SHIFT));
++  EXPECT_EQ(r.resetClass(), RESET_CRASH);
++}
++
++TEST(BatteryStatsRecord, ContentFromExtension) {
++  EXPECT_EQ(contentForPath("/Books/a.EPUB"), CONTENT_TEXT);
++  EXPECT_EQ(contentForPath("/a.md"), CONTENT_TEXT);
++  EXPECT_EQ(contentForPath("/a.xtch"), CONTENT_XTC);
++  EXPECT_EQ(contentForPath("/a.bmp"), CONTENT_NONE);
++  EXPECT_EQ(contentForPath(""), CONTENT_NONE);
++}
++
++TEST(BatteryStatsTime, IsoWithOffsetAndLocalDay) {
++  char buf[32];
++  formatTime(T0, -8 * 60, buf, sizeof(buf));
++  EXPECT_STREQ(buf, "2025-11-21T00:00:00-08:00");
++  formatTime(T0 + 30 * 60, 5 * 60 + 30, buf, sizeof(buf));
++  EXPECT_STREQ(buf, "2025-11-21T14:00:00+05:30");
++  EXPECT_EQ(localDay(T0 - 1, -8 * 60) + 1, localDay(T0, -8 * 60));
++}
++
++TEST(BatteryStatsAnalyzer, PooledRatesAndUnknownStretches) {
++  std::vector<Record> log = sampleLog();
++  Config cfg;
++  Analyzer a(cfg, T0 + 49 * H, nullptr, nullptr, nullptr);
++  for (const Record& r : log) a.add(r);
++  a.finish();
++  const Pooled& standby = a.rate(CAT_STANDBY);
++  ASSERT_TRUE(standby.has());
++  EXPECT_NEAR(standby.pctPerHour(false), 0.2, 1e-9);
++  EXPECT_EQ(standby.segments, 4u);  // each night and each gap before a morning boot
++  const Pooled& text = a.rate(CAT_READING_TEXT);
++  EXPECT_NEAR(text.pctPerHour(false), 3.0, 0.05);
++  EXPECT_EQ(text.pages, 240u);
++  const Pooled& charging = a.rate(CAT_CHARGING);
++  EXPECT_NEAR(charging.pctPerHour(true), 30.0, 1e-6);
++
++  // Power lost while awake: that stretch is skipped, not counted as standby.
++  Analyzer b(cfg, T0, nullptr, nullptr, nullptr);
++  b.add(rec(T0, KIND_BOOT, 80));
++  b.add(rec(T0 + 5 * H, KIND_BOOT, 60, static_cast<uint8_t>(RESET_POWER_ON << FLAG_RESET_SHIFT)));
++  b.finish();
++  EXPECT_FALSE(b.rate(CAT_AWAKE).has());
++  // Charged while asleep: the stretch is unknown too.
++  Analyzer c(cfg, T0, nullptr, nullptr, nullptr);
++  c.add(rec(T0, KIND_SLEEP, 50));
++  c.add(rec(T0 + 5 * H, KIND_BOOT, 70, FLAG_USB));
++  c.finish();
++  EXPECT_FALSE(c.rate(CAT_STANDBY).has());
++}
++
++TEST(BatteryStatsExport, WritesOrbitBatteryStatsJson) {
++  std::vector<Record> log = sampleLog();
++  std::string json;
++  JsonOut out{appendString, &json};
++  Config cfg;
++  cfg.utcOffsetMin = -8 * 60;
++  cfg.hasLight = true;
++  DeviceInfo dev{"X4 Pro", "fuel_gauge", 0, "2.0.0-test"};
++  Summary s;
++  const auto done = [](void* ctx, const Analyzer& a) { *static_cast<Summary*>(ctx) = summarize(a); };
++  ASSERT_TRUE(exportJson(out, dev, cfg, T0 + 49 * H, true, feedSample, &log, done, &s));
++  EXPECT_NE(json.find("\"schema\":\"orbit-battery-stats/1\""), std::string::npos);
++  EXPECT_NE(json.find("\"source\":\"crossink-firmware\""), std::string::npos);
++  EXPECT_NE(json.find("\"content\":\"xtc\""), std::string::npos);
++  EXPECT_NE(json.find("\"light\":\"off\""), std::string::npos);
++  EXPECT_NE(json.find("\"unit\":\"pages\""), std::string::npos);
++  EXPECT_NE(json.find("\"day\":\"2025-11-21\""), std::string::npos);
++  EXPECT_EQ(json.find("capacity_mah"), std::string::npos);
++  EXPECT_TRUE(s.standby);
++  EXPECT_NEAR(s.standbyPctH, 0.2f, 1e-4);
++  EXPECT_TRUE(s.reading);
++  EXPECT_TRUE(s.timeLeft);
++  if (const char* path = std::getenv("BATTERY_STATS_SAMPLE")) {
++    FILE* f = fopen(path, "w");
++    ASSERT_NE(f, nullptr);
++    fwrite(json.data(), 1, json.size(), f);
++    fclose(f);
++  }
++}
++
++TEST(BatteryStatsExport, NoClockWritesNullTimes) {
++  std::vector<Record> log;
++  log.push_back(rec(1000, KIND_SLEEP, 80, FLAG_APPROX_TIME));
++  log.push_back(rec(1000 + 20 * H, KIND_BOOT, 76, FLAG_APPROX_TIME));
++  std::string json;
++  JsonOut out{appendString, &json};
++  Config cfg;
++  cfg.voltageEstimate = false;
++  DeviceInfo dev{"X4", "voltage_estimate", 0, "t"};
++  ASSERT_TRUE(exportJson(out, dev, cfg, 1000 + 20 * H, false, feedSample, &log));
++  EXPECT_NE(json.find("\"start\":null,\"end\":null,\"duration_s\":72000"), std::string::npos);
++  EXPECT_EQ(json.find("\"generated\""), std::string::npos);
++  EXPECT_EQ(json.find("\"day\""), std::string::npos);
++}
+diff --git a/test/battery_stats/CMakeLists.txt b/test/battery_stats/CMakeLists.txt
+new file mode 100644
+index 00000000..9576a328
+--- /dev/null
++++ b/test/battery_stats/CMakeLists.txt
+@@ -0,0 +1,7 @@
++add_executable(BatteryStatsTest
++ BatteryStatsTest.cpp
++ ${REPO_ROOT}/lib/BatteryStats/BatteryStatsCore.cpp
++)
++target_include_directories(BatteryStatsTest PRIVATE ${REPO_ROOT}/lib/BatteryStats)
++target_link_libraries(BatteryStatsTest PRIVATE crosspoint_test_common GTest::gtest_main)
++gtest_discover_tests(BatteryStatsTest)

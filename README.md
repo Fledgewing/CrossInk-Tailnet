@@ -181,6 +181,20 @@ does not remove it. If it is forgotten, create an empty file named `unlock-setti
 `.crossink` folder of the SD card and restart the reader: the PIN is removed and the file
 deleted.
 
+## Battery stats
+
+The reader keeps a small log of how its battery is used: one 16-byte record whenever it wakes,
+sleeps, restarts, turns WiFi on or off, is plugged in or unplugged, opens or closes a book,
+turns the frontlight on or off, or its battery level changes while awake. The log is
+`.crossink/battery.bin` on the SD card, about 1.6 KB a day. Nothing wakes the reader to
+record it, and nothing leaves the reader on its own.
+
+**Settings > System > Battery stats** writes `battery_stats.json` to the root of the SD card in
+the `orbit-battery-stats/1` format, which Orbit Companion's Battery › Compare reads. On the X4
+Pro and X4 Classic the same page shows the time left and the battery used per hour asleep,
+per hour reading and per 100 pages, and the file is written again whenever USB Drive mode
+starts. The X3 and X4 build (`default`) writes the file without the numbers on the page.
+
 ## Limits
 
 - Only tailnet hosts go through the tunnel. Internet traffic (GitHub updates, public OPDS

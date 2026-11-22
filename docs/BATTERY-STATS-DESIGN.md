@@ -1,9 +1,11 @@
-# Battery stats in the firmware: design (draft for approval)
+# Battery stats in the firmware: design (approved; built as patch 0025)
 
 Goal: measured battery numbers on the Xteink X4 Pro, X4 Classic and X3, written in the
 Android companion's export format `orbit-battery-stats/1`
 (BookOrbit-Android `docs/STATS-DESIGN.md`, "Export JSON"). The two can then be compared side by
-side. Constraint: memory must not grow much. Nothing here is built yet.
+side. Constraint: memory must not grow much. Approved with the recommended tiers; built as
+`overlay/patches/v2.0/0025-battery-stats.patch`. Where the build differs from this design,
+§9 "As built" wins.
 
 Code references are to upstream CrossInk-Bookorbit `v2.0.0+bookorbit.1-rc2` (`src/`, `lib/`) and
 its FreeInk SDK at `aad0749` (`freeink-sdk/libs/...`), unless a line says otherwise. Hooks
@@ -270,3 +272,61 @@ The rest is reversible:
 - the log format is internal and versioned;
 - no data is ever deleted, because the log rolls and is never pruned;
 - the export carries aggregates only, which the Android doc already settled (its door 1).
+
+## 9. As built (patch 0025)
+
+**Measured sizes:** local `pio run` of origin/main (`a01b358`) against origin/main plus
+patch 0025, from the same CrossInk rc2 checkout:
+
+| Env | Tier | App flash | Static RAM | App slot free after |
+|---|---|---|---|---|
+| `default` (X3 + X4) | 2 | +12,036 B | +72 B | 64,272 B (was 76,320) |
+| `x4-pro` | 3 | +11,880 B | +72 B | 409,088 B |
+| `x4-classic` | 3 | +11,740 B | +72 B | 561,792 B |
+
+- On `default`, ~8.4 KB of the total is the analysis and JSON code (`BatteryStatsCore`). The C3
+  has no FPU, so the double-precision sums are soft-float calls.
+- The heap is used only while exporting. The JSON line buffer is 256 B on the stack, and the
+  analyzer is about 0.7 KB on the stack, twice.
+- The design's estimate was ~7.5 KB / ~11.5 KB with no static RAM. The `default` build costs
+  more than estimated, and §5's "92 KB free" was the linker's figure; the image's real headroom
+  was 76 KB.
+
+**Differences from §2–§6:**
+- **No `RTC_NOINIT` counters.**
+  - Counts live in plain RAM and go into the next record.
+  - A `restart` record is written before every software restart (`restartWithSilentToken`).
+  - The `boot` record carries the reset class: continue, power-on or crash.
+  - The export works out from the records alone whether a stretch was asleep, awake or unknown.
+  - Counts in flight are lost only on a crash or power loss.
+- **Polling in `loop()` instead of hooks:**
+  - Book open/close, USB power and frontlight are checked once a second.
+  - Battery % is checked once a minute through the power manager's 30-s cache.
+  - None of this runs while the device sleeps, and none of it is a wakeup.
+- **One page-turn hook:** `PluginReaderEvents::noteTurn`, which EPUB, TXT and XTC all call.
+  EPUB footnote-preview paging is not counted.
+- **Wi-Fi:** `WiFi.onEvent` (STA_START/STA_STOP) sets a flag, and `loop()` writes the record.
+- **Refreshes:** counted in `HalDisplay` (`takeRefreshCounts`).
+- **The schema follows the frozen `docs/STATS.md`** rather than §3's draft:
+  - `source` is a string, plus `source_version`;
+  - `battery_source` is at the top level;
+  - rates carry `change_pct`;
+  - the `radio` dimension and the `awake` state are used;
+  - `segments` covers the last 90 days, and its times are null without an RTC.
+- **The page:** opening Battery stats writes the export straight away, with no separate button.
+  - Tier 3 shows time left, standby %/h, reading %/h and % per 100 pages, using the
+    companion's thresholds.
+  - Tier 2 shows only where the file was saved.
+- **Log size:** the log rolls to `battery.1.bin` at 4 MB. A second roll (after about 14 years)
+  replaces the old `battery.1.bin`.
+- **Day attribution:** daily counts and drops land on the local day on which a stretch ends;
+  minutes are split at midnight.
+- **Tests:** host tests are in `test/battery_stats` (gtest, upstream harness). They cover:
+  - record encoding;
+  - ISO times;
+  - the pooled rates;
+  - stretches marked unknown;
+  - the JSON;
+  - an export with no clock.
+
+  A sample export was checked against the rules in `docs/STATS.md`.
