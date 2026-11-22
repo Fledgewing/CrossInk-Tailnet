@@ -172,6 +172,37 @@ jobs:
           merge-multiple: true
           path: firmware
 
+      # The license list, texts and the release-notes section come from this commit.
+      - name: Check out the overlay
+        uses: actions/checkout@v6
+        with:
+          path: overlay
+
+      - name: Write the release notes and license files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERLAY_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          cp overlay/THIRD_PARTY_LICENSES.md firmware/
+          (cd overlay && zip -qr ../firmware/licenses.zip licenses LICENSE THIRD_PARTY_LICENSES.md)
+          {
+            echo "CrossInk-Bookorbit $TAG with Tailscale (MicroLink)."
+            echo
+            echo "Install over the air from the reader (Settings > Check for updates) once it runs a"
+            echo "CrossInk-Tailnet build, or flash the .bin for your reader from an SD card or USB."
+            case "$TAG" in
+              v2.*) echo 'The X3 build leaves out Nearby transfer, mDNS, Plugins and language/hyphenation downloads (see "X3 (rc2 / v2.0) differences" in the README for workarounds). The X4 Pro and X4 Classic keep everything.' ;;
+            esac
+            echo
+            overlay/scripts/licenses-section.sh "$TAG" "$GITHUB_SHA"
+            echo
+            # Marker the resolve job looks for to skip already-released pairs.
+            echo "upstream=$TAG overlay=$GITHUB_SHA"
+          } > notes.md
+          cat notes.md
+
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.resolve.outputs.version }}
@@ -180,12 +211,8 @@ jobs:
           # An upstream release candidate stays a pre-release here too: only
           # readers with Include Release Candidates on are offered it.
           prerelease: ${{ contains(needs.resolve.outputs.version, '-rc') }}
-          body: |
-            CrossInk-Bookorbit ${{ needs.resolve.outputs.upstream_tag }} with Tailscale (MicroLink).
-
-            Install over the air from the reader (Settings > Check for updates) once it runs a
-            CrossInk-Tailnet build, or flash the .bin for your reader from an SD card or USB.
-            ${{ startsWith(needs.resolve.outputs.upstream_tag, 'v2.') && 'The X3 build leaves out Nearby transfer, mDNS, Plugins and language/hyphenation downloads (see "X3 (rc2 / v2.0) differences" in the README for workarounds). The X4 Pro and X4 Classic keep everything.' || '' }}
-
-            upstream=${{ needs.resolve.outputs.upstream_tag }} overlay=${{ github.sha }}
-          files: firmware/*.bin
+          body_path: notes.md
+          files: |
+            firmware/*.bin
+            firmware/THIRD_PARTY_LICENSES.md
+            firmware/licenses.zip
