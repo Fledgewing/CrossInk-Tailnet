@@ -152,7 +152,10 @@ jobs:
         working-directory: upstream
         env:
           CROSSINK_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
-          TAILNET_OVERLAY_REPO: ${{ github.repository }}
+          # The bridge to Orbify: this repo's last releases update readers from Orbify's
+          # xteink-v releases (overlay patch ota-tag-prefix).
+          TAILNET_OVERLAY_REPO: Fledgewing/Orbify
+          TAILNET_OTA_TAG_PREFIX: xteink-v
         run: pio run -j1 -e "${{ matrix.environment }}"
 
       # Complete corresponding source (GPL): the overlay with MicroLink, CrossInk after the

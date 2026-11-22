@@ -1,0 +1,224 @@
+Orbify: offer only this firmware's own releases (tags xteink-v<version>) from a repo whose
+"latest" release is Android: read the release list, keep the newest tag with the prefix
+(CROSSINK_OTA_TAG_PREFIX), skip pre-releases unless asked for, and keep 48-byte tags.
+Host test: xteink/test/run-host-tests.sh in Fledgewing/Orbify.
+
+diff --git a/lib/JsonParser/ReleaseJsonParser.cpp b/lib/JsonParser/ReleaseJsonParser.cpp
+index ed157998..904d2773 100644
+--- a/lib/JsonParser/ReleaseJsonParser.cpp
++++ b/lib/JsonParser/ReleaseJsonParser.cpp
+@@ -63,6 +63,7 @@ void ReleaseJsonParser::clearRelease() {
+   current.firmwareSize = 0;
+   current.tagFound = false;
+   current.firmwareFound = false;
++  current.prerelease = false;
+ }
+ 
+ void ReleaseJsonParser::commitRelease() {
+@@ -98,6 +99,8 @@ void ReleaseJsonParser::sOnKey(void* ctx, const char* key, size_t len) {
+           self->lastKey = LastKey::TAG_NAME;
+         else if (len == 6 && memcmp(key, "assets", 6) == 0)
+           self->lastKey = LastKey::ASSETS;
++        else if (len == 10 && memcmp(key, "prerelease", 10) == 0)
++          self->lastKey = LastKey::PRERELEASE;
+         else
+           self->lastKey = LastKey::NONE;
+       }
+@@ -164,8 +167,13 @@ void ReleaseJsonParser::sOnNumber(void* ctx, const char* value, size_t /*len*/)
+   self->lastKey = LastKey::NONE;
+ }
+ 
+-void ReleaseJsonParser::sOnBool(void* ctx, bool /*value*/) {
+-  static_cast<ReleaseJsonParser*>(ctx)->lastKey = LastKey::NONE;
++void ReleaseJsonParser::sOnBool(void* ctx, bool value) {
++  auto* self = static_cast<ReleaseJsonParser*>(ctx);
++  if (self->lastKey == LastKey::PRERELEASE && self->position == Position::TOP_LEVEL &&
++      self->depth == self->releaseDepth()) {
++    self->current.prerelease = value;
++  }
++  self->lastKey = LastKey::NONE;
+ }
+ 
+ void ReleaseJsonParser::sOnNull(void* ctx) { static_cast<ReleaseJsonParser*>(ctx)->lastKey = LastKey::NONE; }
+diff --git a/lib/JsonParser/ReleaseJsonParser.h b/lib/JsonParser/ReleaseJsonParser.h
+index 85fde644..f9d869f3 100644
+--- a/lib/JsonParser/ReleaseJsonParser.h
++++ b/lib/JsonParser/ReleaseJsonParser.h
+@@ -12,12 +12,14 @@ class ReleaseJsonParser {
+   // One release as read from the response: its tag, and the first firmware asset
+   // assetMatcher accepted.
+   struct Release {
+-    char tagName[32];
++    // 48: room for a prefixed rc tag (xteink-v2.0.0.123+bookorbit.1-rc2) without truncating it.
++    char tagName[48];
+     char firmwareUrl[512];
+     char firmwareSha256[65];
+     size_t firmwareSize;
+     bool tagFound;
+     bool firmwareFound;
++    bool prerelease;
+   };
+ 
+   // GitHub's GET /releases answers with an array of releases rather than one. The parser
+@@ -56,6 +58,7 @@ class ReleaseJsonParser {
+   enum class LastKey : uint8_t {
+     NONE,
+     TAG_NAME,
++    PRERELEASE,
+     ASSETS,
+     ASSET_NAME,
+     ASSET_URL,
+diff --git a/src/network/OtaReleasePick.cpp b/src/network/OtaReleasePick.cpp
+new file mode 100644
+index 00000000..db2297a4
+--- /dev/null
++++ b/src/network/OtaReleasePick.cpp
+@@ -0,0 +1,27 @@
++#include "OtaReleasePick.h"
++
++#include <cstring>
++
++#include "FirmwareVersion.h"
++
++namespace ota_release_pick {
++
++const char* versionOf(const char* tag, const char* prefix) {
++  if (tag == nullptr) return nullptr;
++  if (prefix == nullptr || prefix[0] == '\0') return tag;
++  const size_t n = strlen(prefix);
++  return strncmp(tag, prefix, n) == 0 ? tag + n : nullptr;
++}
++
++void keep(ReleaseJsonParser::Release& newest, const ReleaseJsonParser::Release& candidate, const Filter& filter) {
++  const char* version = versionOf(candidate.tagName, filter.tagPrefix);
++  if (version == nullptr || !firmware_version::isComparable(version)) return;
++  if (candidate.prerelease && !filter.includePrereleases) return;
++  if (newest.tagFound &&
++      firmware_version::compare(version, versionOf(newest.tagName, filter.tagPrefix)) <= 0) {
++    return;
++  }
++  newest = candidate;
++}
++
++}  // namespace ota_release_pick
+diff --git a/src/network/OtaReleasePick.h b/src/network/OtaReleasePick.h
+new file mode 100644
+index 00000000..0880b2c8
+--- /dev/null
++++ b/src/network/OtaReleasePick.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <ReleaseJsonParser.h>
++
++// Orbify (overlay patch "ota-tag-prefix"): picks the firmware release to offer from a GET
++// /releases list. Orbify releases Android and firmware from one repo, so the firmware's
++// releases carry a tag prefix (xteink-v1.6.1.101+bookorbit.8) and never take "latest"; the
++// updater reads the list and keeps the newest release with this firmware's prefix. Pure
++// logic, kept out of OtaUpdater.cpp (device-only) so a host test covers it.
++namespace ota_release_pick {
++
++struct Filter {
++  // Tag prefix of this firmware's releases; "" accepts every tag (upstream's behaviour).
++  const char* tagPrefix;
++  // False skips releases GitHub marks as pre-releases.
++  bool includePrereleases;
++};
++
++// The version part of `tag`: what follows the prefix, or nullptr when `tag` lacks it.
++const char* versionOf(const char* tag, const char* prefix);
++
++// Keeps in `newest` the newest release `filter` accepts; on a tie the earlier (more recent)
++// entry stays. `newest` starts value-initialised (tagFound false).
++void keep(ReleaseJsonParser::Release& newest, const ReleaseJsonParser::Release& candidate, const Filter& filter);
++
++}  // namespace ota_release_pick
+diff --git a/src/network/OtaUpdater.cpp b/src/network/OtaUpdater.cpp
+index 11740cea..e2979041 100644
+--- a/src/network/OtaUpdater.cpp
++++ b/src/network/OtaUpdater.cpp
+@@ -20,6 +20,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, s
+ #include "AppVersion.h"
+ #include "FirmwareFlasher.h"
+ #include "FirmwareVersion.h"
++#include "OtaReleasePick.h"
+ #include "OtaUpdater.h"
+ #include "esp_http_client.h"
+ #include "esp_ota_ops.h"
+@@ -40,6 +41,13 @@ namespace {
+ #define CROSSINK_OTA_RELEASE_LIST_URL "https://api.github.com/repos/uxjulia/CrossInk/releases?per_page=5"
+ #endif
+ 
++// Orbify: the tag prefix of this firmware's releases. Set, every check reads the release list
++// (the repo's "latest" is an Android release) and keeps the newest tag with the prefix.
++#ifndef CROSSINK_OTA_TAG_PREFIX
++#define CROSSINK_OTA_TAG_PREFIX ""
++#endif
++constexpr char otaTagPrefix[] = CROSSINK_OTA_TAG_PREFIX;
++
+ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
+ constexpr char releaseListUrl[] = CROSSINK_OTA_RELEASE_LIST_URL;
+ 
+@@ -128,16 +136,16 @@ struct OtaInstallContext {
+   void* progressCtx = nullptr;
+ };
+ 
+-// Visits each release of a GET /releases list and keeps, in `ctx`, the newest one this
+-// device's firmware can be ordered against. On a tie the earlier, more recent entry stays.
++// Visits each release of a GET /releases list and keeps the newest one the filter accepts
++// (ota_release_pick::keep: this firmware's tag prefix, pre-releases only when asked for).
++struct ListedReleasePick {
++  ReleaseJsonParser::Release* newest;
++  ota_release_pick::Filter filter;
++};
++
+ void keepNewestListedRelease(void* ctx, const ReleaseJsonParser::Release& release) {
+-  auto* newest = static_cast<ReleaseJsonParser::Release*>(ctx);
+-  if (!firmware_version::isComparable(release.tagName)) {
+-    LOG_DBG("OTA", "Skipping listed release %s: its tag is not a version", release.tagName);
+-    return;
+-  }
+-  if (newest->tagFound && firmware_version::compare(release.tagName, newest->tagName) <= 0) return;
+-  *newest = release;
++  auto* pick = static_cast<ListedReleasePick*>(ctx);
++  ota_release_pick::keep(*pick->newest, release, pick->filter);
+ }
+ 
+ esp_err_t release_manifest_event_handler(esp_http_client_event_t* event) {
+@@ -239,8 +247,9 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
+   // The newest listed release lives on the heap, not next to the parser: an OTA launched at
+   // boot checks inside setup()'s frames, on the 8 KB loop stack the TLS handshake also uses
+   // (OtaUpdateActivity::onEnter). Value-initialised, so it starts with nothing found.
++  const bool readList = includePrereleases || otaTagPrefix[0] != '\0';
+   std::unique_ptr<ReleaseJsonParser::Release> newestListed;
+-  if (includePrereleases) {
++  if (readList) {
+     newestListed = makeUniqueNoThrow<ReleaseJsonParser::Release>();
+     if (!newestListed) {
+       LOG_ERR("OTA", "OOM for the release list check (%zu bytes)", sizeof(ReleaseJsonParser::Release));
+@@ -249,11 +258,12 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
+   }
+ 
+   esp_err_t esp_err;
++  ListedReleasePick listedPick{newestListed.get(), {otaTagPrefix, includePrereleases}};
+   ReleaseJsonParser releaseParser(isMatchingFirmwareAssetName, newestListed ? keepNewestListedRelease : nullptr,
+-                                  newestListed.get());
++                                  &listedPick);
+ 
+   esp_http_client_config_t client_config = {
+-      .url = includePrereleases ? releaseListUrl : latestReleaseUrl,
++      .url = readList ? releaseListUrl : latestReleaseUrl,
+       .event_handler = release_manifest_event_handler,
+       // 4096 holds the API response headers; the 32KB body streams through the
+       // parser in chunks so RX needn't be larger. TX only carries our GET.
+@@ -316,7 +326,9 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
+     return JSON_PARSE_ERROR;
+   }
+ 
+-  latestVersion = release->tagName;
++  // Without its tag prefix: the version compares against AppVersion and shows as such.
++  const char* releaseVersion = ota_release_pick::versionOf(release->tagName, otaTagPrefix);
++  latestVersion = releaseVersion != nullptr ? releaseVersion : release->tagName;
+ 
+   if (!release->firmwareFound) {
+     LOG_ERR("OTA", "No matching %s asset found for release %s", firmwareAssetStem, latestVersion.c_str());

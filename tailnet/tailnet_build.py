@@ -15,7 +15,14 @@ import os
 
 Import("env")  # noqa: F821  (SCons builtin)
 
-OVERLAY_REPO = os.environ.get("TAILNET_OVERLAY_REPO", "Fledgewing/CrossInk-Tailnet")
+# Over-the-air updates come from Orbify's releases (AGENTS.md "Releases"): Android and firmware
+# share the repo, the firmware's tags are xteink-v<version>, and "latest" is always Android, so
+# the updater reads the release list and keeps the newest xteink-v release (overlay patch
+# ota-tag-prefix). The page is long enough that a burst of Android releases does not push the
+# newest firmware off it; the xteink workflow republishes when one would (OTA_PAGE there).
+OVERLAY_REPO = os.environ.get("TAILNET_OVERLAY_REPO", "Fledgewing/Orbify")
+OTA_TAG_PREFIX = os.environ.get("TAILNET_OTA_TAG_PREFIX", "xteink-v")
+OTA_PAGE = 25
 
 # The overlay's tailnet/ directory is symlinked into the CrossInk checkout;
 # resolve through the link to find the overlay root and the MicroLink submodule.
@@ -383,11 +390,12 @@ env.Append(CPPPATH=[shim_dir])  # noqa: F821  lets optional UI code #include "Ta
 
 ota_defines = {
     "CROSSINK_OTA_RELEASE_URL": f"https://api.github.com/repos/{OVERLAY_REPO}/releases/latest",
-    "CROSSINK_OTA_RELEASE_LIST_URL": f"https://api.github.com/repos/{OVERLAY_REPO}/releases?per_page=5",
+    "CROSSINK_OTA_RELEASE_LIST_URL": f"https://api.github.com/repos/{OVERLAY_REPO}/releases?per_page={OTA_PAGE}",
+    "CROSSINK_OTA_TAG_PREFIX": OTA_TAG_PREFIX,
 }
 flags = env.get("BUILD_FLAGS", [])  # noqa: F821
 flags = [f for f in flags if not any(f.startswith(f"-D{k}=") for k in ota_defines)]
 flags += [f'-D{k}=\\"{v}\\"' for k, v in ota_defines.items()]
 env.Replace(BUILD_FLAGS=flags)  # noqa: F821
 
-print(f"Tailnet overlay: MicroLink + shim for {pioenv} (PSRAM: {has_psram}); OTA from {OVERLAY_REPO}")
+print(f"Tailnet overlay: MicroLink + shim for {pioenv} (PSRAM: {has_psram}); OTA from {OVERLAY_REPO} ({OTA_TAG_PREFIX}*)")

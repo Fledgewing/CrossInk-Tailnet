@@ -1,5 +1,10 @@
 # CrossInk-Tailnet
 
+> **Moved to [Fledgewing/Orbify](https://github.com/Fledgewing/Orbify)** (`xteink/`), with its
+> history. New firmware is released there as `xteink-v…`. This repository's last releases point
+> the reader's updater at Orbify, so **Settings > Check for updates** keeps working; this
+> repository is archived.
+
 [CrossInk-Bookorbit](https://github.com/agosez/CrossInk-Bookorbit) firmware with your reader on
 your Tailscale tailnet, using [MicroLink](https://github.com/CamM2325/microlink). BookOrbit sync,
 the catalog, OPDS and downloads can reach servers that are only on your tailnet.
