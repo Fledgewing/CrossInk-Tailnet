@@ -171,6 +171,9 @@ SWITCHES = {
     # and shows the progress bar; else the static "Downloading" screen. The X4s never park.
     "CROSSINK_TAILNET_DOWNLOAD_PROGRESS": (1,      0,      0),
     "CROSSINK_TAILNET_DOWNLOAD_PROGRESS_MARGIN": (40000, 40000, 40000),
+    # Patch 0014 (1.6) / 0024 (2.x): the frontlight written to the driver again after the first paint of each boot
+    # and a second later (an X4 Pro could wake dark with its light on). No-op without a light.
+    "CROSSINK_TAILNET_FRONTLIGHT_REAPPLY": (1,     1,      1),
     # --- CrossInk 2.x flash cuts (X3 only: rc2 plus Tailscale is ~199 KB over the C3's 6.25 MB app slot).
     # Each removes one upstream feature from the build the way upstream drops OPDS there: no menu entry,
     # a saved setting that points at it reads as unavailable. Inert on CrossInk 1.6 (no such code).

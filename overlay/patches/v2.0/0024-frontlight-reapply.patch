@@ -1,0 +1,127 @@
+diff --git a/include/CrossInkHalFrontlight.h b/include/CrossInkHalFrontlight.h
+index 6a474174..2cabf3a7 100644
+--- a/include/CrossInkHalFrontlight.h
++++ b/include/CrossInkHalFrontlight.h
+@@ -36,6 +36,7 @@ class HalFrontlight {
+   void setBrightness(const uint8_t percent) { lastBrightness = percent > 100 ? 100 : percent; }
+   void setWarmth(const uint8_t percent) { lastWarmth = percent > 100 ? 100 : percent; }
+   void setOn(const bool on) { lit = on; }
++  void reapply(const char*) {}
+   uint8_t brightness() const { return lastBrightness; }
+   uint8_t warmth() const { return lastWarmth; }
+   bool isOn() const { return lit; }
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index 87113b20..6b42be45 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -155,3 +155,12 @@ bool tlsArenaActive();                                // the arena is reserved (
+ #ifndef CROSSINK_TAILNET_SETTINGS_PIN
+ #define CROSSINK_TAILNET_SETTINGS_PIN 0
+ #endif
++
++// Frontlight re-applied after the first paint of every boot (overlay patch 0024, main.cpp
++// loop() and HalFrontlight::reapply()). An X4 Pro sometimes woke with the light dark while
++// its state said on: the HAL's on/off cache then made the toggle a no-op, and only a
++// brightness change wrote the PWM again. If this does not cure it, the next step is the
++// SDK's boost kick-start for the X4 Pro (BoardConfig FrontlightConfig minStartPermille).
++#ifndef CROSSINK_TAILNET_FRONTLIGHT_REAPPLY
++#define CROSSINK_TAILNET_FRONTLIGHT_REAPPLY 0
++#endif
+diff --git a/lib/hal/HalFrontlight.cpp b/lib/hal/HalFrontlight.cpp
+index 7c83ab68..8cfea48b 100644
+--- a/lib/hal/HalFrontlight.cpp
++++ b/lib/hal/HalFrontlight.cpp
+@@ -41,3 +41,9 @@ void HalFrontlight::setOn(const bool on) {
+   lit = on;
+   manager.setBrightness(lit ? lastBrightness : 0);
+ }
++
++void HalFrontlight::reapply(const char* const why) {
++  if (!manager.present()) return;
++  manager.setBrightness(lit ? lastBrightness : 0);
++  LOG_INF("LIGHT", "reapply %s: %u%% lit=%d", why, lastBrightness, lit ? 1 : 0);
++}
+diff --git a/lib/hal/HalFrontlight.h b/lib/hal/HalFrontlight.h
+index 26477bb6..afed8f32 100644
+--- a/lib/hal/HalFrontlight.h
++++ b/lib/hal/HalFrontlight.h
+@@ -26,6 +26,9 @@ class HalFrontlight {
+   // Warm/cool mix, 0 = cool .. 100 = warm. No-op on single-channel boards.
+   void setWarmth(uint8_t warmPercent);
+   void setOn(bool on);
++  // Write the current state to the driver again, past the on/off cache in
++  // setOn(). `why` names the caller in the log line.
++  void reapply(const char* why);
+ 
+   uint8_t brightness() const { return lastBrightness; }
+   uint8_t warmth() const { return manager.colorTemperature(); }
+diff --git a/src/main.cpp b/src/main.cpp
+index 7769af05..7d3c8ae0 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -456,6 +456,13 @@ static bool deepSleepInProgress = false;
+ // The boot that runs the BookOrbit sleep sync (NetworkBootTarget::BOOKORBIT_SLEEP_SYNC).
+ // It must end in sleep, so it never starts another sleep sync.
+ static bool sleepSyncBoot = false;
++#if CROSSINK_TAILNET_FRONTLIGHT_REAPPLY
++// millis() from which loop() re-applies the frontlight (0 = not yet; see
++// reapplyFrontlightAfterFirstPaint()).
++static unsigned long frontlightReapplyFrom = 0;
++constexpr unsigned long FRONTLIGHT_REAPPLY_AFTER_SETUP_MS = 500;
++constexpr unsigned long FRONTLIGHT_REAPPLY_GUARD_MS = 1000;
++#endif
+ static PowerButtonWakeWatcher sleepSyncWakeWatcher;
+ // Set from BOOKORBIT_SLEEP_SYNC_PAYLOAD_QUICK_RESUME.
+ static bool sleepSyncAfterQuickResumeSleep = false;
+@@ -2250,6 +2257,9 @@ void setup() {
+   gpio.startButtonCapture();
+ #endif
+   allowSleepAt = millis() + 2000;
++#if CROSSINK_TAILNET_FRONTLIGHT_REAPPLY
++  frontlightReapplyFrom = millis() + FRONTLIGHT_REAPPLY_AFTER_SETUP_MS;
++#endif
+ }
+ 
+ #if FREEINK_DEVICE_PICCO
+@@ -2283,6 +2293,31 @@ static bool handleSlideSwitch() {
+ }
+ #endif
+ 
++#if CROSSINK_TAILNET_FRONTLIGHT_REAPPLY
++// Writes the frontlight to the driver again once the first paint of this boot is on the
++// panel, and once more a second later (CrossInkTailnetCuts.h): the light comes up in
++// setup() while the panel powers up, and a wake could leave it dark with its state on.
++// Main task only, like every other Frontlight call. No-op without a frontlight.
++static void reapplyFrontlightAfterFirstPaint() {
++  static uint8_t done = 0;
++  static unsigned long firstAt = 0;
++  if (done >= 2 || frontlightReapplyFrom == 0 || !Frontlight.present()) return;
++  const unsigned long now = millis();
++  if (done == 0) {
++    if (static_cast<long>(now - frontlightReapplyFrom) < 0) return;
++    // The render task holds the lock while it draws: wait for the first paint to finish.
++    RenderLock lock(RenderLock::Mode::Try);
++    if (!lock.ownsLock()) return;
++    Frontlight.reapply("after first paint");
++    firstAt = now;
++    done = 1;
++  } else if (now - firstAt >= FRONTLIGHT_REAPPLY_GUARD_MS) {
++    Frontlight.reapply("1 s after first paint");
++    done = 2;
++  }
++}
++#endif
++
+ void loop() {
+   static unsigned long maxLoopDuration = 0;
+   const unsigned long loopStartTime = millis();
+@@ -2295,6 +2330,9 @@ void loop() {
+     activityManager.loop();
+     return;
+   }
++#if CROSSINK_TAILNET_FRONTLIGHT_REAPPLY
++  reapplyFrontlightAfterFirstPaint();
++#endif
+ #ifndef SIMULATOR
+   // The main task owns calibration. Exclude render-task battery/clock reads
+   // during each short SDK step without blocking input behind a busy renderer.
