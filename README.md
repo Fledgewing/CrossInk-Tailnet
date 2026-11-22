@@ -182,7 +182,28 @@ CrossInk 1.6 and 2.x build on different pioarduino platforms that share one fram
 directory, so keep a separate PlatformIO home for each, e.g.
 `PLATFORMIO_CORE_DIR=~/.platformio-rc2 pio run -e default` for 2.x.
 
-## Licence
+To rebuild a published release, use the commits from its notes: clone CrossInk-Bookorbit at the
+release's upstream tag (`git clone --recursive --branch <tag> ...`), check out this repository at
+the release's overlay commit (`git checkout <commit> && git submodule update --init --recursive`),
+then run the same commands. CI builds with PlatformIO Core 6.1.19 (pioarduino); see
+`.github/workflows/build.yml` at that commit.
 
-MIT, like CrossInk and MicroLink (see `third_party/microlink/LICENSE` for MicroLink's notices,
-including WireGuard and X25519). Not affiliated with or endorsed by Tailscale Inc.
+## License
+
+- **Source in this repository** (the overlay): MIT, see [`LICENSE`](LICENSE). MicroLink, the
+  submodule, is MIT too (`third_party/microlink/LICENSE`, with its WireGuard and X25519 notices).
+- **Released firmware binaries** (`firmware-*.bin`): they combine CrossInk-Bookorbit, MicroLink,
+  this overlay, the Arduino core, ESP-IDF and other third-party components, including
+  [wolfSSL](https://github.com/wolfSSL/Arduino-wolfSSL), which is licensed GPL-2.0-or-later. The
+  binaries are therefore distributed under the **GNU General Public License v3.0 or later**
+  ([`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt)). Each component keeps its own license for its
+  own code.
+- **Third-party list:** [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) lists every component
+  in the firmware with its version, license, copyright and source; [`licenses/`](licenses/) holds
+  the license texts and notices. Every release attaches both (`licenses.zip`).
+- **Corresponding source:** each release's notes ("Licenses and source") link the exact overlay
+  commit, the CrossInk-Bookorbit tag, the MicroLink commit and these build instructions
+  ([Building locally](#building-locally)). The upstream tag's `platformio.ini` pins the platform and
+  every library version.
+
+Not affiliated with or endorsed by Tailscale Inc.
