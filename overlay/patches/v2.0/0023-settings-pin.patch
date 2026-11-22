@@ -1,0 +1,975 @@
+diff --git a/include/CrossInkTailnetCuts.h b/include/CrossInkTailnetCuts.h
+index a4193789..87113b20 100644
+--- a/include/CrossInkTailnetCuts.h
++++ b/include/CrossInkTailnetCuts.h
+@@ -149,3 +149,9 @@ bool tlsArenaActive();                                // the arena is reserved (
+ #ifndef CROSSINK_TAILNET_BACKGROUND_SYNC
+ #define CROSSINK_TAILNET_BACKGROUND_SYNC 0
+ #endif
++
++// Settings PIN (overlay patch 0023, src/util/SettingsPin): an optional 4-digit PIN in NVS
++// in front of Settings, network and Tailscale setup and the web settings endpoints.
++#ifndef CROSSINK_TAILNET_SETTINGS_PIN
++#define CROSSINK_TAILNET_SETTINGS_PIN 0
++#endif
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index fdf5c35c..aa273754 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -718,6 +718,14 @@ STR_NO_SERVERS: "No OPDS servers configured"
+ STR_DELETE_SERVER: "Delete Server"
+ STR_OPDS_SERVERS: "OPDS Servers"
+ STR_TAILSCALE: "Tailscale"
++STR_SETTINGS_PIN: "Settings PIN"
++STR_ENTER_SETTINGS_PIN: "Enter Settings PIN"
++STR_NEW_PIN: "New PIN"
++STR_REPEAT_PIN: "Repeat the PIN"
++STR_WRONG_PIN: "Wrong PIN"
++STR_PIN_MISMATCH: "The PINs differ. Try again."
++STR_CHANGE_PIN: "Change PIN"
++STR_REMOVE_PIN: "Remove PIN"
+ STR_OPDS_DOWNLOAD_FOLDER: "Download Folder"
+ STR_OPDS_SD_ROOT: "SD Root"
+ STR_OPDS_DEFAULT_FOLDER: "Default Folder"
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 3a67b3cf..f1fffc9d 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -1174,6 +1174,9 @@ inline std::vector<SettingInfo> buildSystemSettingsParentList(const std::vector<
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
+ #endif
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_TAILSCALE, SettingAction::Tailscale));
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  systemSettings.push_back(SettingInfo::Action(StrId::STR_SETTINGS_PIN, SettingAction::SettingsPin));
++#endif
+ #if !CROSSINK_TAILNET_NO_PLUGINS
+   systemSettings.push_back(SettingInfo::Action(StrId::STR_PLUGINS, SettingAction::Plugins));
+ #endif
+diff --git a/src/activities/Activity.h b/src/activities/Activity.h
+index 8d290164..7bd048b5 100644
+--- a/src/activities/Activity.h
++++ b/src/activities/Activity.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <CrossInkTailnetCuts.h>
+ #include <Logging.h>
+ 
+ #include <cassert>
+@@ -72,6 +73,11 @@ class Activity {
+   // activity validates that trigger without routing any other normal input.
+   virtual bool handleQuickLockUnlock(QuickLockTrigger) { return false; }
+   virtual bool isReaderActivity() const { return false; }
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  // CrossInk-Tailnet: a screen behind the settings PIN. ActivityManager asks for the PIN
++  // before it opens one while locked, and locks again once none is open.
++  virtual bool requiresSettingsPin() const { return false; }
++#endif
+   // Reader-mode child screens may also report isReaderActivity(); only the
+   // activity owning the open book should be the Home/Reader unwind target.
+   virtual bool isBookReaderActivity() const { return false; }
+diff --git a/src/activities/ActivityManager.cpp b/src/activities/ActivityManager.cpp
+index 00b67cc9..83d282f6 100644
+--- a/src/activities/ActivityManager.cpp
++++ b/src/activities/ActivityManager.cpp
+@@ -61,6 +61,9 @@
+ #include "settings/OpdsServerListActivity.h"
+ #include "settings/ReleaseNotesActivity.h"
+ #include "settings/SettingsActivity.h"
++#if CROSSINK_TAILNET_SETTINGS_PIN
++#include "settings/SettingsPinActivity.h"
++#endif
+ #include "util/FrontlightPanelActivity.h"
+ #include "util/FullScreenMessageActivity.h"
+ #include "util/SwipeAdjustment.h"
+@@ -653,6 +656,14 @@ void ActivityManager::processPendingActivities() {
+       }
+ 
+       const bool closedFrontlightPanel = currentActivity->name == "FrontlightPanel";
++#if CROSSINK_TAILNET_SETTINGS_PIN
++      // The PIN prompt in front of a gated screen closed: open that screen now if the PIN was
++      // right, the way it was asked for. Wrong or cancelled, it is dropped and its opener sees
++      // the prompt's cancelled result, as if the screen had been backed out of.
++      const bool resumePinGated = currentActivity->name == "SettingsPinGate" && pinGatedActivity &&
++                                  !currentActivity->result.isCancelled && !SettingsPin::locked();
++      if (currentActivity->name == "SettingsPinGate" && !resumePinGated) pinGatedActivity.reset();
++#endif
+       ActivityResult pendingResult = std::move(currentActivity->result);
+       if (afterReturnActivity && currentActivity.get() == afterReturnOwner) {
+         afterReturnOwnerExited = true;
+@@ -662,6 +673,13 @@ void ActivityManager::processPendingActivities() {
+       // Destroy the current activity
+       exitActivity(lock);
+       pendingAction = PendingAction::None;
++#if CROSSINK_TAILNET_SETTINGS_PIN
++      if (resumePinGated) {
++        pendingActivity = std::move(pinGatedActivity);
++        pendingAction = stackActivities.empty() ? PendingAction::Replace : pinGatedAction;
++        if (stackActivities.empty()) continue;
++      }
++#endif
+ 
+       if (stackActivities.empty()) {
+         lock.unlock();  // goHome may acquire its own lock
+@@ -681,7 +699,12 @@ void ActivityManager::processPendingActivities() {
+         if (closedFrontlightPanel) currentActivity->onFrontlightPanelClosed();
+ 
+         // Handle result if necessary
++#if CROSSINK_TAILNET_SETTINGS_PIN
++        // A resumed gated screen keeps its opener's handler for when it closes itself.
++        if (currentActivity->resultHandler && !resumePinGated) {
++#else
+         if (currentActivity->resultHandler) {
++#endif
+           // Move it here to avoid the case where handler calling another startActivityForResult()
+           auto handler = std::move(currentActivity->resultHandler);
+           currentActivity->resultHandler = nullptr;
+@@ -707,6 +730,24 @@ void ActivityManager::processPendingActivities() {
+       }
+ 
+     } else if (pendingActivity) {
++#if CROSSINK_TAILNET_SETTINGS_PIN
++      // Every way into a PIN-gated screen (menus, quick actions, global actions, network
++      // boots) passes here: while locked, the PIN prompt opens in its place, over whatever
++      // is current, and the screen follows once the PIN is right (see the Pop branch).
++      if (pendingActivity->requiresSettingsPin() && SettingsPin::locked()) {
++        LOG_INF("PIN", "%s is behind the settings PIN", pendingActivity->name.c_str());
++        auto prompt = makeUniqueNoThrow<SettingsPinActivity>(renderer, mappedInput, SettingsPinActivity::Mode::Unlock);
++        pinGatedActivity = std::move(pendingActivity);
++        pinGatedAction = pendingAction;
++        if (!prompt) {
++          pinGatedActivity.reset();
++          pendingAction = PendingAction::None;
++          continue;
++        }
++        pendingActivity = std::move(prompt);
++        pendingAction = currentActivity ? PendingAction::Push : PendingAction::Replace;
++      }
++#endif
+       if (pendingAction == PendingAction::Push && pendingActivity->requiresFreshBackdrop()) {
+         if (restoredActivityNeedsRender.load()) {
+           const RequestUpdateResult redraw = requestUpdateAndWait();
+@@ -798,6 +839,15 @@ void ActivityManager::processPendingActivities() {
+     }
+   }
+ 
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  // Unlocked only while a PIN-gated screen is open: leaving the last one locks again. The
++  // prompt itself counts as open, so a gate in progress is never cut short.
++  if (pendingAction == PendingAction::None && currentActivity && !settingsPinScreenOpen() &&
++      currentActivity->name != "SettingsPinGate" && currentActivity->name != "SettingsPin") {
++    SettingsPin::relock();
++  }
++#endif
++
+   if (APP_STATE.hasPendingAlert.load(std::memory_order_acquire) && pendingAction == PendingAction::None) {
+     APP_STATE.hasPendingAlert.store(false, std::memory_order_relaxed);
+     pushActivity(std::make_unique<AlertActivity>(renderer, mappedInput));
+@@ -922,6 +972,16 @@ bool ActivityManager::handleQuickLockUnlock(const QuickLockTrigger trigger) {
+   return currentActivity && pendingAction == PendingAction::None && currentActivity->handleQuickLockUnlock(trigger);
+ }
+ 
++#if CROSSINK_TAILNET_SETTINGS_PIN
++bool ActivityManager::settingsPinScreenOpen() const {
++  if (currentActivity && currentActivity->requiresSettingsPin()) return true;
++  for (const auto& activity : stackActivities) {
++    if (activity->requiresSettingsPin()) return true;
++  }
++  return false;
++}
++#endif
++
+ void ActivityManager::notifyInputLockChanged(const bool locked) {
+   if (currentActivity) currentActivity->onInputLockChanged(locked);
+   for (const auto& activity : stackActivities) {
+diff --git a/src/activities/ActivityManager.h b/src/activities/ActivityManager.h
+index d63d3215..f9754474 100644
+--- a/src/activities/ActivityManager.h
++++ b/src/activities/ActivityManager.h
+@@ -88,6 +88,12 @@ class ActivityManager {
+   std::unique_ptr<Activity> pendingActivity;
+   enum class PendingAction { None, Push, Pop, Replace };
+   PendingAction pendingAction = PendingAction::None;
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  // The PIN-gated screen waiting behind the PIN prompt, and how it was to be opened.
++  std::unique_ptr<Activity> pinGatedActivity;
++  PendingAction pinGatedAction = PendingAction::None;
++  bool settingsPinScreenOpen() const;
++#endif
+   // Set once What's New has entered this boot, so a dismissal whose save failed doesn't re-show it.
+   bool releaseNotesShown = false;
+   // Set when an overlay is closed specifically to hand control back to the
+diff --git a/src/activities/home/FileBrowserActivity.cpp b/src/activities/home/FileBrowserActivity.cpp
+index 8b0250e7..cbfb0c9d 100644
+--- a/src/activities/home/FileBrowserActivity.cpp
++++ b/src/activities/home/FileBrowserActivity.cpp
+@@ -19,6 +19,7 @@
+ #include <cstring>
+ #include <limits>
+ 
++#include "util/SettingsPin.h"
+ #include "BookActions.h"
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+@@ -1017,6 +1018,11 @@ void FileBrowserActivity::renameFile(const std::string& oldPath, const std::stri
+ }
+ 
+ void FileBrowserActivity::toggleHiddenFiles() {
++  // CrossInk-Tailnet settings PIN: hidden files stay hidden while Settings are locked.
++  if (!SETTINGS.showHiddenFiles && SettingsPin::locked()) {
++    LOG_INF("PIN", "Show hidden files is behind the settings PIN");
++    return;
++  }
+   const std::string currentEntry =
+       (entryCount() > 0 && selectorIndex < entryCount()) ? entryNameAt(selectorIndex) : std::string();
+   SETTINGS.showHiddenFiles = SETTINGS.showHiddenFiles ? 0 : 1;
+diff --git a/src/activities/network/WifiSelectionActivity.cpp b/src/activities/network/WifiSelectionActivity.cpp
+index 50125698..5cd5055c 100644
+--- a/src/activities/network/WifiSelectionActivity.cpp
++++ b/src/activities/network/WifiSelectionActivity.cpp
+@@ -20,6 +20,7 @@
+ #include "SdCardFontSystem.h"
+ #include "WifiCredentialStore.h"
+ #include "activities/util/KeyboardEntryActivity.h"
++#include "util/SettingsPin.h"
+ #include "components/TouchActionButtons.h"
+ #include "components/TouchHeaderBackButton.h"
+ #include "components/UITheme.h"
+@@ -522,6 +523,19 @@ void WifiSelectionActivity::selectNetwork(const int index) {
+ 
+   const auto& network = networks[index];
+ 
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  // CrossInk-Tailnet settings PIN: joining a network that is not saved yet is network setup.
++  if (!settingsPinGiven && SettingsPin::locked() &&
++      (network.isHiddenPlaceholder || !WIFI_STORE.findCredential(network.ssid))) {
++    SettingsPin::ask(*this, [this, index](const bool granted) {
++      if (!granted) return;
++      settingsPinGiven = true;
++      selectNetwork(index);
++    });
++    return;
++  }
++#endif
++
+   // Synthetic "Add hidden network..." entry: prompt the user to type the SSID first
+   if (network.isHiddenPlaceholder) {
+     promptHiddenSsid();
+@@ -1051,6 +1065,20 @@ void WifiSelectionActivity::loop() {
+ 
+   // Handle forget prompt state (connection failed with saved credentials)
+   if (state == WifiSelectionState::FORGET_PROMPT) {
++#if CROSSINK_TAILNET_SETTINGS_PIN
++    // Forgetting a saved network is network setup too.
++    if (!settingsPinGiven && SettingsPin::locked()) {
++      SettingsPin::ask(*this, [this](const bool granted) {
++        if (granted) {
++          settingsPinGiven = true;
++        } else {
++          state = WifiSelectionState::NETWORK_LIST;
++        }
++        requestUpdate();
++      });
++      return;
++    }
++#endif
+     if (mappedInput.hasTouch()) {
+       const Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+       const auto height = renderer.getLineHeight(UI_10_FONT_ID);
+diff --git a/src/activities/network/WifiSelectionActivity.h b/src/activities/network/WifiSelectionActivity.h
+index a0d2fdc4..8aaef2c4 100644
+--- a/src/activities/network/WifiSelectionActivity.h
++++ b/src/activities/network/WifiSelectionActivity.h
+@@ -53,6 +53,9 @@ enum class WifiSelectionState {
+  * The onComplete callback receives true if connected successfully, false if cancelled.
+  */
+ class WifiSelectionActivity final : public Activity {
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool settingsPinGiven = false;  // the settings PIN was entered on this screen (SettingsPin::ask)
++#endif
+   ButtonNavigator buttonNavigator;
+ 
+   WifiSelectionState state = WifiSelectionState::SCANNING;
+diff --git a/src/activities/settings/BookOrbitSettingsActivity.h b/src/activities/settings/BookOrbitSettingsActivity.h
+index db162a8d..82ad1851 100644
+--- a/src/activities/settings/BookOrbitSettingsActivity.h
++++ b/src/activities/settings/BookOrbitSettingsActivity.h
+@@ -22,6 +22,10 @@
+  */
+ class BookOrbitSettingsActivity final : public Activity {
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  // CrossInk-Tailnet settings PIN. Its network boot (shelf lists) is only reached from here.
++  bool requiresSettingsPin() const override { return !networkBoot; }
++#endif
+   // Main is BookOrbit Sync itself. Home is its Home row, a page of its own: what the
+   // BookOrbit theme's two Library shelves list, each picked in one popup from Discover,
+   // Recently Added, Want to Read and the collections and SmartScopes its last refresh
+diff --git a/src/activities/settings/ButtonRemapActivity.h b/src/activities/settings/ButtonRemapActivity.h
+index fdae02d6..14701f0b 100644
+--- a/src/activities/settings/ButtonRemapActivity.h
++++ b/src/activities/settings/ButtonRemapActivity.h
+@@ -9,6 +9,9 @@
+ 
+ class ButtonRemapActivity final : public Activity {
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   // isReaderMode = true  → saves to reader-specific front button fields
+   // isReaderMode = false → saves to system-wide front button fields (default)
+   explicit ButtonRemapActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool isReaderMode = false,
+diff --git a/src/activities/settings/KOReaderSettingsActivity.h b/src/activities/settings/KOReaderSettingsActivity.h
+index a5ea603d..a5840329 100644
+--- a/src/activities/settings/KOReaderSettingsActivity.h
++++ b/src/activities/settings/KOReaderSettingsActivity.h
+@@ -16,6 +16,9 @@
+  */
+ class KOReaderSettingsActivity final : public Activity {
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   explicit KOReaderSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
+ 
+   void onEnter() override;
+diff --git a/src/activities/settings/OpdsServerListActivity.h b/src/activities/settings/OpdsServerListActivity.h
+index 89bcd439..f566fd9c 100644
+--- a/src/activities/settings/OpdsServerListActivity.h
++++ b/src/activities/settings/OpdsServerListActivity.h
+@@ -17,6 +17,9 @@
+  */
+ class OpdsServerListActivity final : public Activity {
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   explicit OpdsServerListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool pickerMode = false);
+ 
+   void onEnter() override;
+diff --git a/src/activities/settings/PluginHubInstallActivity.h b/src/activities/settings/PluginHubInstallActivity.h
+index 1d7c0e0b..73e1cb56 100644
+--- a/src/activities/settings/PluginHubInstallActivity.h
++++ b/src/activities/settings/PluginHubInstallActivity.h
+@@ -4,6 +4,9 @@
+ 
+ class PluginHubInstallActivity final : public CatalogActivity {
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   explicit PluginHubInstallActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                                     bool showConfirmation = true);
+ 
+diff --git a/src/activities/settings/QuickActionsActivity.h b/src/activities/settings/QuickActionsActivity.h
+index ddd1a6c9..a8f1ea3b 100644
+--- a/src/activities/settings/QuickActionsActivity.h
++++ b/src/activities/settings/QuickActionsActivity.h
+@@ -16,6 +16,9 @@ class QuickActionsActivity final : public Activity {
+   void saveDraft();
+ 
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   QuickActionsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+       : Activity("QuickActions", renderer, mappedInput) {}
+   void onEnter() override;
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 5129675a..ce2a1ea4 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -25,6 +25,9 @@
+ #include "ClockOffsetActivity.h"
+ #include "ClockSyncActivity.h"
+ #include "tailnet/TailnetSettingsActivity.h"
++#if CROSSINK_TAILNET_SETTINGS_PIN
++#include "SettingsPinActivity.h"
++#endif
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+ #include "DeviceCapabilities.h"
+@@ -1737,6 +1740,13 @@ void SettingsActivity::toggleCurrentSetting() {
+       case SettingAction::Tailscale:
+         startActivityForResult(std::make_unique<TailnetSettingsActivity>(renderer, mappedInput), resultHandler);
+         break;
++#if CROSSINK_TAILNET_SETTINGS_PIN
++      case SettingAction::SettingsPin:
++        startActivityForResult(
++            std::make_unique<SettingsPinActivity>(renderer, mappedInput, SettingsPinActivity::Mode::Manage),
++            resultHandler);
++        break;
++#endif
+       case SettingAction::QuickActions:
+         startActivityForResult(std::make_unique<QuickActionsActivity>(renderer, mappedInput), resultHandler);
+         break;
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 32d4eace..2766cf72 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -65,6 +65,9 @@ enum class SettingAction {
+   TtfRendering,
+   ClockSync,
+   Tailscale,
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  SettingsPin,
++#endif
+ };
+ 
+ struct SettingInfo {
+@@ -245,6 +248,9 @@ class SettingsActivity final : public Activity {
+   friend struct AssetDownloadSmokeTest;
+ #endif
+  public:
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  bool requiresSettingsPin() const override { return true; }  // CrossInk-Tailnet settings PIN
++#endif
+   enum class View : uint8_t { Root, FileBrowser };
+ 
+  private:
+diff --git a/src/activities/settings/SettingsPinActivity.cpp b/src/activities/settings/SettingsPinActivity.cpp
+new file mode 100644
+index 00000000..3ecc2e31
+--- /dev/null
++++ b/src/activities/settings/SettingsPinActivity.cpp
+@@ -0,0 +1,181 @@
++#include "SettingsPinActivity.h"
++
++#if CROSSINK_TAILNET_SETTINGS_PIN
++
++#include <GfxRenderer.h>
++#include <I18n.h>
++#include <Logging.h>
++
++#include <cstring>
++
++#include "MappedInputManager.h"
++#include "components/TouchHeaderBackButton.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++
++namespace {
++constexpr int BOX_SIZE = 60;
++constexpr int BOX_GAP = 14;
++}  // namespace
++
++void SettingsPinActivity::onEnter() {
++  Activity::onEnter();
++  startStage(mode == Mode::Manage ? (SettingsPin::isSet() ? Stage::Choose : Stage::New) : Stage::Enter);
++}
++
++void SettingsPinActivity::startStage(const Stage next) {
++  stage = next;
++  memset(digits, 0, sizeof(digits));
++  cursor = 0;
++  requestUpdate();
++}
++
++void SettingsPinActivity::done(const bool cancelled) {
++  ActivityResult result;
++  result.isCancelled = cancelled;
++  setResult(std::move(result));
++  finish();
++}
++
++void SettingsPinActivity::submit() {
++  hasMessage = false;
++  switch (stage) {
++    case Stage::Enter:
++      if (!SettingsPin::verify(digits)) {
++        LOG_INF("PIN", "Wrong settings PIN");
++        message = StrId::STR_WRONG_PIN;
++        hasMessage = true;
++        startStage(Stage::Enter);
++        return;
++      }
++      LOG_INF("PIN", "Settings PIN accepted (%s)", mode == Mode::Unlock ? "unlocked" : "one action");
++      if (mode == Mode::Unlock) SettingsPin::unlock();
++      done(false);
++      return;
++    case Stage::Choose:
++      if (choice == 1) {
++        SettingsPin::clear();
++        done(false);
++      } else {
++        startStage(Stage::New);
++      }
++      return;
++    case Stage::New:
++      memcpy(firstEntry, digits, sizeof(firstEntry));
++      startStage(Stage::Repeat);
++      return;
++    case Stage::Repeat:
++      if (memcmp(firstEntry, digits, sizeof(digits)) != 0) {
++        message = StrId::STR_PIN_MISMATCH;
++        hasMessage = true;
++        startStage(Stage::New);
++        return;
++      }
++      SettingsPin::store(digits);
++      // Set from inside Settings: it stays unlocked until Settings is left.
++      SettingsPin::unlock();
++      done(false);
++      return;
++  }
++}
++
++void SettingsPinActivity::loop() {
++  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
++      mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    mappedInput.suppressNextBackRelease();
++    done(true);
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    if (stage != Stage::Choose && cursor + 1 < SettingsPin::DIGITS) {
++      cursor++;
++      requestUpdate();
++    } else {
++      submit();
++    }
++    return;
++  }
++  if (stage == Stage::Choose) {
++    buttonNavigator.onNextRelease([this] {
++      choice ^= 1;
++      requestUpdate();
++    });
++    buttonNavigator.onPreviousRelease([this] {
++      choice ^= 1;
++      requestUpdate();
++    });
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
++    cursor = static_cast<uint8_t>((cursor + SettingsPin::DIGITS - 1) % SettingsPin::DIGITS);
++    requestUpdate();
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
++    cursor = static_cast<uint8_t>((cursor + 1) % SettingsPin::DIGITS);
++    requestUpdate();
++    return;
++  }
++  buttonNavigator.onNextRelease([this] {
++    digits[cursor] = static_cast<uint8_t>((digits[cursor] + 1) % 10);
++    requestUpdate();
++  });
++  buttonNavigator.onPreviousRelease([this] {
++    digits[cursor] = static_cast<uint8_t>((digits[cursor] + 9) % 10);
++    requestUpdate();
++  });
++}
++
++void SettingsPinActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++  const StrId titleId = stage == Stage::New      ? StrId::STR_NEW_PIN
++                        : stage == Stage::Repeat ? StrId::STR_REPEAT_PIN
++                        : stage == Stage::Choose ? StrId::STR_SETTINGS_PIN
++                                                 : StrId::STR_ENTER_SETTINGS_PIN;
++  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
++  if (mappedInput.hasTouchHardware()) {
++    TouchHeaderBackButton::draw(renderer, header, I18N.get(titleId), false);
++  } else {
++    GUI.drawHeader(renderer, header, I18N.get(titleId));
++  }
++
++  const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
++  const int centerY = renderer.getScreenHeight() / 2;
++  if (stage == Stage::Choose) {
++    const StrId rows[2] = {StrId::STR_CHANGE_PIN, StrId::STR_REMOVE_PIN};
++    for (int i = 0; i < 2; i++) {
++      const char* text = I18N.get(rows[i]);
++      const int width = renderer.getTextWidth(UI_12_FONT_ID, text, EpdFontFamily::BOLD);
++      const int x = (renderer.getScreenWidth() - width) / 2;
++      const int y = centerY - lineHeight - 8 + i * (lineHeight + 16);
++      if (i == choice) renderer.drawRect(x - 12, y - 6, width + 24, lineHeight + 12, true);
++      renderer.drawText(UI_12_FONT_ID, x, y, text, true, EpdFontFamily::BOLD);
++    }
++  } else {
++    const int rowWidth = SettingsPin::DIGITS * BOX_SIZE + (SettingsPin::DIGITS - 1) * BOX_GAP;
++    const int left = (renderer.getScreenWidth() - rowWidth) / 2;
++    const int top = centerY - BOX_SIZE / 2;
++    for (int i = 0; i < SettingsPin::DIGITS; i++) {
++      const int x = left + i * (BOX_SIZE + BOX_GAP);
++      renderer.drawRect(x, top, BOX_SIZE, BOX_SIZE, true);
++      if (i == cursor) renderer.drawRect(x + 2, top + 2, BOX_SIZE - 4, BOX_SIZE - 4, true);
++      // The digit under the cursor shows; the others are masked.
++      char text[2] = {i == cursor ? static_cast<char>('0' + digits[i]) : '*', '\0'};
++      const int width = renderer.getTextWidth(UI_12_FONT_ID, text, EpdFontFamily::BOLD);
++      renderer.drawText(UI_12_FONT_ID, x + (BOX_SIZE - width) / 2, top + (BOX_SIZE - lineHeight) / 2, text, true,
++                        EpdFontFamily::BOLD);
++    }
++    if (hasMessage) {
++      const char* text = I18N.get(message);
++      const int width = renderer.getTextWidth(UI_10_FONT_ID, text);
++      renderer.drawText(UI_10_FONT_ID, (renderer.getScreenWidth() - width) / 2, top + BOX_SIZE + 24, text);
++    }
++  }
++
++  const auto labels =
++      mappedInput.mapLabels(mappedInput.withBackArrow(tr(STR_BACK)), tr(STR_OK), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
++  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++  renderer.displayBuffer();
++}
++
++#endif  // CROSSINK_TAILNET_SETTINGS_PIN
+diff --git a/src/activities/settings/SettingsPinActivity.h b/src/activities/settings/SettingsPinActivity.h
+new file mode 100644
+index 00000000..9bb86157
+--- /dev/null
++++ b/src/activities/settings/SettingsPinActivity.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include <I18n.h>
++
++#include <cstdint>
++
++#include "activities/Activity.h"
++#include "util/ButtonNavigator.h"
++#include "util/SettingsPin.h"
++
++// CrossInk-Tailnet settings PIN entry (overlay patch 0023): four digits in boxes, Up/Down
++// change the one under the cursor, Confirm moves on and submits after the last, Left/Right
++// move between them, Back cancels. Laid out like FrontlightTimePickerActivity's fields.
++class SettingsPinActivity final : public Activity {
++ public:
++  enum class Mode : uint8_t {
++    Unlock,  // the gate in front of a locked screen: a right PIN unlocks Settings
++    Verify,  // one action (SettingsPin::ask): a right PIN only lets that action go ahead
++    Manage,  // Settings > Settings PIN: set one, or change or remove the one set
++  };
++
++  SettingsPinActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Mode mode)
++      : Activity(mode == Mode::Unlock ? "SettingsPinGate" : "SettingsPin", renderer, mappedInput), mode(mode) {}
++
++  void onEnter() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++
++ private:
++  enum class Stage : uint8_t { Enter, Choose, New, Repeat };
++
++  const Mode mode;
++  Stage stage = Stage::Enter;
++  uint8_t digits[SettingsPin::DIGITS] = {};
++  uint8_t firstEntry[SettingsPin::DIGITS] = {};
++  uint8_t cursor = 0;
++  uint8_t choice = 0;     // Stage::Choose: 0 = change, 1 = remove
++  StrId message{};        // under the boxes; empty id = none
++  bool hasMessage = false;
++  ButtonNavigator buttonNavigator;
++
++  void startStage(Stage next);
++  void submit();
++  void done(bool cancelled);
++};
+diff --git a/src/main.cpp b/src/main.cpp
+index 4fc95b63..7769af05 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -109,6 +109,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
+ #include "SdCardFontSystem.h"
+ #include "SilentRestart.h"
+ #include "WifiCredentialStore.h"
++#include "util/SettingsPin.h"
+ #include "activities/network/StatsUploadActivity.h"
+ #include "activities/Activity.h"
+ #include "activities/ActivityManager.h"
+@@ -1539,6 +1540,9 @@ void completeSleepAfterSleepSync() {
+ 
+ // Enter deep sleep mode
+ void enterDeepSleep(bool fromTimeout) {
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  SettingsPin::relock();  // never unlocked past sleep
++#endif
+ #ifndef SIMULATOR
+   gpio.stopButtonCapture();
+ #endif
+@@ -1868,6 +1872,9 @@ void setup() {
+   // Apply brightness and wake policy only after the saved settings are loaded.
+   Frontlight.initializeHardware();
+   SETTINGS.loadFromFile();
++#if CROSSINK_TAILNET_SETTINGS_PIN
++  SettingsPin::boot();  // the recovery file, and hidden files off while locked
++#endif
+ #if FREEINK_DEVICE_EEGO_A4
+   // Up + Down resets EEGO, so every boot must restore touch as the recovery path.
+   SETTINGS.disableReaderTouchscreen = 0;
+diff --git a/src/network/CrossPointWebServer.cpp b/src/network/CrossPointWebServer.cpp
+index b5e027ff..e4e0c229 100644
+--- a/src/network/CrossPointWebServer.cpp
++++ b/src/network/CrossPointWebServer.cpp
+@@ -67,6 +67,7 @@
+ #include "util/FontFamilyLabel.h"
+ #include "util/OpdsDownloadFolder.h"
+ #include "util/ReaderStatusBarJson.h"
++#include "util/SettingsPin.h"
+ #include "util/StringUtils.h"
+ 
+ namespace {
+@@ -391,6 +392,14 @@ bool isProtectedPath(const String& path) {
+ 
+   return false;
+ }
++
++// CrossInk-Tailnet settings PIN: while it is locked, the settings, credential, font and plugin
++// file endpoints answer 403 (and hidden files stay hidden, see SettingsPin::relock()).
++bool refusedWhileLocked(WebServer& server) {
++  if (!SettingsPin::locked()) return false;
++  server.send(403, "text/plain", "settings locked");
++  return true;
++}
+ }  // namespace
+ 
+ // File listing page template - now using generated headers:
+@@ -492,7 +501,8 @@ void CrossPointWebServer::begin() {
+   server->on("/api/crypto", HTTP_POST, [this] { handleCrypto(); });
+   server->on("/api/fetch", HTTP_POST, [this] { handleFetch(); });
+   server->on("/api/book-key", HTTP_POST, [this] { handleBookKey(); });
+-  server->on("/api/plugin-fs", HTTP_POST, [this] { handlePluginFs(); }, [this] { handlePluginFsUpload(); });
++  server->on("/api/plugin-fs", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handlePluginFs(); },
++             [this] { if (!SettingsPin::locked()) handlePluginFsUpload(); });
+ #endif
+   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
+   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
+@@ -514,30 +524,31 @@ void CrossPointWebServer::begin() {
+   server->on("/delete", HTTP_POST, [this] { handleDelete(); });
+ 
+   // Settings endpoints
+-  server->on("/settings", HTTP_GET, [this] { handleSettingsPage(); });
+-  server->on("/api/settings", HTTP_GET, [this] { handleGetSettings(); });
+-  server->on("/api/settings", HTTP_POST, [this] { handlePostSettings(); });
+-  server->on("/api/status-bars", HTTP_GET, [this] { handleGetStatusBars(); });
+-  server->on("/api/status-bars", HTTP_POST, [this] { handlePostStatusBars(); });
++  server->on("/settings", HTTP_GET, [this] { if (!refusedWhileLocked(*server)) handleSettingsPage(); });
++  server->on("/api/settings", HTTP_GET, [this] { if (!refusedWhileLocked(*server)) handleGetSettings(); });
++  server->on("/api/settings", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handlePostSettings(); });
++  server->on("/api/status-bars", HTTP_GET, [this] { if (!refusedWhileLocked(*server)) handleGetStatusBars(); });
++  server->on("/api/status-bars", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handlePostStatusBars(); });
+ 
+   // Font management endpoints
+   server->on("/fonts", HTTP_GET, [this] { handleFontsPage(); });
+   server->on("/api/fonts", HTTP_GET, [this] { handleFontList(); });
+-  server->on("/api/fonts/upload", HTTP_POST, [this] { handleFontUpload(); }, [this] { handleFontUploadData(); });
+-  server->on("/api/fonts/delete", HTTP_POST, [this] { handleFontDelete(); });
++  server->on("/api/fonts/upload", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handleFontUpload(); },
++             [this] { if (!SettingsPin::locked()) handleFontUploadData(); });
++  server->on("/api/fonts/delete", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handleFontDelete(); });
+ 
+   // OPDS server endpoints
+ #if CROSSINK_APP_CAP_OPDS
+   // Without OPDS these answer 404, and the web settings page leaves its OPDS card out.
+-  server->on("/api/opds", HTTP_GET, [this] { handleGetOpdsServers(); });
+-  server->on("/api/opds", HTTP_POST, [this] { handlePostOpdsServer(); });
+-  server->on("/api/opds/delete", HTTP_POST, [this] { handleDeleteOpdsServer(); });
++  server->on("/api/opds", HTTP_GET, [this] { if (!refusedWhileLocked(*server)) handleGetOpdsServers(); });
++  server->on("/api/opds", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handlePostOpdsServer(); });
++  server->on("/api/opds/delete", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handleDeleteOpdsServer(); });
+ #endif
+ 
+   // Wi-Fi credential endpoints
+-  server->on("/api/wifi", HTTP_GET, [this] { handleGetWifiNetworks(); });
+-  server->on("/api/wifi", HTTP_POST, [this] { handlePostWifiNetwork(); });
+-  server->on("/api/wifi/delete", HTTP_POST, [this] { handleDeleteWifiNetwork(); });
++  server->on("/api/wifi", HTTP_GET, [this] { if (!refusedWhileLocked(*server)) handleGetWifiNetworks(); });
++  server->on("/api/wifi", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handlePostWifiNetwork(); });
++  server->on("/api/wifi/delete", HTTP_POST, [this] { if (!refusedWhileLocked(*server)) handleDeleteWifiNetwork(); });
+ 
+   server->onNotFound([this] { handleNotFound(); });
+ 
+diff --git a/src/util/SettingsPin.cpp b/src/util/SettingsPin.cpp
+new file mode 100644
+index 00000000..e01d9850
+--- /dev/null
++++ b/src/util/SettingsPin.cpp
+@@ -0,0 +1,136 @@
++#include "SettingsPin.h"
++
++#if CROSSINK_TAILNET_SETTINGS_PIN
++
++#include <HalStorage.h>
++#include <Logging.h>
++#include <esp_attr.h>
++#include <esp_random.h>
++#include <esp_system.h>
++#include <mbedtls/sha256.h>
++#include <nvs.h>
++
++#include <cstring>
++#include <memory>
++
++#include "CrossPointSettings.h"
++#include "activities/Activity.h"
++#include "activities/settings/SettingsPinActivity.h"
++
++extern GfxRenderer renderer;
++extern MappedInputManager mappedInputManager;
++
++namespace SettingsPin {
++namespace {
++constexpr const char* NVS_NAMESPACE = "crossink_pin";
++constexpr const char* NVS_KEY = "v1";
++constexpr const char* RECOVERY_FILE = "/.crossink/unlock-settings";
++constexpr uint32_t UNLOCKED_MAGIC = 0x50494E55;  // "PINU"
++
++struct Record {
++  uint8_t salt[16];
++  uint8_t hash[32];
++};
++
++// Kept through software restarts (network boots); boot() drops it after any other reset.
++RTC_NOINIT_ATTR uint32_t unlockedMagic;
++int8_t setCache = -1;  // -1 = not read yet
++
++bool hashPin(const uint8_t (&salt)[16], const uint8_t (&digits)[DIGITS], uint8_t (&out)[32]) {
++  uint8_t input[sizeof(salt) + DIGITS];
++  memcpy(input, salt, sizeof(salt));
++  for (int i = 0; i < DIGITS; i++) input[sizeof(salt) + i] = static_cast<uint8_t>('0' + digits[i]);
++  return mbedtls_sha256(input, sizeof(input), out, 0) == 0;
++}
++
++bool readRecord(Record& record) {
++  nvs_handle_t handle;
++  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
++  size_t length = sizeof(record);
++  const bool ok = nvs_get_blob(handle, NVS_KEY, &record, &length) == ESP_OK && length == sizeof(record);
++  nvs_close(handle);
++  return ok;
++}
++}  // namespace
++
++bool isSet() {
++  if (setCache < 0) {
++    Record record;
++    setCache = readRecord(record) ? 1 : 0;
++  }
++  return setCache == 1;
++}
++
++bool locked() { return isSet() && unlockedMagic != UNLOCKED_MAGIC; }
++
++void unlock() { unlockedMagic = UNLOCKED_MAGIC; }
++
++void relock() {
++  if (unlockedMagic != UNLOCKED_MAGIC) return;
++  unlockedMagic = 0;
++  if (isSet() && SETTINGS.showHiddenFiles) {
++    LOG_INF("PIN", "Settings locked: hidden files hidden again");
++    SETTINGS.showHiddenFiles = 0;
++  } else {
++    LOG_INF("PIN", "Settings locked");
++  }
++}
++
++bool verify(const uint8_t (&digits)[DIGITS]) {
++  Record record;
++  uint8_t hash[32];
++  if (!readRecord(record) || !hashPin(record.salt, digits, hash)) return false;
++  uint8_t diff = 0;
++  for (size_t i = 0; i < sizeof(hash); i++) diff |= hash[i] ^ record.hash[i];
++  return diff == 0;
++}
++
++bool store(const uint8_t (&digits)[DIGITS]) {
++  Record record;
++  esp_fill_random(record.salt, sizeof(record.salt));
++  if (!hashPin(record.salt, digits, record.hash)) return false;
++  nvs_handle_t handle;
++  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return false;
++  const bool ok = nvs_set_blob(handle, NVS_KEY, &record, sizeof(record)) == ESP_OK && nvs_commit(handle) == ESP_OK;
++  nvs_close(handle);
++  setCache = -1;
++  LOG_INF("PIN", "Settings PIN %s", ok ? "set" : "could not be saved");
++  return ok;
++}
++
++void clear() {
++  nvs_handle_t handle;
++  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
++    nvs_erase_key(handle, NVS_KEY);
++    nvs_commit(handle);
++    nvs_close(handle);
++  }
++  setCache = 0;
++  LOG_INF("PIN", "Settings PIN removed");
++}
++
++void boot() {
++  if (esp_reset_reason() != ESP_RST_SW) unlockedMagic = 0;
++  if (Storage.exists(RECOVERY_FILE)) {
++    clear();
++    const bool removed = Storage.remove(RECOVERY_FILE);
++    LOG_INF("PIN", "Recovery file %s found: settings PIN cleared%s", RECOVERY_FILE,
++            removed ? ", file deleted" : "; could not delete the file");
++  }
++  if (locked() && SETTINGS.showHiddenFiles) SETTINGS.showHiddenFiles = 0;
++  LOG_INF("PIN", "Settings PIN %s", !isSet() ? "not set" : locked() ? "set, locked" : "set, unlocked");
++}
++
++void ask(Activity& from, std::function<void(bool)> done) {
++  if (!locked()) {
++    done(true);
++    return;
++  }
++  from.startActivityForResult(
++      std::make_unique<SettingsPinActivity>(renderer, mappedInputManager, SettingsPinActivity::Mode::Verify),
++      [done = std::move(done)](const ActivityResult& result) { done(!result.isCancelled); });
++}
++
++}  // namespace SettingsPin
++
++#endif  // CROSSINK_TAILNET_SETTINGS_PIN
+diff --git a/src/util/SettingsPin.h b/src/util/SettingsPin.h
+new file mode 100644
+index 00000000..0b60aef6
+--- /dev/null
++++ b/src/util/SettingsPin.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <CrossInkTailnetCuts.h>
++
++#include <cstdint>
++#include <functional>
++
++class Activity;
++
++// CrossInk-Tailnet settings PIN (overlay patch 0023). An optional 4-digit PIN that keeps
++// Settings, firmware updates, network and Tailscale setup and the web settings out of
++// reach until it is entered. A kid-proof lock, not security: the settings files are on the
++// SD card. The PIN lives in NVS as a salted SHA-256, so deleting the settings file keeps it;
++// /.crossink/unlock-settings on the card clears it at the next boot.
++//
++// Unlocked lasts while a PIN-gated screen is open (ActivityManager relocks once none is)
++// and never past sleep. It survives the silent restarts into a network boot, so a screen
++// that restarts into one (OTA, Tailscale login) does not ask again.
++namespace SettingsPin {
++
++constexpr int DIGITS = 4;
++
++#if CROSSINK_TAILNET_SETTINGS_PIN
++// Boot, after the SD card and settings are up: the recovery file, the restart carry-over,
++// and hidden files kept off while locked.
++void boot();
++
++bool isSet();
++// A PIN is set and has not been entered since the last lock.
++bool locked();
++void unlock();
++// Back to locked; hidden files go off again (in RAM; the file keeps the user's choice).
++void relock();
++
++bool verify(const uint8_t (&digits)[DIGITS]);
++bool store(const uint8_t (&digits)[DIGITS]);
++void clear();
++
++// For an action inside a screen that is not gated as a whole (adding a WiFi network): calls
++// `done(true)` at once when unlocked, else once the PIN prompt over `from` closes, with
++// whether the right PIN was entered. It does not unlock Settings.
++void ask(Activity& from, std::function<void(bool granted)> done);
++#else
++constexpr bool locked() { return false; }
++#endif
++
++}  // namespace SettingsPin

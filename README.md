@@ -152,6 +152,35 @@ behave like a normal Tailscale client:
 
 **Settings > Tailscale > Diagnostics** shows both regions ("Relay: ours sea, server sea").
 
+## Sync while reading (X4 Pro, X4 Classic)
+
+With BookOrbit **Smart sync** on, **Settings > BookOrbit Sync > Sync While Reading** syncs the
+open book in the background every 10, 15, 30 or 60 minutes, every 25, 50 or 100 pages, or every
+one or two chapters (off by default). The book stays open: WiFi and Tailscale come up, the
+progress is synced with Smart sync's rules, and WiFi goes off again. A newer position on the
+server is never overwritten; it waits for the next sync when you open the book or the reader
+sleeps, as does any case Smart sync would ask about. Highlights, bookmarks and reading stats
+also wait for that sync. Nothing is shown while reading; without a network it simply tries
+again at the next interval. Not on the X3: a sync does not fit in its memory beside an open
+book.
+
+## Settings PIN
+
+**Settings > System > Settings PIN** sets an optional 4-digit PIN (Up/Down change a digit,
+Confirm moves on). While one is set, the reader asks for it before opening Settings, the
+BookOrbit, KOReader and OPDS account screens, Quick Actions and button setup, the plugin
+installer, and before joining or forgetting a WiFi network. The web file transfer answers
+"settings locked" for its settings, WiFi, OPDS, font and plugin-file pages, and hidden files
+(`.crosspoint`, `.crossink`) stay hidden on the reader, in the web file manager and over
+WebDAV. Reading, the library, the BookOrbit catalog, downloads and sync stay open. Once
+entered, the PIN holds until you leave Settings or the reader sleeps.
+
+It is a lock against children, not security: anyone can take the SD card out and edit the
+settings files. The PIN is kept in the reader's internal memory, so deleting the settings file
+does not remove it. If it is forgotten, create an empty file named `unlock-settings` in the
+`.crossink` folder of the SD card and restart the reader: the PIN is removed and the file
+deleted.
+
 ## Limits
 
 - Only tailnet hosts go through the tunnel. Internet traffic (GitHub updates, public OPDS
